@@ -27,3 +27,7 @@ database.yml.bak
 
 # Internal documents
 document/
+
+# Local binaries and rules
+bin/
+rule.md
