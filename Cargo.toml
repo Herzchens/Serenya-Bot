@@ -1,0 +1,24 @@
+[package]
+name = "serenya"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A multi-guild Discord music bot"
+
+[dependencies]
+poise = "0.6"
+serenity = { version = "0.12", default-features = false, features = [
+    "client", "gateway", "model", "rustls_backend", "cache"
+] }
+songbird = { version = "0.6", features = ["builtin-queue"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = "0.0.27"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+dashmap = "6"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+tokio-util = "0.7"
