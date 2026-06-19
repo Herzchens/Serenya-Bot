@@ -21,7 +21,9 @@ use crate::database::DatabaseManager;
 pub struct Data {
     pub config: Arc<BotConfig>,
     pub database: Arc<DatabaseManager>,
-    pub guild_players: DashMap<serenity::GuildId, ()>,
+    pub guild_players: Arc<
+        DashMap<serenity::GuildId, std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>>,
+    >,
     pub http_client: reqwest::Client,
     pub start_time: std::time::Instant,
 }
@@ -72,7 +74,7 @@ async fn run() -> Result<(), utils::Error> {
                 Ok(Data {
                     config: config_clone,
                     database: database_clone,
-                    guild_players: DashMap::new(),
+                    guild_players: std::sync::Arc::new(DashMap::new()),
                     http_client,
                     start_time,
                 })
