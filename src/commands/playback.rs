@@ -9,7 +9,9 @@ use songbird::input::YoutubeDl;
 #[poise::command(slash_command, prefix_command)]
 pub async fn play(
     ctx: Context<'_>,
-    #[description = "Search query, URL, or playlist name"] query: String,
+    #[autocomplete = "crate::commands::playlist::autocomplete_playlist"]
+    #[description = "Search query, URL, or playlist name"]
+    query: String,
 ) -> Result<(), Error> {
     let guild_id = ctx
         .guild_id()

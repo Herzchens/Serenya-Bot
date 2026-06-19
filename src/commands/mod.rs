@@ -2,7 +2,9 @@ pub mod info;
 pub mod loop_cmd;
 pub mod meta;
 pub mod playback;
+pub mod playlist;
 pub mod queue;
+pub mod settings;
 pub mod voice;
 
 use crate::utils::Error;
@@ -26,5 +28,7 @@ pub fn all_commands() -> Vec<poise::Command<crate::Data, Error>> {
         queue::shuffle(),
         voice::join(),
         voice::leave(),
+        playlist::playlist(),
+        settings::settings(),
     ]
 }

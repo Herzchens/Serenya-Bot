@@ -130,11 +130,18 @@ pub async fn play_next(
         player.playback_status = crate::core::PlaybackStatus::Idle;
 
         let announce_channel = player.announce_channel;
-        if let Some(channel) = announce_channel {
-            let ctx_clone = serenity_ctx.clone();
-            tokio::spawn(async move {
-                let _ = channel.say(&ctx_clone.http, "Queue finished. ⏹️").await;
-            });
+        let announce_setting = database
+            .get_guild_settings(guild_id.get())
+            .await
+            .announce_track;
+
+        if announce_setting {
+            if let Some(channel) = announce_channel {
+                let ctx_clone = serenity_ctx.clone();
+                tokio::spawn(async move {
+                    let _ = channel.say(&ctx_clone.http, "Queue finished. ⏹️").await;
+                });
+            }
         }
     }
 
