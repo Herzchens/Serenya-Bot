@@ -66,6 +66,8 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
     if let Some(player_lock) = ctx.data().guild_players.get(&guild_id) {
         let mut player = player_lock.write().await;
         player.reset();
+        player.voice_channel = None;
+        player.announce_channel = None;
     }
 
     ctx.say("👋 Left voice channel and cleared state.").await?;
