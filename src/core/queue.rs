@@ -27,6 +27,10 @@ impl Queue {
         Ok(())
     }
 
+    pub fn push_front(&mut self, track: Track) {
+        self.tracks.push_front(track);
+    }
+
     pub fn push_batch(
         &mut self,
         tracks: Vec<Track>,

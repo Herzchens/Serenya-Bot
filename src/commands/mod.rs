@@ -1,5 +1,8 @@
+pub mod control;
 pub mod info;
+pub mod invite;
 pub mod loop_cmd;
+pub mod media;
 pub mod meta;
 pub mod playback;
 pub mod playlist;
@@ -33,5 +36,16 @@ pub fn all_commands() -> Vec<poise::Command<crate::Data, Error>> {
         playlist::playlist(),
         settings::settings(),
         stats::stats(),
+        control::seek(),
+        control::forward(),
+        control::rewind(),
+        control::replay(),
+        control::previous(),
+        control::jump(),
+        control::r#move(),
+        media::lyrics(),
+        media::songinfo(),
+        invite::invite(),
+        invite::support(),
     ]
 }

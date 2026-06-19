@@ -84,6 +84,31 @@ async fn test_db_playlists() -> Result<(), Box<dyn std::error::Error>> {
             .is_err()
     );
 
+    // Test remove_from_playlist
+    manager.remove_from_playlist(12345, "my_list", 1).await?;
+    let playlist = manager
+        .get_user_playlist(12345, "my_list")
+        .await
+        .ok_or("playlist not found")?;
+    assert_eq!(playlist.tracks.len(), 1);
+    assert_eq!(playlist.tracks[0].title, "Track 2");
+
+    // Test rename_playlist
+    manager
+        .rename_playlist(12345, "my_list", "new_list")
+        .await?;
+    let names = manager.get_user_playlist_names(12345).await;
+    assert_eq!(names, vec!["new_list"]);
+
+    // Test rename duplicate error
+    manager.create_playlist(12345, "another_list", 3).await?;
+    assert!(
+        manager
+            .rename_playlist(12345, "new_list", "another_list")
+            .await
+            .is_err()
+    );
+
     let _ = tokio::fs::remove_file(&db_path).await;
     Ok(())
 }
