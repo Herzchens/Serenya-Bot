@@ -225,6 +225,60 @@ impl DatabaseManager {
         Ok(())
     }
 
+    pub async fn remove_from_playlist(
+        &self,
+        user_id: u64,
+        name: &str,
+        index: usize,
+    ) -> Result<(), SerenyaError> {
+        let mut data = self.data.write().await;
+        let key = user_id.to_string();
+        let playlist = data
+            .user_playlists
+            .get_mut(&key)
+            .and_then(|p| p.get_mut(name))
+            .ok_or_else(|| SerenyaError::NotFound(format!("playlist '{name}' not found")))?;
+
+        if index == 0 || index > playlist.tracks.len() {
+            return Err(SerenyaError::Queue(format!(
+                "track index {index} out of bounds (len: {})",
+                playlist.tracks.len()
+            )));
+        }
+
+        playlist.tracks.remove(index - 1);
+        playlist.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(())
+    }
+
+    pub async fn rename_playlist(
+        &self,
+        user_id: u64,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), SerenyaError> {
+        let mut data = self.data.write().await;
+        let key = user_id.to_string();
+        let playlists = data
+            .user_playlists
+            .get_mut(&key)
+            .ok_or_else(|| SerenyaError::NotFound("no playlists found for user".into()))?;
+
+        let playlist = playlists
+            .remove(old_name)
+            .ok_or_else(|| SerenyaError::NotFound(format!("playlist '{old_name}' not found")))?;
+
+        if playlists.contains_key(new_name) {
+            playlists.insert(old_name.to_owned(), playlist);
+            return Err(SerenyaError::Database(format!(
+                "playlist '{new_name}' already exists"
+            )));
+        }
+
+        playlists.insert(new_name.to_owned(), playlist);
+        Ok(())
+    }
+
     pub async fn increment_songs_played(&self, guild_id: u64) {
         let mut data = self.data.write().await;
         let key = guild_id.to_string();
