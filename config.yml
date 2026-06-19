@@ -1,0 +1,21 @@
+bot:
+  token: ${DISCORD_TOKEN}
+  prefix: "s!"
+  owner: 123456789012345678
+  instance_id: "serenya-1"
+  display_name: "Serenya"
+
+playback:
+  stay_in_voice: true
+  announce_track: true
+  max_queue_size: 500
+  max_playlist_import: 100
+  max_user_playlists: 25
+  max_tracks_per_user_playlist: 500
+
+audio:
+  default_quality: balanced
+  modes:
+    - performance
+    - balanced
+    - quality
