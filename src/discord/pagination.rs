@@ -125,3 +125,86 @@ pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track]) -> Result<(), Er
 
     Ok(())
 }
+
+/// Paginate lyrics text page by page.
+pub async fn paginate_lyrics(
+    ctx: Context<'_>,
+    title: &str,
+    artist: &str,
+    pages: &[String],
+) -> Result<(), Error> {
+    let total_pages = pages.len();
+    let mut current_page: usize = 0;
+    let ctx_id = ctx.id();
+
+    let make_embed = |page_idx: usize| {
+        serenity::CreateEmbed::new()
+            .title(format!("🎤 Lyrics: {} - {}", title, artist))
+            .description(&pages[page_idx])
+            .footer(serenity::CreateEmbedFooter::new(format!(
+                "Page {}/{}",
+                page_idx + 1,
+                total_pages
+            )))
+            .color(0x5865F2)
+    };
+
+    let embed = make_embed(0);
+    let components = make_navigation_components(ctx_id, 0, total_pages);
+
+    let reply = poise::CreateReply::default()
+        .embed(embed)
+        .components(components);
+    let msg = ctx.send(reply).await?;
+    let msg_inner = msg.into_message().await?;
+
+    let timeout = std::time::Duration::from_secs(60);
+    let start_time = std::time::Instant::now();
+
+    while start_time.elapsed() < timeout {
+        let remaining = timeout
+            .checked_sub(start_time.elapsed())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+
+        let collector = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
+            .author_id(ctx.author().id)
+            .message_id(msg_inner.id)
+            .timeout(remaining);
+
+        if let Some(interaction) = collector.next().await {
+            if interaction.data.custom_id == format!("{}_prev", ctx_id) {
+                current_page = current_page.saturating_sub(1);
+            } else if interaction.data.custom_id == format!("{}_next", ctx_id) {
+                if current_page + 1 < total_pages {
+                    current_page += 1;
+                }
+            } else {
+                continue;
+            }
+
+            let next_embed = make_embed(current_page);
+            let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
+
+            let _ = interaction
+                .create_response(
+                    &ctx.serenity_context().http,
+                    serenity::CreateInteractionResponse::UpdateMessage(
+                        serenity::CreateInteractionResponseMessage::new()
+                            .embed(next_embed)
+                            .components(next_comps),
+                    ),
+                )
+                .await;
+        } else {
+            break;
+        }
+    }
+
+    let final_embed = make_embed(current_page);
+    let _ = disable_buttons(msg_inner, &ctx.serenity_context().http, final_embed, ctx_id).await;
+
+    Ok(())
+}
