@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
-use songbird::input::YoutubeDl;
 
 use crate::core::Track;
 use crate::discord::embeds::now_playing_embed;
@@ -50,7 +49,7 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
 
     let elapsed = if let Some(ref handle) = player.current_track_handle {
         match handle.get_info().await {
-            Ok(info) => info.position,
+            Ok(info) => player.seek_offset + info.position,
             Err(_) => Duration::from_secs(0),
         }
     } else {
@@ -63,21 +62,20 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-async fn search_ytdl(query: &str) -> Result<Vec<Track>, SerenyaError> {
-    let output = tokio::process::Command::new("yt-dlp")
-        .args([
-            "--flat-playlist",
-            "--dump-single-json",
-            &format!("ytsearch5:{}", query),
-        ])
-        .output()
-        .await
-        .map_err(|e| SerenyaError::Audio(format!("Failed to execute yt-dlp: {}", e)))?;
-
-    if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stderr);
-        return Err(SerenyaError::Audio(format!("yt-dlp error: {}", err_msg)));
-    }
+async fn search_ytdl(query: &str, user_id: serenity::UserId) -> Result<Vec<Track>, SerenyaError> {
+    let settings = crate::audio::runtime::settings();
+    let output = crate::audio::runtime::run_ytdlp(
+        "manual search",
+        vec![
+            "--flat-playlist".to_owned(),
+            "--dump-single-json".to_owned(),
+            format!("ytsearch5:{query}"),
+        ],
+        crate::audio::runtime::duration_from_millis(settings.ytsearch_timeout_ms),
+        true,
+        Some(crate::audio::runtime::negative_cache_key("ytsearch", query)),
+    )
+    .await?;
 
     let search_result: YtDlpSearchResult = serde_json::from_slice(&output.stdout)
         .map_err(|e| SerenyaError::Audio(format!("Failed to parse search results: {}", e)))?;
@@ -92,9 +90,12 @@ async fn search_ytdl(query: &str) -> Result<Vec<Track>, SerenyaError> {
                 duration: entry
                     .duration
                     .map(|d| std::time::Duration::from_secs(d as u64)),
-                requester_id: serenity::UserId::new(0),
+                requester_id: user_id,
                 requester_name: String::new(),
                 source_type: crate::core::SourceType::Search,
+                resolved_url: None,
+                thumbnail: None,
+                source_provider: "YouTube".to_owned(),
             });
         }
     }
@@ -102,21 +103,18 @@ async fn search_ytdl(query: &str) -> Result<Vec<Track>, SerenyaError> {
     Ok(tracks)
 }
 
-fn build_search_menu(ctx_id: u64, tracks: &[Track]) -> serenity::CreateSelectMenu {
+pub fn build_search_menu(ctx_id: u64, tracks: &[Track]) -> serenity::CreateSelectMenu {
     let mut options = Vec::new();
     for (i, track) in tracks.iter().enumerate() {
-        let label = if track.title.len() > 100 {
-            format!("{}...", &track.title[..97])
-        } else {
-            track.title.clone()
-        };
+        let label = crate::utils::truncate_chars(&track.title, 97);
         let duration_str = track
             .duration
             .map(crate::discord::embeds::format_duration)
             .unwrap_or_else(|| "Live".to_string());
+        let description = format!("{} • {}", track.source_provider, duration_str);
         options.push(
             serenity::CreateSelectMenuOption::new(label, i.to_string())
-                .description(format!("Duration: {}", duration_str)),
+                .description(description.chars().take(100).collect::<String>()),
         );
     }
 
@@ -139,7 +137,7 @@ async fn enqueue_selected_track(
         .ok_or_else(|| SerenyaError::NotFound("No player active.".into()))?;
 
     let mut player = player_lock.write().await;
-    let config = &ctx.data().config;
+    let config = ctx.data().config();
 
     if player.playback_status == crate::core::PlaybackStatus::Idle && player.now_playing.is_none() {
         player.now_playing = Some(selected_track.clone());
@@ -151,9 +149,11 @@ async fn enqueue_selected_track(
         let call_lock = manager
             .get(guild_id)
             .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel.".into()))?;
+        let resolved_url =
+            crate::audio::extract_stream_url_for_guild(guild_id.get(), &selected_track.url).await?;
         let mut call = call_lock.lock().await;
         let source: songbird::input::Input =
-            YoutubeDl::new(ctx.data().http_client.clone(), selected_track.url.clone()).into();
+            songbird::input::HttpRequest::new(ctx.data().http_client.clone(), resolved_url).into();
         let handle = call.play_input(source);
 
         let _ = handle.add_event(
@@ -166,9 +166,24 @@ async fn enqueue_selected_track(
                 serenity_ctx: ctx.serenity_context().clone(),
             },
         );
+        let _ = handle.add_event(
+            songbird::Event::Track(songbird::TrackEvent::Error),
+            crate::audio::events::TrackErrorHandler {
+                guild_id,
+                database: ctx.data().database.clone(),
+                guild_players: ctx.data().guild_players.clone(),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+            },
+        );
         player.current_track_handle = Some(handle);
 
-        Ok(format!("🎶 **Now Playing:** {}", selected_track.title))
+        let msg = if selected_track.url.starts_with("http") {
+            format!("🎶 **Now Playing:** [{}]({})", selected_track.title, selected_track.url)
+        } else {
+            format!("🎶 **Now Playing:** {}", selected_track.title)
+        };
+        Ok(msg)
     } else {
         let max_queue_size = config.playback.max_queue_size;
         player.queue.push(selected_track.clone(), max_queue_size)?;
@@ -192,7 +207,7 @@ pub async fn search(
 
     ctx.defer().await?;
 
-    let mut tracks = search_ytdl(&query).await?;
+    let mut tracks = search_ytdl(&query, ctx.author().id).await?;
     if tracks.is_empty() {
         ctx.say("No search results found.").await?;
         return Ok(());

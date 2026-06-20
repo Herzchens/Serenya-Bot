@@ -6,6 +6,7 @@ use crate::utils::{Context, Error, SerenyaError};
 #[poise::command(
     slash_command,
     prefix_command,
+    aliases("q"),
     check = "crate::discord::checks::require_guild"
 )]
 pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
@@ -33,6 +34,7 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(
     slash_command,
     prefix_command,
+    aliases("r"),
     check = "crate::discord::checks::require_same_voice_channel"
 )]
 pub async fn remove(
@@ -89,8 +91,16 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
 
     let mut player = player_lock.write().await;
     player.queue.clear();
+    if let Some(ref handle) = player.current_track_handle {
+        let _ = handle.stop();
+    }
+    player.current_track_handle = None;
+    player.now_playing = None;
+    player.playback_status = crate::core::PlaybackStatus::Idle;
+    player.clear_skip_votes();
 
-    ctx.say("🧹 Cleared the queue.").await?;
+    ctx.say("🧹 Cleared the queue and stopped playback.")
+        .await?;
     Ok(())
 }
 
@@ -98,6 +108,7 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
 #[poise::command(
     slash_command,
     prefix_command,
+    aliases("sh"),
     check = "crate::discord::checks::require_same_voice_channel"
 )]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {

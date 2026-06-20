@@ -1,12 +1,11 @@
 use poise::serenity_prelude as serenity;
 
-use crate::audio::{TrackEndHandler, resolve_input};
-use crate::core::{GuildPlayer, PlaybackStatus};
+use crate::audio::{ResolvedInput, TrackEndHandler, TrackErrorHandler, resolve_input};
+use crate::core::{GuildPlayer, PlaybackStatus, Track};
 use crate::utils::{Context, Error, SerenyaError};
-use songbird::input::YoutubeDl;
 
 /// Play a song or playlist.
-#[poise::command(slash_command, prefix_command)]
+#[poise::command(slash_command, prefix_command, aliases("p"))]
 pub async fn play(
     ctx: Context<'_>,
     #[autocomplete = "crate::commands::playlist::autocomplete_playlist"]
@@ -17,7 +16,10 @@ pub async fn play(
         .guild_id()
         .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
 
-    // 1. Check if user is in a voice channel
+    // 1. Defer immediately to prevent Discord interaction timeout (3s deadline)
+    ctx.defer().await?;
+
+    // 2. Check if user is in a voice channel
     let user_channel_id = {
         let guild = ctx
             .guild()
@@ -36,36 +38,123 @@ pub async fn play(
         .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
         .clone();
 
-    // 2. Auto-join voice channel if not already connected
-    let call_lock: std::sync::Arc<tokio::sync::Mutex<songbird::Call>> =
-        if let Some(call) = manager.get(guild_id) {
-            call
-        } else {
-            manager
-                .join(guild_id, user_channel_id)
-                .await
-                .map_err(|e| SerenyaError::Voice(format!("Failed to join voice channel: {}", e)))?
-        };
-
-    // 3. Defer response because metadata lookup can take time
-    ctx.defer().await?;
-
-    // 4. Resolve input tracks
+    // 3. Resolve input + auto-join voice channel in parallel
     let user_id = ctx.author().id.get();
-    let mut tracks = resolve_input(
-        &query,
-        user_id,
-        &ctx.data().database,
-        &ctx.data().http_client,
-    )
-    .await?;
+    let db_ref = &ctx.data().database;
+    let http_ref = &ctx.data().http_client;
+    let (call_result, resolved) = tokio::join!(
+        async {
+            if let Some(call) = manager.get(guild_id) {
+                Ok::<_, SerenyaError>(call)
+            } else {
+                manager
+                    .join(guild_id, user_channel_id)
+                    .await
+                    .map_err(|e| SerenyaError::Voice(format!("Failed to join voice channel: {}", e)))
+            }
+        },
+        resolve_input(&query, user_id, db_ref, http_ref)
+    );
+    let call_lock = call_result?;
+    let resolved = resolved?;
 
+    match resolved {
+        ResolvedInput::Playlist(tracks) => {
+            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, tracks).await?;
+        }
+        ResolvedInput::Track(track) => {
+            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, vec![track])
+                .await?;
+        }
+        ResolvedInput::SearchResults(mut candidates) => {
+            let select_menu = crate::commands::info::build_search_menu(ctx.id(), &candidates);
+            let components = vec![serenity::CreateActionRow::SelectMenu(select_menu)];
+            let reply = poise::CreateReply::default()
+                .content("🔎 Select a track to play:")
+                .components(components);
+
+            let msg = ctx.send(reply).await?;
+            let mut msg_inner = msg.into_message().await?;
+
+            let collector = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
+                .author_id(ctx.author().id)
+                .message_id(msg_inner.id)
+                .timeout(std::time::Duration::from_secs(60));
+
+            if let Some(interaction) = collector.next().await {
+                let selected_idx_str = match &interaction.data.kind {
+                    serenity::ComponentInteractionDataKind::StringSelect { values } => values
+                        .first()
+                        .ok_or_else(|| SerenyaError::Audio("No selection received.".into()))?,
+                    _ => return Err(SerenyaError::Audio("Invalid interaction type.".into()).into()),
+                };
+                let selected_idx: usize = selected_idx_str
+                    .parse()
+                    .map_err(|_| SerenyaError::Audio("Invalid selection index.".into()))?;
+
+                let selected_track = candidates.remove(selected_idx);
+
+                let _ = interaction
+                    .create_response(
+                        &ctx.serenity_context().http,
+                        serenity::CreateInteractionResponse::UpdateMessage(
+                            serenity::CreateInteractionResponseMessage::new()
+                                .content("⏳ Resolving selected track...")
+                                .components(vec![]),
+                        ),
+                    )
+                    .await;
+
+                let tracks = if is_metadata_search_option(&selected_track) {
+                    resolve_input(
+                        &selected_track.url,
+                        user_id,
+                        &ctx.data().database,
+                        &ctx.data().http_client,
+                    )
+                    .await?
+                    .into_tracks_or_top()
+                } else {
+                    vec![selected_track]
+                };
+
+                enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, tracks)
+                    .await?;
+            } else {
+                let _ = msg_inner
+                    .edit(
+                        &ctx.serenity_context().http,
+                        serenity::EditMessage::new()
+                            .content("⏱️ Play selection timed out.")
+                            .components(vec![]),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_metadata_search_option(track: &Track) -> bool {
+    track.source_provider.starts_with("Deezer")
+        || track.source_provider.starts_with("Spotify")
+        || track.source_provider.starts_with("Apple Music")
+}
+
+async fn enqueue_and_play_resolved(
+    ctx: Context<'_>,
+    guild_id: serenity::GuildId,
+    user_channel_id: serenity::ChannelId,
+    call_lock: std::sync::Arc<tokio::sync::Mutex<songbird::Call>>,
+    mut tracks: Vec<Track>,
+) -> Result<(), Error> {
     if tracks.is_empty() {
-        ctx.say("No tracks found for the query.").await?;
+        ctx.say("No tracks found to play.").await?;
         return Ok(());
     }
 
-    // 5. Get/Create guild player
+    // Get/Create guild player
     let player_lock = ctx
         .data()
         .guild_players
@@ -77,8 +166,7 @@ pub async fn play(
     player.voice_channel = Some(user_channel_id);
     player.announce_channel = Some(ctx.channel_id());
 
-    // 6. Add to queue or play immediately
-    let config = &ctx.data().config;
+    let config = ctx.data().config();
     let max_queue_size = config.playback.max_queue_size;
 
     if player.playback_status == PlaybackStatus::Idle && player.now_playing.is_none() {
@@ -86,40 +174,197 @@ pub async fn play(
         let mut first_track = tracks.remove(0);
         first_track.requester_name = ctx.author().name.clone();
 
+        // Fix: set requester_name for all remaining tracks before queuing
+        for t in &mut tracks {
+            t.requester_name = ctx.author().name.clone();
+        }
+
+        // Resolve first track search query synchronously so we have a real URL for the embed!
+        if first_track.url.starts_with("ytsearch1:") {
+            if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(&mut first_track, &ctx.data().http_client).await {
+                tracing::error!("Failed to resolve Spotify track search: {:?}", e);
+            }
+        }
+
         player.now_playing = Some(first_track.clone());
         player.playback_status = PlaybackStatus::Playing;
-
-        let mut call = call_lock.lock().await;
-        let source: songbird::input::Input =
-            YoutubeDl::new(ctx.data().http_client.clone(), first_track.url.clone()).into();
-        let handle = call.play_input(source);
-
-        // Register event handler
-        let _ = handle.add_event(
-            songbird::Event::Track(songbird::TrackEvent::End),
-            TrackEndHandler {
-                guild_id,
-                database: ctx.data().database.clone(),
-                guild_players: ctx.data().guild_players.clone(),
-                http_client: ctx.data().http_client.clone(),
-                serenity_ctx: ctx.serenity_context().clone(),
-            },
-        );
-
-        player.current_track_handle = Some(handle);
 
         // Queue remaining tracks (if any)
         let added = player.queue.push_batch(tracks, max_queue_size)?;
 
+        // Spawn background play resolution task
+        let player_lock_clone = player_lock.clone();
+        let call_lock_clone = call_lock.clone();
+        let http_client_clone = ctx.data().http_client.clone();
+        let database_clone = ctx.data().database.clone();
+        let guild_players_clone = ctx.data().guild_players.clone();
+        let serenity_ctx_clone = ctx.serenity_context().clone();
+        let first_track_clone = first_track.clone();
+
+        tokio::spawn(async move {
+            let mut current_track = first_track_clone.clone();
+            if current_track.url.starts_with("ytsearch1:") {
+                if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(&mut current_track, &http_client_clone).await {
+                    tracing::error!("Failed to resolve Spotify track search: {:?}", e);
+                } else {
+                    // Update player's now_playing field with the resolved track
+                    let mut player = player_lock_clone.write().await;
+                    if player.playback_status == PlaybackStatus::Playing {
+                        if let Some(ref mut np) = player.now_playing {
+                            if np.url == first_track_clone.url {
+                                *np = current_track.clone();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 1. Resolve stream URL in background
+            let stream_res =
+                crate::audio::extract_stream_url_for_guild(guild_id.get(), &current_track.url)
+                    .await;
+
+            // 2. Race condition check: check if player was reset/stopped/skipped while resolving
+            {
+                let player = player_lock_clone.read().await;
+                if player.playback_status == PlaybackStatus::Idle || player.now_playing.is_none() {
+                    tracing::info!(
+                        "Player was stopped or reset while resolving stream URL, aborting playback"
+                    );
+                    return;
+                }
+                if let Some(ref current) = player.now_playing {
+                    if current.url != current_track.url {
+                        tracing::info!(
+                            "Track was skipped or changed while resolving stream URL, aborting playback"
+                        );
+                        return;
+                    }
+                }
+            }
+
+            // 3. Play the input
+            let resolved_url = match stream_res {
+                Ok(resolved_url) => resolved_url,
+                Err(e) => {
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        track = %current_track.title,
+                        "Failed to resolve stream URL: {:?}",
+                        e
+                    );
+
+                    let announce_channel = {
+                        let mut player = player_lock_clone.write().await;
+                        if player
+                            .now_playing
+                            .as_ref()
+                            .map(|current| current.url.as_str())
+                            == Some(current_track.url.as_str())
+                        {
+                            player.now_playing = None;
+                            player.current_track_handle = None;
+                            player.playback_status = PlaybackStatus::Idle;
+                        }
+                        player.announce_channel
+                    };
+
+                    if let Some(channel) = announce_channel {
+                        let _ = channel
+                            .say(
+                                &serenity_ctx_clone.http,
+                                format!(
+                                    "⚠️ Could not resolve **{}**. Trying the next track.",
+                                    current_track.title
+                                ),
+                            )
+                            .await;
+                    }
+
+                    if let Err(next_err) = crate::audio::events::play_next(
+                        guild_id,
+                        &database_clone,
+                        &guild_players_clone,
+                        &http_client_clone,
+                        &serenity_ctx_clone,
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            guild_id = %guild_id,
+                            "Failed to continue after stream resolution error: {:?}",
+                            next_err
+                        );
+                    }
+                    return;
+                }
+            };
+
+            let mut call = call_lock_clone.lock().await;
+            let source: songbird::input::Input =
+                songbird::input::HttpRequest::new(http_client_clone.clone(), resolved_url.clone()).into();
+            let handle = call.play_input(source);
+
+            // 4. Register event handlers
+            let _ = handle.add_event(
+                songbird::Event::Track(songbird::TrackEvent::End),
+                TrackEndHandler {
+                    guild_id,
+                    database: database_clone.clone(),
+                    guild_players: guild_players_clone.clone(),
+                    http_client: http_client_clone.clone(),
+                    serenity_ctx: serenity_ctx_clone.clone(),
+                },
+            );
+            let _ = handle.add_event(
+                songbird::Event::Track(songbird::TrackEvent::Error),
+                TrackErrorHandler {
+                    guild_id,
+                    database: database_clone,
+                    guild_players: guild_players_clone.clone(),
+                    http_client: http_client_clone.clone(),
+                    serenity_ctx: serenity_ctx_clone,
+                },
+            );
+
+            // 5. Update track handle in player
+            let mut player = player_lock_clone.write().await;
+            // Check race condition again
+            if player.playback_status == PlaybackStatus::Playing {
+                if let Some(ref mut current) = player.now_playing {
+                    if current.url == current_track.url {
+                        current.resolved_url = Some(resolved_url.clone());
+                        player.current_track_handle = Some(handle);
+                        crate::audio::events::schedule_prefetch(
+                            guild_id,
+                            guild_players_clone.clone(),
+                            current_track.duration,
+                            http_client_clone.clone(),
+                        );
+                        return;
+                    }
+                }
+            }
+            // If check failed, stop the handle
+            let _ = handle.stop();
+        });
+
+        // Drop player lock BEFORE sending response to allow background task to start immediately!
+        drop(player);
+
         if added > 0 {
-            ctx.say(format!(
-                "🎶 **Now Playing:** {}\nEnqueued {} other tracks.",
-                first_track.title, added
-            ))
-            .await?;
+            let mut embed = crate::discord::embeds::now_playing_announce_embed(&first_track);
+            embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
+                "Enqueued {} other tracks.",
+                added
+            )));
+            let reply = poise::CreateReply::default().embed(embed);
+            ctx.send(reply).await?;
         } else {
-            ctx.say(format!("🎶 **Now Playing:** {}", first_track.title))
-                .await?;
+            let embed = crate::discord::embeds::now_playing_announce_embed(&first_track);
+            let reply = poise::CreateReply::default().embed(embed);
+            ctx.send(reply).await?;
         }
     } else {
         // Enqueue all tracks
@@ -134,12 +379,37 @@ pub async fn play(
         let added = player.queue.push_batch(tracks, max_queue_size)?;
 
         if added == 0 {
-            ctx.say("Queue is full! Could not add any tracks.").await?;
+            let embed =
+                crate::discord::embeds::error_embed("Queue is full! Could not add any tracks.");
+            let reply = poise::CreateReply::default().embed(embed);
+            ctx.send(reply).await?;
         } else if added == 1 && track_count == 1 {
-            ctx.say(format!("📝 **Enqueued:** {}", first_title)).await?;
+            let queue_pos = player.queue.len();
+            if let Some(track) = player.queue.get(queue_pos - 1) {
+                let embed = crate::discord::embeds::track_added_embed(track, queue_pos);
+                let reply = poise::CreateReply::default().embed(embed);
+                ctx.send(reply).await?;
+            } else {
+                ctx.say(format!("📝 **Enqueued:** {}", first_title)).await?;
+            }
         } else {
-            ctx.say(format!("📝 **Enqueued {} tracks**", added)).await?;
+            let embed = serenity::CreateEmbed::new()
+                .title("📝 Tracks Enqueued")
+                .description(format!(
+                    "Successfully enqueued **{}** tracks to the queue.",
+                    added
+                ))
+                .color(0x57F287);
+            let reply = poise::CreateReply::default().embed(embed);
+            ctx.send(reply).await?;
         }
+
+        // Trigger prefetching in case it's the next track
+        let gp_clone = ctx.data().guild_players.clone();
+        let http_client_clone = ctx.data().http_client.clone();
+        tokio::spawn(async move {
+            crate::audio::events::trigger_prefetch(guild_id, gp_clone, http_client_clone).await;
+        });
     }
 
     Ok(())
@@ -338,6 +608,7 @@ async fn check_requester_absence(
 #[poise::command(
     slash_command,
     prefix_command,
+    aliases("s"),
     check = "crate::discord::checks::require_same_voice_channel"
 )]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
@@ -358,7 +629,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     }
 
     let author_id = ctx.author().id;
-    let owner_id = ctx.data().config.bot.owner;
+    let owner_id = ctx.data().config().bot.owner;
     let track_requester_id = player.now_playing.as_ref().map(|t| t.requester_id);
 
     let can_skip = author_id.get() == owner_id || Some(author_id) == track_requester_id;
@@ -374,6 +645,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 
     if approved {
         ctx.say("⏭️ Skipping track...").await?;
+        player.skip_forced = true;
         if let Some(ref handle) = player.current_track_handle {
             let _ = handle.stop();
         } else {
@@ -384,6 +656,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
                 &ctx.data().guild_players,
                 &ctx.data().http_client,
                 ctx.serenity_context(),
+                None,
             )
             .await?;
         }
