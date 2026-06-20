@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod cleanup;
 pub mod control;
 pub mod info;
@@ -22,6 +23,7 @@ pub fn all_commands() -> Vec<poise::Command<crate::Data, Error>> {
         meta::help(),
         meta::reload(),
         cleanup::cleanup(),
+        audio::eight_d(),
         playback::play(),
         playback::pause(),
         playback::resume(),
@@ -37,7 +39,9 @@ pub fn all_commands() -> Vec<poise::Command<crate::Data, Error>> {
         voice::join(),
         voice::leave(),
         playlist::playlist(),
-        settings::settings(),
+        settings::quality(),
+        settings::announce_track(),
+        settings::prefix(),
         stats::stats(),
         control::seek(),
         control::forward(),

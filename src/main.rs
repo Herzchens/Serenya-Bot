@@ -50,8 +50,8 @@ async fn run() -> Result<(), utils::Error> {
 
     // Register secrets for redaction
     crate::logging::register_secret_to_redact(&config.bot.token);
-    if let Some(ref secret) = config.spotify.client_secret {
-        crate::logging::register_secret_to_redact(secret);
+    if let Some(ref cookie) = config.spotify.sp_dc {
+        crate::logging::register_secret_to_redact(cookie);
     }
     if let Some(ref url) = config.logging.webhook_url {
         crate::logging::register_secret_to_redact(url);
@@ -72,7 +72,13 @@ async fn run() -> Result<(), utils::Error> {
     let auto_save_handle =
         database.start_auto_save(std::time::Duration::from_secs(30), cancel_token.clone());
 
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(16)
+        .tcp_keepalive(std::time::Duration::from_secs(60))
+        .build()?;
     let start_time = std::time::Instant::now();
 
     let config_clone = Arc::clone(&config);
@@ -84,10 +90,18 @@ async fn run() -> Result<(), utils::Error> {
             prefix_options: poise::PrefixFrameworkOptions {
                 dynamic_prefix: Some(|ctx| {
                     Box::pin(async move {
-                        let prefix = ctx.data.config().bot.prefix.clone();
-                        Ok(Some(prefix))
+                        let default_prefix = ctx.data.config().bot.prefix.clone();
+                        if let Some(guild_id) = ctx.guild_id {
+                            let db = &ctx.data.database;
+                            let settings = db.get_guild_settings(guild_id.get()).await;
+                            if let Some(ref custom_prefix) = settings.prefix {
+                                return Ok(Some(custom_prefix.clone()));
+                            }
+                        }
+                        Ok(Some(default_prefix))
                     })
                 }),
+                mention_as_prefix: true,
                 ..Default::default()
             },
             on_error: |error| Box::pin(on_error(error)),
@@ -111,6 +125,16 @@ async fn run() -> Result<(), utils::Error> {
                         guild_id = ?ctx.guild_id(),
                         "Command executed successfully"
                     );
+                })
+            },
+            event_handler: |ctx, event, _framework, data| {
+                Box::pin(async move {
+                    if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
+                        if let Err(e) = handle_voice_state_update(ctx, old, new, data).await {
+                            error!("Error in voice state update handler: {:?}", e);
+                        }
+                    }
+                    Ok(())
                 })
             },
             ..Default::default()
@@ -289,4 +313,85 @@ async fn on_error(error: poise::FrameworkError<'_, Data, utils::Error>) {
             }
         }
     }
+}
+
+async fn handle_voice_state_update(
+    ctx: &serenity::Context,
+    _old: &Option<serenity::VoiceState>,
+    new: &serenity::VoiceState,
+    data: &Data,
+) -> Result<(), crate::utils::Error> {
+    let guild_id = match new.guild_id {
+        Some(g) => g,
+        None => return Ok(()),
+    };
+
+    // 1. Get the guild player. If there is no player, we don't care.
+    let player_lock = match data.guild_players.get(&guild_id) {
+        Some(p) => p.clone(),
+        None => return Ok(()),
+    };
+
+    let mut player = player_lock.write().await;
+
+    // 2. Only perform empty-room check if bot is currently Playing
+    if player.playback_status != crate::core::PlaybackStatus::Playing {
+        return Ok(());
+    }
+
+    // 3. Get the bot's current voice channel
+    let bot_channel_id = match player.voice_channel {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+
+    // 4. Get bot user ID
+    let bot_id = ctx.cache.current_user().id;
+
+    // 5. Count human members in the voice channel
+    let mut human_count = 0;
+    if let Some(guild) = ctx.cache.guild(guild_id) {
+        for state in guild.voice_states.values() {
+            if state.channel_id == Some(bot_channel_id) && state.user_id != bot_id {
+                let is_bot = if let Some(user) = ctx.cache.user(state.user_id) {
+                    user.bot
+                } else if let Some(member) = guild.members.get(&state.user_id) {
+                    member.user.bot
+                } else {
+                    false
+                };
+
+                if !is_bot {
+                    human_count += 1;
+                }
+            }
+        }
+    }
+
+    // 6. If no humans left, pause playback and announce
+    if human_count == 0 {
+        if let Some(ref handle) = player.current_track_handle {
+            if let Err(e) = handle.pause() {
+                tracing::error!("Failed to auto-pause track in empty channel: {:?}", e);
+            } else {
+                player.playback_status = crate::core::PlaybackStatus::Paused;
+                info!(
+                    guild_id = %guild_id,
+                    channel_id = %bot_channel_id,
+                    "Playback auto-paused because voice channel is empty"
+                );
+
+                if let Some(announce_channel) = player.announce_channel {
+                    let embed = serenity::CreateEmbed::new()
+                        .description("Không có ai trong room nên âm nhạc sẽ tạm dừng `s.resume` để tiếp tục từ chỗ đã stop")
+                        .color(0x5865F2);
+                    let _ = announce_channel
+                        .send_message(&ctx.http, serenity::CreateMessage::new().embed(embed))
+                        .await;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

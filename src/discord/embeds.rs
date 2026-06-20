@@ -126,6 +126,7 @@ pub fn queue_embed(
     page: usize,
     total_pages: usize,
     total_tracks: usize,
+    title: &str,
 ) -> serenity::CreateEmbed {
     let mut desc = String::new();
     for (i, track) in tracks.iter().enumerate() {
@@ -151,7 +152,7 @@ pub fn queue_embed(
     }
 
     serenity::CreateEmbed::new()
-        .title("🎶 Current Queue")
+        .title(title)
         .description(desc)
         .footer(serenity::CreateEmbedFooter::new(format!(
             "Page {}/{} • {} tracks",

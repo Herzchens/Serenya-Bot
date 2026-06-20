@@ -63,29 +63,6 @@ pub async fn rename(
     Ok(())
 }
 
-fn format_tracks_list(playlist: &crate::database::models::UserPlaylist) -> String {
-    let mut track_list = String::new();
-    for (i, t) in playlist.tracks.iter().enumerate() {
-        if i < 10 {
-            let dur_str = t
-                .duration_secs
-                .map(|s| crate::discord::embeds::format_duration(Duration::from_secs(s)))
-                .unwrap_or_else(|| "Live".to_string());
-            track_list.push_str(&format!("**{}.** {} | `{}`\n", i + 1, t.title, dur_str));
-        }
-    }
-
-    if playlist.tracks.len() > 10 {
-        track_list.push_str(&format!(
-            "*...and {} more track(s)*",
-            playlist.tracks.len() - 10
-        ));
-    } else if playlist.tracks.is_empty() {
-        track_list = "*No tracks in this playlist.*".to_string();
-    }
-    track_list
-}
-
 /// Show detailed information about a playlist.
 #[poise::command(slash_command, prefix_command)]
 pub async fn info(
@@ -103,35 +80,31 @@ pub async fn info(
         .await
         .ok_or_else(|| SerenyaError::NotFound(format!("Playlist '{name}' not found.")))?;
 
-    let mut total_duration = Duration::from_secs(0);
-    for t in &playlist.tracks {
-        if let Some(secs) = t.duration_secs {
-            total_duration += Duration::from_secs(secs);
-        }
+    if playlist.tracks.is_empty() {
+        ctx.say(format!("Playlist **{}** is currently empty.", name)).await?;
+        return Ok(());
     }
 
-    let track_list = format_tracks_list(&playlist);
-    let duration_str = crate::discord::embeds::format_duration(total_duration);
-    let created = playlist
-        .created_at
-        .split('T')
-        .next()
-        .unwrap_or(&playlist.created_at);
-    let updated = playlist
-        .updated_at
-        .split('T')
-        .next()
-        .unwrap_or(&playlist.updated_at);
+    ctx.defer().await?;
 
-    let embed = serenity::CreateEmbed::new()
-        .title(format!("📁 Playlist: {}", name))
-        .field("Total Tracks", playlist.tracks.len().to_string(), true)
-        .field("Total Duration", duration_str, true)
-        .field("Created At", created.to_string(), true)
-        .field("Updated At", updated.to_string(), true)
-        .field("Tracks", track_list, false)
-        .color(0xFEE75C);
+    let tracks: Vec<crate::core::Track> = playlist.tracks.iter().map(|t| crate::core::Track {
+        title: t.title.clone(),
+        url: t.url.clone(),
+        duration: t.duration_secs.map(Duration::from_secs),
+        requester_id: serenity::UserId::new(user_id),
+        requester_name: ctx.author().name.clone(),
+        source_type: crate::core::track::SourceType::Playlist,
+        resolved_url: None,
+        thumbnail: None,
+        source_provider: "Playlist".to_owned(),
+    }).collect();
 
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    crate::discord::pagination::paginate_queue(
+        ctx,
+        &tracks,
+        &format!("📁 Playlist: {}", name),
+    )
+    .await?;
+
     Ok(())
 }

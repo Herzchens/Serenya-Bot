@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Checks if the command is run inside a guild (server).
@@ -7,27 +6,6 @@ pub async fn require_guild(ctx: Context<'_>) -> Result<bool, Error> {
         Ok(true)
     } else {
         Err(SerenyaError::Config("This command can only be used in a server.".into()).into())
-    }
-}
-
-/// Checks if the user invoking the command is in a voice channel.
-pub async fn require_voice_channel(ctx: Context<'_>) -> Result<bool, Error> {
-    let owner_id = ctx.data().config().bot.owner;
-    if ctx.author().id.get() == owner_id {
-        return Ok(true);
-    }
-
-    let guild = ctx
-        .guild()
-        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
-
-    if guild.voice_states.contains_key(&ctx.author().id) {
-        Ok(true)
-    } else {
-        Err(
-            SerenyaError::Voice("You must be in a voice channel to use this command.".into())
-                .into(),
-        )
     }
 }
 
@@ -72,15 +50,5 @@ pub async fn require_same_voice_channel(ctx: Context<'_>) -> Result<bool, Error>
         Ok(true)
     } else {
         Err(SerenyaError::Voice("You must be in the same voice channel as the bot.".into()).into())
-    }
-}
-
-/// Checks if the user is the bot owner defined in the config.
-pub async fn is_owner(ctx: Context<'_>) -> Result<bool, Error> {
-    let owner_id = ctx.data().config().bot.owner;
-    if ctx.author().id.get() == owner_id {
-        Ok(true)
-    } else {
-        Err(SerenyaError::Permission("This command is restricted to the bot owner.".into()).into())
     }
 }

@@ -27,6 +27,7 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
         .clone();
 
     let _handler = manager.join(guild_id, channel_id).await;
+    let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, channel_id).await;
 
     // Get or create guild player
     let player_lock = ctx

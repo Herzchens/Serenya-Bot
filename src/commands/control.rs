@@ -8,7 +8,7 @@ fn format_seek_time(d: Duration) -> String {
     format!("{:02}:{:02}", mins, secs)
 }
 
-async fn seek_by_restart(
+pub(crate) async fn seek_by_restart(
     ctx: Context<'_>,
     guild_id: poise::serenity_prelude::GuildId,
     player_lock: std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
@@ -29,33 +29,15 @@ async fn seek_by_restart(
         None => crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?,
     };
 
-    // 2. Spawn FFMPEG process starting at target_position
-    let seek_time_secs = target_position.as_secs();
-
-    use std::process::{Command, Stdio};
-    let child = Command::new("ffmpeg")
-        .args([
-            "-ss",
-            &seek_time_secs.to_string(),
-            "-i",
-            &stream_url,
-            "-f",
-            "wav",
-            "-acodec",
-            "pcm_s16le",
-            "-ar",
-            "48000",
-            "-ac",
-            "2",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| SerenyaError::Audio(format!("Failed to spawn ffmpeg: {e}")))?;
-
-    let child_container: songbird::input::ChildContainer = child.into();
-    let source: songbird::input::Input = child_container.into();
+    let eight_d_enabled = {
+        let player = player_lock.read().await;
+        player.eight_d_enabled
+    };
+    let source = crate::audio::source::create_ffmpeg_stream_input(
+        &stream_url,
+        Some(target_position),
+        eight_d_enabled,
+    )?;
 
     // 3. Stop the current track and play the new input
     let manager = songbird::get(ctx.serenity_context())
@@ -289,10 +271,10 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
         drop(player);
         crate::audio::events::play_next(
             guild_id,
-            &ctx.data().database,
-            &ctx.data().guild_players,
-            &ctx.data().http_client,
-            ctx.serenity_context(),
+            std::sync::Arc::clone(&ctx.data().database),
+            std::sync::Arc::clone(&ctx.data().guild_players),
+            ctx.data().http_client.clone(),
+            ctx.serenity_context().clone(),
             None,
         )
         .await?;
@@ -338,10 +320,10 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
         drop(player);
         crate::audio::events::play_next(
             guild_id,
-            &ctx.data().database,
-            &ctx.data().guild_players,
-            &ctx.data().http_client,
-            ctx.serenity_context(),
+            std::sync::Arc::clone(&ctx.data().database),
+            std::sync::Arc::clone(&ctx.data().guild_players),
+            ctx.data().http_client.clone(),
+            ctx.serenity_context().clone(),
             None,
         )
         .await?;
@@ -369,12 +351,28 @@ pub async fn jump(
         .get(&guild_id)
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
     let mut player = player_lock.write().await;
+    let queue_len = player.queue.len();
 
-    if position == 0 || position > player.queue.len() {
-        return Err(SerenyaError::Queue(format!("Index {position} out of bounds.")).into());
+    if position == 0 {
+        return Err(SerenyaError::Queue("Position must be 1 or greater.".into()).into());
     }
 
-    let skipped = player.queue.jump(position - 1)?;
+    let index = if player.now_playing.is_some() {
+        if position == 1 {
+            return Err(SerenyaError::Queue("Cannot jump to the currently playing track. Use `/replay` to restart it.".into()).into());
+        }
+        if position > queue_len + 1 {
+            return Err(SerenyaError::Queue(format!("Index {position} out of bounds (queue size is {}).", queue_len + 1)).into());
+        }
+        position - 2
+    } else {
+        if position > queue_len {
+            return Err(SerenyaError::Queue(format!("Index {position} out of bounds (queue size is {}).", queue_len)).into());
+        }
+        position - 1
+    };
+
+    let skipped = player.queue.jump(index)?;
     ctx.say(format!(
         "⏭️ Jumped to track #{position}. Skipped {} tracks.",
         skipped.len()
@@ -388,10 +386,10 @@ pub async fn jump(
         drop(player);
         crate::audio::events::play_next(
             guild_id,
-            &ctx.data().database,
-            &ctx.data().guild_players,
-            &ctx.data().http_client,
-            ctx.serenity_context(),
+            std::sync::Arc::clone(&ctx.data().database),
+            std::sync::Arc::clone(&ctx.data().guild_players),
+            ctx.data().http_client.clone(),
+            ctx.serenity_context().clone(),
             None,
         )
         .await?;
@@ -419,12 +417,28 @@ pub async fn r#move(
         .get(&guild_id)
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
     let mut player = player_lock.write().await;
+    let queue_len = player.queue.len();
 
-    if from == 0 || to == 0 || from > player.queue.len() || to > player.queue.len() {
-        return Err(SerenyaError::Queue("Index out of bounds.".into()).into());
+    if from == 0 || to == 0 {
+        return Err(SerenyaError::Queue("Index must be 1 or greater.".into()).into());
     }
 
-    player.queue.move_item(from - 1, to - 1)?;
+    let (from_idx, to_idx) = if player.now_playing.is_some() {
+        if from == 1 || to == 1 {
+            return Err(SerenyaError::Queue("Cannot move the currently playing track.".into()).into());
+        }
+        if from > queue_len + 1 || to > queue_len + 1 {
+            return Err(SerenyaError::Queue("Index out of bounds.".into()).into());
+        }
+        (from - 2, to - 2)
+    } else {
+        if from > queue_len || to > queue_len {
+            return Err(SerenyaError::Queue("Index out of bounds.".into()).into());
+        }
+        (from - 1, to - 1)
+    };
+
+    player.queue.move_item(from_idx, to_idx)?;
     ctx.say(format!("↕️ Moved track from #{from} to #{to}."))
         .await?;
     Ok(())

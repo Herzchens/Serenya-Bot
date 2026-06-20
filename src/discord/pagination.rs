@@ -57,14 +57,14 @@ async fn disable_buttons(
 }
 
 /// Paginate a list of tracks with next/prev buttons.
-pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track]) -> Result<(), Error> {
+pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track], title: &str) -> Result<(), Error> {
     let page_size = 10;
     let total_pages = tracks.len().div_ceil(page_size).max(1);
     let mut current_page: usize = 0;
     let ctx_id = ctx.id();
 
     let initial_slice = get_page_slice(tracks, 0, page_size);
-    let embed = queue_embed(initial_slice, 0, total_pages, tracks.len());
+    let embed = queue_embed(initial_slice, 0, total_pages, tracks.len(), title);
     let components = make_navigation_components(ctx_id, 0, total_pages);
 
     let reply = poise::CreateReply::default()
@@ -101,7 +101,7 @@ pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track]) -> Result<(), Er
             }
 
             let slice = get_page_slice(tracks, current_page, page_size);
-            let next_embed = queue_embed(slice, current_page, total_pages, tracks.len());
+            let next_embed = queue_embed(slice, current_page, total_pages, tracks.len(), title);
             let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
 
             let _ = interaction
@@ -120,7 +120,7 @@ pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track]) -> Result<(), Er
     }
 
     let final_slice = get_page_slice(tracks, current_page, page_size);
-    let final_embed = queue_embed(final_slice, current_page, total_pages, tracks.len());
+    let final_embed = queue_embed(final_slice, current_page, total_pages, tracks.len(), title);
     let _ = disable_buttons(msg_inner, &ctx.serenity_context().http, final_embed, ctx_id).await;
 
     Ok(())

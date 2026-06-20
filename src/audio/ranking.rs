@@ -406,7 +406,7 @@ pub fn score_candidates(
         let is_lyric =
             candidate_title_lower.contains("lyric") || candidate_title_lower.contains("lyrics");
         if is_lyric {
-            score += 0.20;
+            score += 0.50;
         }
 
         // 6. Popularity boost (view count logarithmic scale)

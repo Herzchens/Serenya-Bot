@@ -153,15 +153,15 @@ async fn search_trusted_metadata_candidates(
 ) -> Vec<(TrackCandidate, f64)> {
     let mut join_set = JoinSet::new();
 
-    for provider in ["Deezer", "Spotify", "Apple Music"] {
+    for provider in ["Deezer", "Apple Music", "Spotify"] {
         let query = query.to_owned();
         let client = http_client.clone();
         join_set.spawn(async move {
             let start = std::time::Instant::now();
             let result = match provider {
                 "Deezer" => DeezerProvider.search(&query, &client).await,
-                "Spotify" => SpotifyProvider.search(&query, &client).await,
                 "Apple Music" => AppleMusicProvider.search(&query, &client).await,
+                "Spotify" => SpotifyProvider.search(&query, &client).await,
                 _ => Ok(Vec::new()),
             };
             let elapsed_ms = start.elapsed().as_millis();
@@ -226,8 +226,8 @@ async fn search_trusted_metadata_candidates(
 fn get_priority_boost(source: &str, query: &str) -> f64 {
     let query_lower = query.to_lowercase();
     match source {
-        "YouTube Music" => 0.08,
-        "YouTube" => 0.03,
+        "YouTube Music" => 0.02,
+        "YouTube" => -0.02,
         "yt-dlp" => -0.05,
         "SoundCloud" if query_lower.contains("soundcloud") => 0.04,
         "SoundCloud" if query_lower.contains("remix") || query_lower.contains("mix") => 0.02,
@@ -301,6 +301,15 @@ fn score_provider_candidates(
 
     for (candidate, score) in &mut scored {
         *score = (*score + get_priority_boost(&candidate.source, search_query)).clamp(0.0, 1.0);
+
+        // Apply highest priority boost for YouTube/YT Music/YT-DLP lyrics videos
+        let is_yt = candidate.source == "YouTube" || candidate.source == "YouTube Music" || candidate.source == "yt-dlp";
+        let title_lower = candidate.title.to_lowercase();
+        let is_lyric = title_lower.contains("lyric") || title_lower.contains("lyrics");
+        if is_yt && is_lyric {
+            *score += 10.0;
+        }
+
         tracing::debug!(
             provider = %candidate.source,
             candidate_title = %candidate.title,
@@ -414,7 +423,7 @@ async fn collect_search_results(
             source_type: SourceType::Search,
             resolved_url: None,
             thumbnail: candidate.thumbnail,
-            source_provider: format!("{} • {:.0}%", candidate.source, score * 100.0),
+            source_provider: format!("{} • {:.0}%", candidate.source, if score >= 10.0 { score - 10.0 } else { score } * 100.0),
         })
         .collect();
 
@@ -424,9 +433,9 @@ async fn collect_search_results(
 fn source_priority(source: &str) -> usize {
     match source {
         "Deezer" => 0,
-        "Spotify" => 1,
-        "SoundCloud" => 2,
-        "Apple Music" => 3,
+        "Apple Music" => 1,
+        "Spotify" => 2,
+        "SoundCloud" => 3,
         "YouTube Music" => 4,
         "YouTube" => 5,
         "yt-dlp" => 6,
@@ -434,18 +443,7 @@ fn source_priority(source: &str) -> usize {
     }
 }
 
-#[allow(dead_code)]
-fn has_confident_candidate(scored: &[(TrackCandidate, f64)], query: &str) -> bool {
-    let settings = crate::audio::runtime::settings();
-    scored
-        .iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(candidate, score)| {
-            *score >= settings.auto_pick_threshold
-                && !contains_unrequested_variant(&candidate.title, query)
-        })
-        .unwrap_or(false)
-}
+
 
 async fn run_provider_batch(
     providers: &[SearchProviderKind],
@@ -841,11 +839,15 @@ async fn mirror_metadata(
     http_client: &reqwest::Client,
     source_provider: String,
 ) -> Result<ResolvedInput, SerenyaError> {
-    let search_query = if let Some(ref artist) = meta.artist {
+    let mut search_query = if let Some(ref artist) = meta.artist {
         format!("{} - {}", artist, meta.title)
     } else {
         meta.title.clone()
     };
+
+    if !search_query.to_lowercase().contains("lyric") {
+        search_query.push_str(" lyrics");
+    }
 
     tracing::info!(
         query = %search_query,
@@ -923,7 +925,7 @@ fn evaluate_confidence_and_respond(
                 source_type: SourceType::Search,
                 resolved_url: None,
                 thumbnail: forced_thumbnail.clone().or(cand.thumbnail),
-                source_provider: format!("{} • {:.0}%", cand.source, score * 100.0),
+                source_provider: format!("{} • {:.0}%", cand.source, if score >= 10.0 { score - 10.0 } else { score } * 100.0),
             });
         }
         Ok(ResolvedInput::SearchResults(tracks))
@@ -1010,49 +1012,7 @@ fn extract_spotify_id(url: &str, pattern: &str) -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
-fn parse_spotify_track_json(track_val: &serde_json::Value, user_id: u64) -> Option<Track> {
-    let name = track_val.get("name")?.as_str()?.to_owned();
-    let id = track_val.get("id")?.as_str()?;
-    let duration_ms = track_val.get("duration_ms")?.as_u64()?;
 
-    let mut artists_vec = Vec::new();
-    if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
-        for a in artists {
-            if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
-                artists_vec.push(a_name.to_owned());
-            }
-        }
-    }
-    let _artist_str = if artists_vec.is_empty() {
-        "".to_owned()
-    } else {
-        artists_vec.join(", ")
-    };
-
-    let thumbnail = track_val
-        .get("album")
-        .and_then(|v| v.get("images"))
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|img| img.get("url"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned());
-
-    let track_url = format!("https://open.spotify.com/track/{}", id);
-
-    Some(Track {
-        title: name,
-        url: track_url,
-        duration: Some(Duration::from_millis(duration_ms)),
-        requester_id: serenity::UserId::new(user_id),
-        requester_name: "".to_owned(),
-        source_type: SourceType::Url,
-        resolved_url: None,
-        thumbnail,
-        source_provider: "Spotify".to_owned(),
-    })
-}
 
 #[derive(serde::Deserialize, Debug)]
 #[allow(dead_code)]
@@ -1246,33 +1206,34 @@ async fn resolve_spotify_playlist_api(
     playlist_id: &str,
     limit: usize,
     user_id: u64,
-    client_id: &str,
-    client_secret: &str,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
-    tracing::info!("Requesting Spotify API access token for playlist resolution...");
-    let token = crate::audio::providers::get_spotify_access_token(
+    tracing::info!("Requesting Spotify session info for playlist resolution...");
+    let session_info =
+        crate::audio::providers::get_spotify_session_info(http_client, Duration::from_secs(5))
+            .await?;
+    tracing::info!("Spotify session info retrieved successfully.");
+
+    tracing::info!("Requesting Spotify client token info...");
+    let client_token_info = crate::audio::providers::get_spotify_client_token_info(
         http_client,
-        client_id,
-        client_secret,
+        &session_info.client_id,
         Duration::from_secs(5),
     )
     .await?;
-    tracing::info!("Spotify API access token retrieved successfully.");
+    tracing::info!("Spotify client token info retrieved successfully.");
+
+    let sp_dc = crate::audio::runtime::spotify_settings()
+        .and_then(|config| config.sp_dc)
+        .filter(|cookie| !cookie.trim().is_empty())
+        .ok_or_else(|| SerenyaError::Audio("Spotify sp_dc cookie is not configured.".to_owned()))?;
 
     let mut tracks = Vec::new();
     let mut offset = 0;
+    let mut total_count = None;
 
     while tracks.len() < limit {
-        let chunk_limit = (limit - tracks.len()).min(50);
-        let market = crate::audio::runtime::spotify_settings()
-            .map(|settings| settings.market)
-            .filter(|market| !market.trim().is_empty())
-            .unwrap_or_else(|| "US".to_owned());
-        let url = format!(
-            "https://api.spotify.com/v1/playlists/{}/items?limit={}&offset={}&market={}",
-            playlist_id, chunk_limit, offset, market
-        );
+        let chunk_limit = (limit - tracks.len()).min(100);
 
         tracing::info!(
             "Fetching Spotify playlist tracks: offset = {}, limit = {} (total resolved so far: {})",
@@ -1281,13 +1242,39 @@ async fn resolve_spotify_playlist_api(
             tracks.len()
         );
 
-        let mut attempts = 0;
+        let gql_hash = "a65e12194ed5fc443a1cdebed5fabe33ca5b07b987185d63c72483867ad13cb4";
+        let gql_body = serde_json::json!({
+            "operationName": "fetchPlaylist",
+            "variables": {
+                "uri": format!("spotify:playlist:{}", playlist_id),
+                "offset": offset,
+                "limit": chunk_limit,
+                "enableWatchFeedEntrypoint": false
+            },
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": gql_hash
+                }
+            }
+        });
+
         let mut response = None;
+        let mut attempts = 0;
         while attempts < 3 {
             attempts += 1;
             match http_client
-                .get(&url)
-                .header("Authorization", format!("Bearer {}", token))
+                .post("https://api-partner.spotify.com/pathfinder/v1/query")
+                .json(&gql_body)
+                .header("Authorization", format!("Bearer {}", session_info.access_token))
+                .header("Client-Token", &client_token_info.client_token)
+                .header("Spotify-App-Version", &client_token_info.client_version)
+                .header("Accept", "application/json")
+                .header("Accept-Language", "en")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+                .header("Referer", "https://open.spotify.com/")
+                .header("Origin", "https://open.spotify.com")
+                .header("Cookie", format!("sp_dc={}; sp_t={}", sp_dc, client_token_info.device_id))
                 .send()
                 .await
             {
@@ -1304,13 +1291,13 @@ async fn resolve_spotify_playlist_api(
                             .and_then(|s| s.parse::<u64>().ok())
                             .unwrap_or(2);
                         tracing::warn!(
-                            "Spotify API rate limited (429). Retrying after {} seconds...",
+                            "Spotify Partner API rate limited (429). Retrying after {} seconds...",
                             retry_after
                         );
                         tokio::time::sleep(Duration::from_secs(retry_after)).await;
                     } else {
                         tracing::warn!(
-                            "Spotify API request failed with status: {} (attempt {}/3)",
+                            "Spotify Partner API request failed with status: {} (attempt {}/3)",
                             status,
                             attempts
                         );
@@ -1318,7 +1305,7 @@ async fn resolve_spotify_playlist_api(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Spotify API request failed: {} (attempt {}/3)", e, attempts);
+                    tracing::warn!("Spotify Partner API request failed: {} (attempt {}/3)", e, attempts);
                     tokio::time::sleep(Duration::from_millis(500 * attempts)).await;
                 }
             }
@@ -1335,16 +1322,38 @@ async fn resolve_spotify_playlist_api(
         };
 
         let body: serde_json::Value = response.json().await.map_err(|e| {
-            SerenyaError::Audio(format!("Failed to parse Spotify playlist API JSON: {}", e))
+            SerenyaError::Audio(format!("Failed to parse Spotify Partner API JSON: {}", e))
         })?;
 
-        let items = match body.get("items").and_then(|v| v.as_array()) {
-            Some(arr) => arr,
-            None => {
-                tracing::warn!("Spotify playlist response missing 'items' array or it is empty.");
-                break;
+        if let Some(errors) = body.get("errors").and_then(|e| e.as_array()) {
+            if !errors.is_empty() {
+                let first_err = errors[0].get("message").and_then(|m| m.as_str()).unwrap_or("Unknown GraphQL error");
+                return Err(SerenyaError::Audio(format!("Spotify GraphQL error: {}", first_err)));
             }
-        };
+        }
+
+        let playlist_v2 = body
+            .pointer("/data/playlistV2")
+            .ok_or_else(|| SerenyaError::Audio("Missing playlistV2 in Spotify GraphQL response".to_owned()))?;
+
+        if playlist_v2.get("__typename").and_then(|t| t.as_str()) == Some("NotFound") {
+            return Err(SerenyaError::Audio("Spotify playlist not found or access denied".to_owned()));
+        }
+
+        let content = playlist_v2
+            .get("content")
+            .ok_or_else(|| SerenyaError::Audio("Missing content in Spotify playlistV2".to_owned()))?;
+
+        if total_count.is_none() {
+            let tc = content.get("totalCount").and_then(|t| t.as_u64()).unwrap_or(0);
+            total_count = Some(tc as usize);
+            tracing::info!("Spotify playlist total track count: {}", tc);
+        }
+
+        let items = content
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| SerenyaError::Audio("Missing items in Spotify playlist content".to_owned()))?;
 
         if items.is_empty() {
             tracing::info!("No more items found in Spotify playlist response.");
@@ -1353,29 +1362,42 @@ async fn resolve_spotify_playlist_api(
 
         let items_len = items.len();
         for item in items {
-            let Some(track_val) = item.get("track").or_else(|| item.get("item")) else {
+            let track_val = item.pointer("/itemV2/data")
+                .or_else(|| item.pointer("/itemV3/data"));
+            let Some(track_val) = track_val else {
                 continue;
             };
-            if track_val.is_null() {
-                continue;
-            }
 
             let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else {
                 continue;
             };
+
             let duration_ms = track_val
-                .get("duration_ms")
+                .pointer("/trackDuration/totalMilliseconds")
                 .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    track_val
+                        .pointer("/consumptionExperienceTrait/duration/seconds")
+                        .and_then(|v| v.as_u64())
+                        .map(|s| s * 1000)
+                })
                 .unwrap_or(0);
 
             let mut artists_vec = Vec::new();
-            if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
+            if let Some(artists) = track_val.pointer("/artists/items").and_then(|v| v.as_array()) {
                 for a in artists {
-                    if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
+                    if let Some(a_name) = a.pointer("/profile/name").and_then(|v| v.as_str()) {
                         artists_vec.push(a_name.to_owned());
                     }
                 }
+            } else if let Some(contributors) = track_val.pointer("/identityTrait/contributors/items").and_then(|v| v.as_array()) {
+                for c in contributors {
+                    if let Some(c_name) = c.get("name").and_then(|v| v.as_str()) {
+                        artists_vec.push(c_name.to_owned());
+                    }
+                }
             }
+
             let artist_str = if artists_vec.is_empty() {
                 "".to_owned()
             } else {
@@ -1383,8 +1405,8 @@ async fn resolve_spotify_playlist_api(
             };
 
             let thumbnail = track_val
-                .get("album")
-                .and_then(|v| v.get("images"))
+                .pointer("/albumOfTrack/coverArt/sources")
+                .or_else(|| track_val.pointer("/visualIdentityTrait/squareCoverImage/image/data/sources"))
                 .and_then(|v| v.as_array())
                 .and_then(|arr| arr.first())
                 .and_then(|img| img.get("url"))
@@ -1420,12 +1442,12 @@ async fn resolve_spotify_playlist_api(
             items_len
         );
 
-        if body.get("next").and_then(|v| v.as_str()).is_none() {
-            tracing::info!("Spotify API response does not have a next page link.");
-            break;
-        }
-
         offset += items_len;
+        if let Some(tc) = total_count {
+            if offset >= tc {
+                break;
+            }
+        }
     }
 
     tracing::info!(
@@ -1446,49 +1468,24 @@ async fn resolve_spotify_playlist(
         playlist_id,
         limit
     );
+    if playlist_id.starts_with("37i9dQZF") {
+        tracing::info!(
+            "Playlist {} is Spotify-curated. Bypassing Partner API and using embed scraper fallback directly.",
+            playlist_id
+        );
+        return resolve_spotify_playlist_fallback(playlist_id, limit, user_id, http_client).await;
+    }
     if let Some(config) = crate::audio::runtime::spotify_settings() {
-        if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
+        if config
+            .sp_dc
+            .as_ref()
+            .map(|cookie| !cookie.trim().is_empty())
+            .unwrap_or(false)
+        {
             tracing::info!(
-                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+                "Spotify sp_dc cookie found. Attempting resolution via Spotify Web API..."
             );
-            let mut api_attempts = 0;
-            let mut api_result = Err(SerenyaError::Audio("Not attempted".to_string()));
-            while api_attempts < 3 {
-                api_attempts += 1;
-                tracing::info!(
-                    "Attempting Spotify Web API playlist resolution (attempt {}/3)...",
-                    api_attempts
-                );
-                match resolve_spotify_playlist_api(
-                    playlist_id,
-                    limit,
-                    user_id,
-                    client_id,
-                    client_secret,
-                    http_client,
-                )
-                .await
-                {
-                    Ok(tracks) => {
-                        api_result = Ok(tracks);
-                        break;
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "Spotify Web API playlist resolution attempt {} failed: {:?}",
-                            api_attempts,
-                            err
-                        );
-                        if api_attempts < 3 {
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                        } else {
-                            api_result = Err(err);
-                        }
-                    }
-                }
-            }
-
-            match api_result {
+            match resolve_spotify_playlist_api(playlist_id, limit, user_id, http_client).await {
                 Ok(tracks) => {
                     tracing::info!(
                         "Successfully resolved {} tracks via Spotify Web API",
@@ -1498,14 +1495,14 @@ async fn resolve_spotify_playlist(
                 }
                 Err(err) => {
                     tracing::warn!(
-                        "Spotify Web API playlist resolution failed completely after 3 attempts ({:?}). Falling back to Spotify embed scraper...",
+                        "Spotify Web API playlist resolution failed ({:?}). Falling back to Spotify embed scraper...",
                         err
                     );
                 }
             }
         } else {
             tracing::warn!(
-                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+                "Spotify sp_dc cookie missing in config. Falling back to Spotify embed scraper."
             );
         }
     } else {
@@ -1520,18 +1517,12 @@ async fn resolve_spotify_album_api(
     album_id: &str,
     limit: usize,
     user_id: u64,
-    client_id: &str,
-    client_secret: &str,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
     tracing::info!("Requesting Spotify API access token for album resolution...");
-    let token = crate::audio::providers::get_spotify_access_token(
-        http_client,
-        client_id,
-        client_secret,
-        Duration::from_secs(5),
-    )
-    .await?;
+    let token =
+        crate::audio::providers::get_spotify_access_token(http_client, Duration::from_secs(5))
+            .await?;
     tracing::info!("Spotify API access token retrieved successfully.");
 
     let mut tracks = Vec::new();
@@ -1776,20 +1767,16 @@ async fn resolve_spotify_album(
         limit
     );
     if let Some(config) = crate::audio::runtime::spotify_settings() {
-        if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
+        if config
+            .sp_dc
+            .as_ref()
+            .map(|cookie| !cookie.trim().is_empty())
+            .unwrap_or(false)
+        {
             tracing::info!(
-                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+                "Spotify sp_dc cookie found. Attempting resolution via Spotify Web API..."
             );
-            match resolve_spotify_album_api(
-                album_id,
-                limit,
-                user_id,
-                client_id,
-                client_secret,
-                http_client,
-            )
-            .await
-            {
+            match resolve_spotify_album_api(album_id, limit, user_id, http_client).await {
                 Ok(tracks) => {
                     tracing::info!(
                         "Successfully resolved {} tracks via Spotify Web API",
@@ -1806,7 +1793,7 @@ async fn resolve_spotify_album(
             }
         } else {
             tracing::warn!(
-                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+                "Spotify sp_dc cookie missing in config. Falling back to Spotify embed scraper."
             );
         }
     } else {
@@ -1840,18 +1827,12 @@ async fn resolve_spotify_artist_top_tracks_api(
     artist_id: &str,
     limit: usize,
     user_id: u64,
-    client_id: &str,
-    client_secret: &str,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
     tracing::info!("Requesting Spotify API access token for artist top tracks resolution...");
-    let token = crate::audio::providers::get_spotify_access_token(
-        http_client,
-        client_id,
-        client_secret,
-        Duration::from_secs(5),
-    )
-    .await?;
+    let token =
+        crate::audio::providers::get_spotify_access_token(http_client, Duration::from_secs(5))
+            .await?;
     tracing::info!("Spotify API access token retrieved successfully.");
 
     let market = crate::audio::runtime::spotify_settings()
@@ -1983,19 +1964,17 @@ async fn resolve_spotify_artist_top_tracks(
         limit
     );
     if let Some(config) = crate::audio::runtime::spotify_settings() {
-        if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
+        if config
+            .sp_dc
+            .as_ref()
+            .map(|cookie| !cookie.trim().is_empty())
+            .unwrap_or(false)
+        {
             tracing::info!(
-                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+                "Spotify sp_dc cookie found. Attempting resolution via Spotify Web API..."
             );
-            match resolve_spotify_artist_top_tracks_api(
-                artist_id,
-                limit,
-                user_id,
-                client_id,
-                client_secret,
-                http_client,
-            )
-            .await
+            match resolve_spotify_artist_top_tracks_api(artist_id, limit, user_id, http_client)
+                .await
             {
                 Ok(tracks) => {
                     tracing::info!(
@@ -2013,7 +1992,7 @@ async fn resolve_spotify_artist_top_tracks(
             }
         } else {
             tracing::warn!(
-                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+                "Spotify sp_dc cookie missing in config. Falling back to Spotify embed scraper."
             );
         }
     } else {
@@ -2032,11 +2011,16 @@ pub async fn resolve_ytsearch_track(
         return Ok(());
     }
 
-    let query = &track.url["ytsearch1:".len()..];
+    let raw_query = &track.url["ytsearch1:".len()..];
+    let query = if !raw_query.to_lowercase().contains("lyric") {
+        format!("{} lyrics", raw_query)
+    } else {
+        raw_query.to_owned()
+    };
     tracing::info!(query, "Resolving ytsearch1 query lazily to YouTube URL");
 
     let scored =
-        perform_parallel_search(query, &track.title, None, track.duration, http_client).await?;
+        perform_parallel_search(&query, &track.title, None, track.duration, http_client).await?;
 
     if let Some((best_candidate, score)) = scored.into_iter().next() {
         tracing::info!(
@@ -2051,9 +2035,9 @@ pub async fn resolve_ytsearch_track(
         }
         Ok(())
     } else {
-        let mut candidates = YouTubeProvider.search(query, http_client).await?;
+        let mut candidates = YouTubeProvider.search(&query, http_client).await?;
         if candidates.is_empty() && crate::audio::runtime::ytdlp_enabled() {
-            if let Ok(ytdl_candidates) = YouTubeProvider.search_fallback_ytdl(query).await {
+            if let Ok(ytdl_candidates) = YouTubeProvider.search_fallback_ytdl(&query).await {
                 candidates = ytdl_candidates;
             }
         }

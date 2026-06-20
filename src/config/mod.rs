@@ -37,8 +37,7 @@ pub struct LoggingSection {
 #[derive(Deserialize, Clone, Debug)]
 pub struct SpotifySection {
     pub enabled: bool,
-    pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+    pub sp_dc: Option<String>,
     pub enable_track: bool,
     pub enable_playlist: bool,
     pub enable_album: bool,
@@ -335,8 +334,7 @@ mod tests {
     fn test_spotify() -> SpotifySection {
         SpotifySection {
             enabled: false,
-            client_id: None,
-            client_secret: None,
+            sp_dc: None,
             enable_track: true,
             enable_playlist: true,
             enable_album: true,

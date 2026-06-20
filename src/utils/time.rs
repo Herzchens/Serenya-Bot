@@ -4,7 +4,6 @@ use super::SerenyaError;
 
 /// Parses human-readable duration strings like "1h30m", "2m10s", "45".
 /// Bare numbers are treated as seconds.
-#[allow(dead_code)]
 pub fn parse_duration(input: &str) -> Result<Duration, SerenyaError> {
     let input = input.trim();
     if input.is_empty() {

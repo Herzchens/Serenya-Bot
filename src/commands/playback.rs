@@ -48,9 +48,11 @@ pub async fn play(
             if let Some(call) = manager.get(guild_id) {
                 Ok::<_, SerenyaError>(call)
             } else {
-                manager.join(guild_id, user_channel_id).await.map_err(|e| {
+                let call = manager.join(guild_id, user_channel_id).await.map_err(|e| {
                     SerenyaError::Voice(format!("Failed to join voice channel: {}", e))
-                })
+                })?;
+                let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await;
+                Ok(call)
             }
         },
         resolve_input(&query, user_id, db_ref, http_ref)
@@ -142,7 +144,7 @@ fn is_metadata_search_option(track: &Track) -> bool {
         || track.source_provider.starts_with("Apple Music")
 }
 
-async fn enqueue_and_play_resolved(
+pub(crate) async fn enqueue_and_play_resolved(
     ctx: Context<'_>,
     guild_id: serenity::GuildId,
     user_channel_id: serenity::ChannelId,
@@ -153,6 +155,8 @@ async fn enqueue_and_play_resolved(
         ctx.say("No tracks found to play.").await?;
         return Ok(());
     }
+    let requested_track_count = tracks.len();
+    let show_queue_after_enqueue = requested_track_count > 1;
 
     // Get/Create guild player
     let player_lock = ctx
@@ -177,18 +181,6 @@ async fn enqueue_and_play_resolved(
         // Fix: set requester_name for all remaining tracks before queuing
         for t in &mut tracks {
             t.requester_name = ctx.author().name.clone();
-        }
-
-        // Resolve first track search query synchronously so we have a real URL for the embed!
-        if first_track.url.starts_with("ytsearch1:") {
-            if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(
-                &mut first_track,
-                &ctx.data().http_client,
-            )
-            .await
-            {
-                tracing::error!("Failed to resolve Spotify track search: {:?}", e);
-            }
         }
 
         player.now_playing = Some(first_track.clone());
@@ -244,7 +236,7 @@ async fn enqueue_and_play_resolved(
                     return;
                 }
                 if let Some(ref current) = player.now_playing {
-                    if current.url != current_track.url {
+                    if current.url != current_track.url && current.url != first_track_clone.url {
                         tracing::info!(
                             "Track was skipped or changed while resolving stream URL, aborting playback"
                         );
@@ -266,6 +258,7 @@ async fn enqueue_and_play_resolved(
 
                     let announce_channel = {
                         let mut player = player_lock_clone.write().await;
+                        player.consecutive_errors += 1;
                         if player
                             .now_playing
                             .as_ref()
@@ -293,10 +286,10 @@ async fn enqueue_and_play_resolved(
 
                     if let Err(next_err) = crate::audio::events::play_next(
                         guild_id,
-                        &database_clone,
-                        &guild_players_clone,
-                        &http_client_clone,
-                        &serenity_ctx_clone,
+                        std::sync::Arc::clone(&database_clone),
+                        std::sync::Arc::clone(&guild_players_clone),
+                        http_client_clone.clone(),
+                        serenity_ctx_clone.clone(),
                         None,
                     )
                     .await
@@ -311,10 +304,23 @@ async fn enqueue_and_play_resolved(
                 }
             };
 
+            let eight_d_enabled = {
+                let player = player_lock_clone.read().await;
+                player.eight_d_enabled
+            };
+            let source = match crate::audio::source::create_stream_input(
+                http_client_clone.clone(),
+                resolved_url.clone(),
+                eight_d_enabled,
+            ) {
+                Ok(source) => source,
+                Err(err) => {
+                    tracing::error!(guild_id = %guild_id, %err, "Failed to create audio input");
+                    return;
+                }
+            };
+
             let mut call = call_lock_clone.lock().await;
-            let source: songbird::input::Input =
-                songbird::input::HttpRequest::new(http_client_clone.clone(), resolved_url.clone())
-                    .into();
             let handle = call.play_input(source);
 
             // 4. Register event handlers
@@ -344,7 +350,7 @@ async fn enqueue_and_play_resolved(
             // Check race condition again
             if player.playback_status == PlaybackStatus::Playing {
                 if let Some(ref mut current) = player.now_playing {
-                    if current.url == current_track.url {
+                    if current.url == current_track.url || current.url == first_track_clone.url {
                         current.resolved_url = Some(resolved_url.clone());
                         player.current_track_handle = Some(handle);
                         crate::audio::events::schedule_prefetch(
@@ -364,7 +370,10 @@ async fn enqueue_and_play_resolved(
         // Drop player lock BEFORE sending response to allow background task to start immediately!
         drop(player);
 
-        if added > 0 {
+        if show_queue_after_enqueue {
+            let queue_tracks = queue_snapshot(&player_lock).await;
+            crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue").await?;
+        } else if added > 0 {
             let mut embed = crate::discord::embeds::now_playing_announce_embed(&first_track);
             embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
                 "Enqueued {} other tracks.",
@@ -394,6 +403,14 @@ async fn enqueue_and_play_resolved(
                 crate::discord::embeds::error_embed("Queue is full! Could not add any tracks.");
             let reply = poise::CreateReply::default().embed(embed);
             ctx.send(reply).await?;
+        } else if show_queue_after_enqueue {
+            let mut queue_tracks = Vec::new();
+            if let Some(ref np) = player.now_playing {
+                queue_tracks.push(np.clone());
+            }
+            queue_tracks.extend(player.queue.iter().cloned());
+            drop(player);
+            crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue").await?;
         } else if added == 1 && track_count == 1 {
             let queue_pos = player.queue.len();
             if let Some(track) = player.queue.get(queue_pos - 1) {
@@ -424,6 +441,18 @@ async fn enqueue_and_play_resolved(
     }
 
     Ok(())
+}
+
+async fn queue_snapshot(
+    player_lock: &std::sync::Arc<tokio::sync::RwLock<GuildPlayer>>,
+) -> Vec<Track> {
+    let player = player_lock.read().await;
+    let mut tracks = Vec::new();
+    if let Some(ref np) = player.now_playing {
+        tracks.push(np.clone());
+    }
+    tracks.extend(player.queue.iter().cloned());
+    tracks
 }
 
 /// Pause the currently playing song.
@@ -663,10 +692,10 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
             drop(player);
             crate::audio::events::play_next(
                 guild_id,
-                &ctx.data().database,
-                &ctx.data().guild_players,
-                &ctx.data().http_client,
-                ctx.serenity_context(),
+                std::sync::Arc::clone(&ctx.data().database),
+                std::sync::Arc::clone(&ctx.data().guild_players),
+                ctx.data().http_client.clone(),
+                ctx.serenity_context().clone(),
                 None,
             )
             .await?;

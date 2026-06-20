@@ -23,25 +23,49 @@ async fn save_tracks_to_playlist(
     Ok(added)
 }
 
-/// Add a song to a playlist.
+/// Add songs to a playlist.
 #[poise::command(slash_command, prefix_command)]
 pub async fn add(
     ctx: Context<'_>,
     #[autocomplete = "super::autocomplete_playlist"]
     #[description = "Playlist name"]
     name: String,
-    #[description = "Search query or URL"] query: String,
+    #[description = "Search query or URLs (separated by spaces or commas)"] query: String,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id.get();
     let db = &ctx.data().database;
     let config = ctx.data().config();
 
     ctx.defer().await?;
-    let resolved =
-        crate::audio::resolve_input(&query, user_id, db, &ctx.data().http_client).await?;
-    let tracks = resolved.into_tracks_or_top();
-    if tracks.is_empty() {
-        ctx.say("No tracks found for the query.").await?;
+
+    // Split input query by whitespace or commas to support multiple links
+    let mut urls = Vec::new();
+    for part in query.split(|c: char| c == ',' || c.is_whitespace()) {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            urls.push(trimmed.to_string());
+        }
+    }
+
+    if urls.is_empty() {
+        ctx.say("Please provide at least one search query or URL.").await?;
+        return Ok(());
+    }
+
+    let mut all_tracks = Vec::new();
+    for url in urls {
+        match crate::audio::resolve_input(&url, user_id, db, &ctx.data().http_client).await {
+            Ok(resolved) => {
+                all_tracks.extend(resolved.into_tracks_or_top());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to resolve input '{}': {:?}", url, e);
+            }
+        }
+    }
+
+    if all_tracks.is_empty() {
+        ctx.say("No tracks found for the provided query/queries.").await?;
         return Ok(());
     }
 
@@ -51,11 +75,12 @@ pub async fn add(
         .ok_or_else(|| SerenyaError::NotFound(format!("Playlist '{}' not found.", name)))?;
 
     let max_tracks = config.playback.max_tracks_per_user_playlist;
-    if playlist.tracks.len() + tracks.len() > max_tracks {
+    if playlist.tracks.len() + all_tracks.len() > max_tracks {
         ctx.say(format!(
-            "Playlist limit exceeded! Cannot add {} tracks (max {}).",
-            tracks.len(),
-            max_tracks
+            "Playlist limit exceeded! Cannot add {} tracks (max {}). Current size: {}.",
+            all_tracks.len(),
+            max_tracks,
+            playlist.tracks.len()
         ))
         .await?;
         return Ok(());
@@ -65,7 +90,7 @@ pub async fn add(
         db,
         user_id,
         &name,
-        tracks,
+        all_tracks,
         max_tracks,
         config.playback.max_playlist_import,
     )

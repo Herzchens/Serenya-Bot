@@ -80,6 +80,10 @@ pub fn yt_dlp_timeout() -> Duration {
     Duration::from_secs(settings().yt_dlp_timeout_seconds.max(1))
 }
 
+pub fn ytdlp_enabled() -> bool {
+    true
+}
+
 pub fn prefetch_timeout() -> Duration {
     Duration::from_secs(settings().prefetch_timeout_seconds.max(1))
 }
@@ -124,10 +128,12 @@ pub async fn run_ytdlp(
     youtube_sensitive: bool,
     negative_cache_key: Option<String>,
 ) -> Result<Output, SerenyaError> {
-    tracing::warn!(context, "yt-dlp is temporarily disabled");
-    return Err(SerenyaError::Audio(
-        "yt-dlp is temporarily disabled".to_owned(),
-    ));
+    if !ytdlp_enabled() {
+        tracing::warn!(context, "yt-dlp is temporarily disabled");
+        return Err(SerenyaError::Audio(
+            "yt-dlp is temporarily disabled".to_owned(),
+        ));
+    }
 
     if youtube_sensitive && is_youtube_degraded() {
         return Err(youtube_degraded_error());

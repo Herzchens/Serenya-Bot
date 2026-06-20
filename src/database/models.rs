@@ -21,6 +21,10 @@ pub struct GuildSettings {
     pub total_songs_played: u64,
     #[serde(default)]
     pub total_listening_seconds: u64,
+    #[serde(default = "default_guild_quality")]
+    pub quality: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 impl Default for GuildSettings {
@@ -29,12 +33,18 @@ impl Default for GuildSettings {
             announce_track: true,
             total_songs_played: 0,
             total_listening_seconds: 0,
+            quality: "auto".to_owned(),
+            prefix: None,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_guild_quality() -> String {
+    "auto".to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

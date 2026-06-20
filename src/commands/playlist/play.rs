@@ -1,95 +1,5 @@
 use crate::core::Track;
 use crate::utils::{Context, Error, SerenyaError};
-use poise::serenity_prelude as serenity;
-
-async fn enqueue_playlist_tracks(
-    ctx: Context<'_>,
-    guild_id: serenity::GuildId,
-    user_channel_id: serenity::ChannelId,
-    mut tracks: Vec<Track>,
-) -> Result<(), Error> {
-    let player_lock = ctx
-        .data()
-        .guild_players
-        .entry(guild_id)
-        .or_insert_with(|| {
-            std::sync::Arc::new(tokio::sync::RwLock::new(crate::core::GuildPlayer::new()))
-        })
-        .clone();
-
-    let mut player = player_lock.write().await;
-    player.voice_channel = Some(user_channel_id);
-    player.announce_channel = Some(ctx.channel_id());
-
-    let max_queue_size = ctx.data().config().playback.max_queue_size;
-
-    if player.playback_status == crate::core::PlaybackStatus::Idle && player.now_playing.is_none() {
-        let mut first = tracks.remove(0);
-
-        // Resolve first track search query synchronously so we have a real URL for the embed!
-        if first.url.starts_with("ytsearch1:") {
-            if let Err(e) =
-                crate::audio::resolver::resolve_ytsearch_track(&mut first, &ctx.data().http_client)
-                    .await
-            {
-                tracing::error!("Failed to resolve Spotify track search: {:?}", e);
-            }
-        }
-
-        player.now_playing = Some(first.clone());
-        player.playback_status = crate::core::PlaybackStatus::Playing;
-
-        let manager = songbird::get(ctx.serenity_context())
-            .await
-            .ok_or_else(|| SerenyaError::Voice("Songbird not initialized.".into()))?;
-        let call_lock = if let Some(call) = manager.get(guild_id) {
-            call
-        } else {
-            manager
-                .join(guild_id, user_channel_id)
-                .await
-                .map_err(|e| SerenyaError::Voice(format!("Failed to join voice channel: {}", e)))?
-        };
-        let resolved_url =
-            crate::audio::extract_stream_url_for_guild(guild_id.get(), &first.url).await?;
-        let mut call = call_lock.lock().await;
-        let source: songbird::input::Input =
-            songbird::input::HttpRequest::new(ctx.data().http_client.clone(), resolved_url).into();
-        let handle = call.play_input(source);
-
-        let _ = handle.add_event(
-            songbird::Event::Track(songbird::TrackEvent::End),
-            crate::audio::events::TrackEndHandler {
-                guild_id,
-                database: ctx.data().database.clone(),
-                guild_players: ctx.data().guild_players.clone(),
-                http_client: ctx.data().http_client.clone(),
-                serenity_ctx: ctx.serenity_context().clone(),
-            },
-        );
-        player.current_track_handle = Some(handle);
-
-        let added = player.queue.push_batch(tracks, max_queue_size)?;
-        let mut embed = crate::discord::embeds::now_playing_announce_embed(&first);
-        if added > 0 {
-            embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
-                "Enqueued {} other tracks.",
-                added
-            )));
-        }
-        let reply = poise::CreateReply::default().embed(embed);
-        ctx.send(reply).await?;
-    } else {
-        let added = player.queue.push_batch(tracks, max_queue_size)?;
-        ctx.say(format!(
-            "📝 **Enqueued {} tracks** from the playlist.",
-            added
-        ))
-        .await?;
-    }
-
-    Ok(())
-}
 
 /// Play all tracks in a playlist.
 #[poise::command(slash_command, prefix_command)]
@@ -145,6 +55,29 @@ pub async fn play(
         });
     }
 
-    enqueue_playlist_tracks(ctx, guild_id, user_channel_id, tracks).await?;
+    let manager = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
+        .clone();
+
+    let call_lock = if let Some(call) = manager.get(guild_id) {
+        call
+    } else {
+        let call = manager
+            .join(guild_id, user_channel_id)
+            .await
+            .map_err(|e| SerenyaError::Voice(format!("Failed to join voice channel: {}", e)))?;
+        let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await;
+        call
+    };
+
+    crate::commands::playback::enqueue_and_play_resolved(
+        ctx,
+        guild_id,
+        user_channel_id,
+        call_lock,
+        tracks,
+    )
+    .await?;
     Ok(())
 }

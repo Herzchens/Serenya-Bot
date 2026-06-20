@@ -1,6 +1,7 @@
 use crate::core::Track;
 use crate::utils::SerenyaError;
 use moka::future::Cache;
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -266,6 +267,7 @@ async fn run_ytdlp_stream_resolution(
 
 async fn extract_stream_url_inner(track_url: &str) -> Result<String, SerenyaError> {
     if let Some(stream_url) = cache_get_stream(track_url).await {
+        tracing::debug!(track_url, stream_url = %stream_url, "stream cache hit");
         return Ok(stream_url);
     }
 
@@ -281,46 +283,23 @@ async fn extract_stream_url_inner(track_url: &str) -> Result<String, SerenyaErro
     let youtube_url = is_youtube_url(track_url);
 
     if youtube_url && !crate::audio::runtime::is_youtube_degraded() {
-        if let Some(video_id) = extract_youtube_video_id(track_url) {
-            let client = reqwest::Client::new();
-            let video_id_str = video_id.to_owned();
-            let track_url_str = track_url.to_owned();
-            let negative_key_str = negative_key.clone();
-
-            tracing::info!(video_id = %video_id_str, "Running parallel stream resolution (Piped/Invidious vs yt-dlp)");
-
-            // Query Piped/Invidious in parallel with yt-dlp
-            let res = tokio::select! {
-                piped_res = resolve_via_invidious_or_piped(&video_id_str, &client) => {
-                    if let Some(url) = piped_res {
-                        tracing::info!(video_id = %video_id_str, "Piped/Invidious resolved stream URL first!");
-                        Ok(url)
-                    } else {
-                        tracing::info!(video_id = %video_id_str, "Piped/Invidious failed, waiting for yt-dlp");
-                        run_ytdlp_stream_resolution(&track_url_str, youtube_url, &negative_key_str).await
-                    }
-                }
-                ytdlp_res = run_ytdlp_stream_resolution(&track_url_str, youtube_url, &negative_key_str) => {
-                    ytdlp_res
-                }
-            };
-
-            if let Ok(ref stream_url) = res {
-                cache_set_stream(track_url.to_owned(), stream_url.clone()).await;
-            }
-            return res;
+        if let Some(stream_url) = resolve_youtube_stream_native(track_url).await {
+            tracing::info!(track_url, stream_url = %stream_url, "native stream resolution succeeded");
+            cache_set_stream(track_url.to_owned(), stream_url.clone()).await;
+            return Ok(stream_url);
         }
+        tracing::debug!(track_url, "native stream resolution failed, falling back to yt-dlp");
     }
 
-    // Non-YouTube URL or fallback when video_id extraction fails
+    // Non-YouTube URL or fallback when native resolution fails
     let res = run_ytdlp_stream_resolution(track_url, youtube_url, &negative_key).await;
     if let Ok(ref stream_url) = res {
+        tracing::info!(track_url, stream_url = %stream_url, "yt-dlp stream resolution succeeded");
         cache_set_stream(track_url.to_owned(), stream_url.clone()).await;
     }
     res
 }
 
-#[allow(dead_code)]
 async fn resolve_via_rusty_ytdl(track_url: &str) -> Result<String, SerenyaError> {
     use rusty_ytdl::{Video, VideoOptions, VideoSearchOptions, choose_format};
 
@@ -341,6 +320,143 @@ async fn resolve_via_rusty_ytdl(track_url: &str) -> Result<String, SerenyaError>
         .map_err(|e| SerenyaError::Audio(format!("rusty_ytdl choose_format failed: {e}")))?;
 
     Ok(format.url.clone())
+}
+
+fn is_direct_stream_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("googlevideo.com") || lower.contains("googleusercontent.com")
+}
+
+async fn resolve_youtube_stream_native(track_url: &str) -> Option<String> {
+    let mut join_set = tokio::task::JoinSet::new();
+    let track_url_owned = track_url.to_owned();
+
+    join_set.spawn(async move {
+        match resolve_via_rusty_ytdl(&track_url_owned).await {
+            Ok(url) => {
+                tracing::debug!(track_url = %track_url_owned, stream_url = %url, "rusty_ytdl resolved");
+                Some(url)
+            }
+            Err(err) => {
+                tracing::debug!(track_url = %track_url_owned, %err, "rusty_ytdl stream resolution failed");
+                None
+            }
+        }
+    });
+
+    if let Some(video_id) = extract_youtube_video_id(track_url).map(str::to_owned) {
+        join_set.spawn(async move {
+            let client = reqwest::Client::new();
+            resolve_via_invidious_or_piped(&video_id, &client).await
+        });
+    }
+
+    let deadline = Duration::from_secs(4);
+    let started = Instant::now();
+    while started.elapsed() < deadline {
+        let remaining = deadline.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, join_set.join_next()).await {
+            Ok(Some(Ok(Some(url)))) => {
+                // Only accept direct Google video URLs — reject piped/invidious proxy URLs
+                // which are unreliable and often broken
+                if is_direct_stream_url(&url) {
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    return Some(url);
+                }
+                tracing::debug!(url = %url, "rejecting non-direct stream URL from native resolver");
+            }
+            Ok(Some(Ok(None))) | Ok(Some(Err(_))) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    join_set.abort_all();
+    while join_set.join_next().await.is_some() {}
+    None
+}
+
+pub fn create_stream_input(
+    _http_client: reqwest::Client,
+    stream_url: String,
+    eight_d_enabled: bool,
+) -> Result<songbird::input::Input, SerenyaError> {
+    // Always use ffmpeg for robust playback — handles reconnection, headers,
+    // and various URL types better than songbird's built-in HttpRequest
+    create_ffmpeg_stream_input(&stream_url, None, eight_d_enabled)
+}
+
+pub fn create_ffmpeg_stream_input(
+    stream_url: &str,
+    seek: Option<Duration>,
+    eight_d_enabled: bool,
+) -> Result<songbird::input::Input, SerenyaError> {
+    let mut args = vec![
+        "-nostdin".to_owned(),
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-reconnect".to_owned(),
+        "1".to_owned(),
+        "-reconnect_streamed".to_owned(),
+        "1".to_owned(),
+        "-reconnect_delay_max".to_owned(),
+        "5".to_owned(),
+    ];
+
+    if let Some(position) = seek {
+        args.push("-ss".to_owned());
+        args.push(position.as_secs().to_string());
+    }
+
+    args.extend([
+        "-user_agent".to_owned(),
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36".to_owned(),
+        "-headers".to_owned(),
+        "Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n".to_owned(),
+        "-i".to_owned(),
+        stream_url.to_owned(),
+        "-vn".to_owned(),
+        "-ar".to_owned(),
+        "48000".to_owned(),
+        "-ac".to_owned(),
+        "2".to_owned(),
+    ]);
+
+    if eight_d_enabled {
+        args.push("-af".to_owned());
+        args.push("apulsator=hz=0.08:amount=0.85,freeverb=room_size=0.5:damp=0.5:wet_level=0.33:dry_level=1.0:width=1.0".to_owned());
+    }
+
+    args.extend([
+        "-f".to_owned(),
+        "wav".to_owned(),
+        "-acodec".to_owned(),
+        "pcm_s16le".to_owned(),
+        "pipe:1".to_owned(),
+    ]);
+
+    let mut child = Command::new("ffmpeg")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| SerenyaError::Audio(format!("Failed to spawn ffmpeg: {e}")))?;
+
+    // Log ffmpeg stderr in background for diagnostics
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut reader = std::io::BufReader::new(stderr);
+            if reader.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
+                tracing::warn!(ffmpeg_stderr = %buf, "ffmpeg stderr output");
+            }
+        });
+    }
+
+    let child_container: songbird::input::ChildContainer = child.into();
+    Ok(child_container.into())
 }
 
 pub fn clear_caches() -> (usize, usize) {

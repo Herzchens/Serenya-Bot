@@ -1,4 +1,3 @@
-use crate::core::Track;
 use crate::discord::pagination::paginate_queue;
 use crate::utils::{Context, Error, SerenyaError};
 
@@ -21,12 +20,16 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
     let player = player_lock.read().await;
-    let tracks: Vec<Track> = player.queue.iter().cloned().collect();
+    let mut tracks = Vec::new();
+    if let Some(ref np) = player.now_playing {
+        tracks.push(np.clone());
+    }
+    tracks.extend(player.queue.iter().cloned());
 
     // Release read lock before awaiting paginate_queue
     drop(player);
 
-    paginate_queue(ctx, &tracks).await?;
+    paginate_queue(ctx, &tracks, "🎶 Current Queue").await?;
     Ok(())
 }
 
@@ -57,7 +60,27 @@ pub async fn remove(
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
     let mut player = player_lock.write().await;
-    let index = position - 1;
+    let queue_len = player.queue.len();
+
+    let index = if player.now_playing.is_some() {
+        if position == 1 {
+            ctx.say("❌ Cannot remove the currently playing track. Use `/skip` to skip it.").await?;
+            return Ok(());
+        }
+        let idx = position - 2;
+        if idx >= queue_len {
+            ctx.say(format!("❌ Position {} is out of bounds (queue size is {}).", position, queue_len + 1)).await?;
+            return Ok(());
+        }
+        idx
+    } else {
+        let idx = position - 1;
+        if idx >= queue_len {
+            ctx.say(format!("❌ Position {} is out of bounds (queue size is {}).", position, queue_len)).await?;
+            return Ok(());
+        }
+        idx
+    };
 
     let removed_track = player
         .queue

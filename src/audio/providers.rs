@@ -142,83 +142,480 @@ impl SpotifyProvider {
 
 struct SpotifyToken {
     access_token: String,
+    client_id: String,
     expires_at: std::time::Instant,
+    cookie_hash: u64,
 }
 
 static SPOTIFY_TOKEN_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<SpotifyToken>>> =
     std::sync::OnceLock::new();
 
-pub(crate) async fn get_spotify_access_token(
-    http_client: &reqwest::Client,
-    client_id: &str,
-    client_secret: &str,
-    timeout: std::time::Duration,
-) -> Result<String, SerenyaError> {
-    let cache_lock = SPOTIFY_TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
-    let mut cache = cache_lock.lock().await;
+const SPOTIFY_WEB_TOKEN_URL: &str = "https://open.spotify.com/api/token";
+const SPOTIFY_WEB_HOME_URL: &str = "https://open.spotify.com/";
+const SPOTIFY_WEB_PRODUCT_TYPE: &str = "web-player";
+const SPOTIFY_WEB_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36";
+const SPOTIFY_TOTP_VERSION: &str = "61";
+const SPOTIFY_TOTP_CIPHER: [u8; 26] = [
+    44, 55, 47, 42, 70, 40, 34, 114, 76, 74, 50, 111, 120, 97, 75, 76, 94, 102, 43, 69, 49, 120,
+    118, 80, 64, 78,
+];
 
+#[derive(Clone, Debug)]
+pub(crate) struct SpotifySessionInfo {
+    pub access_token: String,
+    pub client_id: String,
+}
+
+struct SpotifyClientTokenCache {
+    client_token: String,
+    client_version: String,
+    device_id: String,
+    expires_at: std::time::Instant,
+}
+
+static SPOTIFY_CLIENT_TOKEN_CACHE: std::sync::OnceLock<tokio::sync::Mutex<Option<SpotifyClientTokenCache>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) struct SpotifyClientTokenInfo {
+    pub client_token: String,
+    pub client_version: String,
+    pub device_id: String,
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = 0u32;
+    let mut bits = 0;
+    for c in input.chars() {
+        if c.is_whitespace() || c == '=' {
+            continue;
+        }
+        let val = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' | '-' => 62,
+            '/' | '_' => 63,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((buffer >> bits) & 0xFF) as u8);
+        }
+    }
+    Some(bytes)
+}
+
+pub(crate) async fn get_spotify_session_info(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+) -> Result<SpotifySessionInfo, SerenyaError> {
+    let sp_dc = crate::audio::runtime::spotify_settings()
+        .and_then(|config| config.sp_dc)
+        .filter(|cookie| !cookie.trim().is_empty())
+        .ok_or_else(|| SerenyaError::Audio("Spotify sp_dc cookie is not configured.".to_owned()))?;
+
+    let cookie_hash = spotify_cookie_hash(&sp_dc);
+    let cache_lock = SPOTIFY_TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
     let now = std::time::Instant::now();
-    if let Some(ref token) = *cache {
-        if token.expires_at > now + std::time::Duration::from_secs(60) {
-            return Ok(token.access_token.clone());
+    {
+        let cache = cache_lock.lock().await;
+        if let Some(ref token) = *cache {
+            if token.cookie_hash == cookie_hash
+                && token.expires_at > now + std::time::Duration::from_secs(60)
+            {
+                return Ok(SpotifySessionInfo {
+                    access_token: token.access_token.clone(),
+                    client_id: token.client_id.clone(),
+                });
+            }
         }
     }
 
-    let token_response = tokio::time::timeout(timeout, async {
+    let token_json = fetch_spotify_web_token(http_client, timeout, &sp_dc).await?;
+
+    let access_token = token_json
+        .get("accessToken")
+        .or_else(|| token_json.get("access_token"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            SerenyaError::Audio("Spotify web token response missing accessToken".to_owned())
+        })?
+        .to_owned();
+
+    let client_id = token_json
+        .get("clientId")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            SerenyaError::Audio("Spotify web token response missing client_id".to_owned())
+        })?
+        .to_owned();
+
+    let expires_at = token_json
+        .get("accessTokenExpirationTimestampMs")
+        .and_then(|value| value.as_u64())
+        .and_then(|timestamp_ms| {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let delta_ms = timestamp_ms as i64 - now_ms;
+            u64::try_from(delta_ms.max(0)).ok()
+        })
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| {
+            std::time::Duration::from_secs(
+                token_json
+                    .get("expires_in")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(3600),
+            )
+        });
+
+    crate::logging::register_secret_to_redact(&access_token);
+
+    let mut cache = cache_lock.lock().await;
+    *cache = Some(SpotifyToken {
+        access_token: access_token.clone(),
+        client_id: client_id.clone(),
+        expires_at: now + expires_at,
+        cookie_hash,
+    });
+
+    Ok(SpotifySessionInfo {
+        access_token,
+        client_id,
+    })
+}
+
+pub(crate) async fn get_spotify_client_token_info(
+    http_client: &reqwest::Client,
+    client_id: &str,
+    timeout: std::time::Duration,
+) -> Result<SpotifyClientTokenInfo, SerenyaError> {
+    let cache_lock = SPOTIFY_CLIENT_TOKEN_CACHE.get_or_init(|| tokio::sync::Mutex::new(None));
+    let now = std::time::Instant::now();
+    {
+        let cache = cache_lock.lock().await;
+        if let Some(ref cached) = *cache {
+            if cached.expires_at > now {
+                return Ok(SpotifyClientTokenInfo {
+                    client_token: cached.client_token.clone(),
+                    client_version: cached.client_version.clone(),
+                    device_id: cached.device_id.clone(),
+                });
+            }
+        }
+    }
+
+    tracing::info!("Fetching Spotify homepage to extract clientVersion and sp_t cookie...");
+    let response = tokio::time::timeout(timeout, async {
         http_client
-            .post("https://accounts.spotify.com/api/token")
-            .basic_auth(client_id, Some(client_secret))
-            .form(&[("grant_type", "client_credentials")])
+            .get(SPOTIFY_WEB_HOME_URL)
+            .header(reqwest::header::USER_AGENT, SPOTIFY_WEB_USER_AGENT)
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .send()
             .await
     })
     .await
-    .map_err(|_| SerenyaError::Audio("Spotify token request timed out".to_owned()))?
-    .map_err(|e| SerenyaError::Audio(format!("Spotify token request failed: {e}")))?;
+    .map_err(|_| SerenyaError::Audio("Spotify home page request timed out".to_owned()))?
+    .map_err(|e| SerenyaError::Audio(format!("Spotify home page request failed: {e}")))?;
 
-    let status = token_response.status();
-    if !status.is_success() {
-        let err_body = token_response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Failed to read response body".to_string());
-        tracing::error!(
-            "Spotify token request failed with status: {}, body: {}",
-            status,
-            err_body
-        );
+    if !response.status().is_success() {
         return Err(SerenyaError::Audio(format!(
-            "Spotify token request failed with status: {}, body: {}",
-            status, err_body
+            "Spotify homepage returned status: {}",
+            response.status()
         )));
     }
 
-    let token_json = token_response
-        .json::<serde_json::Value>()
+    let mut device_id = "some_random_device_id".to_owned();
+    for cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
+        if let Ok(cookie_str) = cookie.to_str() {
+            if cookie_str.starts_with("sp_t=") {
+                if let Some(val) = cookie_str.split(';').next() {
+                    if let Some(val_parts) = val.split('=').nth(1) {
+                        device_id = val_parts.to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let html = response
+        .text()
         .await
-        .map_err(|e| SerenyaError::Audio(format!("Spotify token JSON parse failed: {e}")))?;
+        .map_err(|e| SerenyaError::Audio(format!("Failed to read Spotify homepage HTML: {e}")))?;
 
-    let access_token = token_json
-        .get("access_token")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| {
-            SerenyaError::Audio("Spotify token response missing access_token".to_owned())
-        })?
-        .to_owned();
+    let client_version = if let Some(start_pos) = html.find("<script id=\"appServerConfig\" type=\"text/plain\">") {
+        let tag_len = "<script id=\"appServerConfig\" type=\"text/plain\">".len();
+        let content_start = start_pos + tag_len;
+        if let Some(end_pos) = html[content_start..].find("</script>") {
+            let base64_str = html[content_start..content_start + end_pos].trim();
+            if let Some(decoded_bytes) = base64_decode(base64_str) {
+                if let Ok(decoded_str) = String::from_utf8(decoded_bytes) {
+                    if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&decoded_str) {
+                        config_json
+                            .get("clientVersion")
+                            .and_then(|v| v.as_str())
+                            .map(|v| v.to_owned())
+                            .unwrap_or_else(|| "1.2.93.427.ge5dd628d".to_owned())
+                    } else {
+                        "1.2.93.427.ge5dd628d".to_owned()
+                    }
+                } else {
+                    "1.2.93.427.ge5dd628d".to_owned()
+                }
+            } else {
+                "1.2.93.427.ge5dd628d".to_owned()
+            }
+        } else {
+            "1.2.93.427.ge5dd628d".to_owned()
+        }
+    } else {
+        "1.2.93.427.ge5dd628d".to_owned()
+    };
 
-    let expires_in = token_json
-        .get("expires_in")
-        .and_then(|value| value.as_u64())
-        .unwrap_or(3600);
+    tracing::info!("Requesting client token from Spotify...");
 
-    crate::logging::register_secret_to_redact(&access_token);
-
-    *cache = Some(SpotifyToken {
-        access_token: access_token.clone(),
-        expires_at: now + std::time::Duration::from_secs(expires_in),
+    let ct_url = "https://clienttoken.spotify.com/v1/clienttoken";
+    let ct_payload = serde_json::json!({
+        "client_data": {
+            "client_version": client_version,
+            "client_id": client_id,
+            "js_sdk_data": {
+                "device_brand": "unknown",
+                "device_model": "unknown",
+                "os": "windows",
+                "os_version": "NT 10.0",
+                "device_id": device_id,
+                "device_type": "computer"
+            }
+        }
     });
 
-    Ok(access_token)
+    let ct_response = tokio::time::timeout(timeout, async {
+        http_client
+            .post(ct_url)
+            .json(&ct_payload)
+            .header(reqwest::header::USER_AGENT, SPOTIFY_WEB_USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| SerenyaError::Audio("Spotify client token request timed out".to_owned()))?
+    .map_err(|e| SerenyaError::Audio(format!("Spotify client token request failed: {e}")))?;
+
+    if !ct_response.status().is_success() {
+        return Err(SerenyaError::Audio(format!(
+            "Spotify client token request failed with status: {}",
+            ct_response.status()
+        )));
+    }
+
+    let ct_data: serde_json::Value = ct_response
+        .json()
+        .await
+        .map_err(|e| SerenyaError::Audio(format!("Failed to parse Spotify client token JSON: {e}")))?;
+
+    let client_token = ct_data
+        .pointer("/granted_token/token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SerenyaError::Audio("Spotify client token response missing token".to_owned()))?
+        .to_owned();
+
+    crate::logging::register_secret_to_redact(&client_token);
+
+    let mut cache = cache_lock.lock().await;
+    *cache = Some(SpotifyClientTokenCache {
+        client_token: client_token.clone(),
+        client_version: client_version.clone(),
+        device_id: device_id.clone(),
+        expires_at: now + std::time::Duration::from_secs(3600),
+    });
+
+    Ok(SpotifyClientTokenInfo {
+        client_token,
+        client_version,
+        device_id,
+    })
+}
+
+pub(crate) async fn get_spotify_access_token(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+) -> Result<String, SerenyaError> {
+    let session = get_spotify_session_info(http_client, timeout).await?;
+    Ok(session.access_token)
+}
+
+async fn fetch_spotify_web_token(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+    sp_dc: &str,
+) -> Result<serde_json::Value, SerenyaError> {
+    let local_time = chrono::Utc::now().timestamp();
+    match request_spotify_web_token_reasons(http_client, timeout, sp_dc, local_time).await {
+        Ok(token) => return Ok(token),
+        Err(err) => {
+            tracing::warn!(
+                "Spotify web token request with local clock failed; retrying with Spotify server time: {:?}",
+                err
+            );
+        }
+    }
+
+    let server_time = fetch_spotify_server_time(http_client, timeout).await?;
+    request_spotify_web_token_reasons(http_client, timeout, sp_dc, server_time).await
+}
+
+async fn request_spotify_web_token_reasons(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+    sp_dc: &str,
+    timestamp_seconds: i64,
+) -> Result<serde_json::Value, SerenyaError> {
+    let mut last_error = None;
+    for reason in ["transport", "init"] {
+        match request_spotify_web_token(http_client, timeout, sp_dc, reason, timestamp_seconds)
+            .await
+        {
+            Ok(token) if spotify_access_token_from_json(&token).is_some() => return Ok(token),
+            Ok(_) => {
+                last_error = Some(SerenyaError::Audio(format!(
+                    "Spotify web token response missing accessToken for reason={reason}"
+                )));
+            }
+            Err(err) => {
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        SerenyaError::Audio("Spotify web token request did not return a token".to_owned())
+    }))
+}
+
+async fn request_spotify_web_token(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+    sp_dc: &str,
+    reason: &str,
+    timestamp_seconds: i64,
+) -> Result<serde_json::Value, SerenyaError> {
+    let totp = spotify_totp_at(timestamp_seconds)?;
+    let params = [
+        ("reason", reason.to_owned()),
+        ("productType", SPOTIFY_WEB_PRODUCT_TYPE.to_owned()),
+        ("totp", totp.clone()),
+        ("totpServer", totp),
+        ("totpVer", SPOTIFY_TOTP_VERSION.to_owned()),
+    ];
+
+    let response = tokio::time::timeout(timeout, async {
+        http_client
+            .get(SPOTIFY_WEB_TOKEN_URL)
+            .query(&params)
+            .header(reqwest::header::COOKIE, format!("sp_dc={sp_dc}"))
+            .header(reqwest::header::USER_AGENT, SPOTIFY_WEB_USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::REFERER, SPOTIFY_WEB_HOME_URL)
+            .header("App-Platform", "WebPlayer")
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| SerenyaError::Audio("Spotify web token request timed out".to_owned()))?
+    .map_err(|e| SerenyaError::Audio(format!("Spotify web token request failed: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(reason, %status, "Spotify web token request failed");
+        return Err(SerenyaError::Audio(format!(
+            "Spotify web token request failed with status {status}"
+        )));
+    }
+
+    response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| SerenyaError::Audio(format!("Spotify web token JSON parse failed: {e}")))
+}
+
+async fn fetch_spotify_server_time(
+    http_client: &reqwest::Client,
+    timeout: std::time::Duration,
+) -> Result<i64, SerenyaError> {
+    let response = tokio::time::timeout(timeout, async {
+        http_client
+            .head(SPOTIFY_WEB_HOME_URL)
+            .header(reqwest::header::USER_AGENT, SPOTIFY_WEB_USER_AGENT)
+            .send()
+            .await
+    })
+    .await
+    .map_err(|_| SerenyaError::Audio("Spotify server time request timed out".to_owned()))?
+    .map_err(|e| SerenyaError::Audio(format!("Spotify server time request failed: {e}")))?;
+
+    let date_header = response
+        .headers()
+        .get(reqwest::header::DATE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            SerenyaError::Audio("Spotify server time response missing Date".to_owned())
+        })?;
+    chrono::DateTime::parse_from_rfc2822(date_header)
+        .map(|date| date.timestamp())
+        .map_err(|e| SerenyaError::Audio(format!("Spotify server time parse failed: {e}")))
+}
+
+fn spotify_totp_at(timestamp_seconds: i64) -> Result<String, SerenyaError> {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    let mut secret_material = String::with_capacity(SPOTIFY_TOTP_CIPHER.len() * 3);
+    for (index, encoded) in SPOTIFY_TOTP_CIPHER.iter().copied().enumerate() {
+        let xor_key = u8::try_from((index % 33) + 9)
+            .map_err(|e| SerenyaError::Audio(format!("Spotify TOTP key conversion failed: {e}")))?;
+        secret_material.push_str(&(encoded ^ xor_key).to_string());
+    }
+
+    let counter = u64::try_from(timestamp_seconds.max(0))
+        .map_err(|e| SerenyaError::Audio(format!("Spotify TOTP timestamp failed: {e}")))?
+        / 30;
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret_material.as_bytes())
+        .map_err(|e| SerenyaError::Audio(format!("Spotify TOTP init failed: {e}")))?;
+    mac.update(&counter.to_be_bytes());
+    let digest = mac.finalize().into_bytes();
+    let offset = digest
+        .last()
+        .map(|byte| usize::from(byte & 0x0f))
+        .ok_or_else(|| SerenyaError::Audio("Spotify TOTP digest is empty".to_owned()))?;
+    let window = digest
+        .get(offset..offset + 4)
+        .ok_or_else(|| SerenyaError::Audio("Spotify TOTP digest window invalid".to_owned()))?;
+    let binary = (u32::from(window[0] & 0x7f) << 24)
+        | (u32::from(window[1]) << 16)
+        | (u32::from(window[2]) << 8)
+        | u32::from(window[3]);
+
+    Ok(format!("{:06}", binary % 1_000_000))
+}
+
+fn spotify_access_token_from_json(token_json: &serde_json::Value) -> Option<&str> {
+    token_json
+        .get("accessToken")
+        .or_else(|| token_json.get("access_token"))
+        .and_then(|value| value.as_str())
+}
+
+fn spotify_cookie_hash(cookie: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cookie.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[async_trait]
@@ -236,20 +633,19 @@ impl MetadataProvider for SpotifyProvider {
             Some(cfg) if cfg.enabled && cfg.enable_text_search => cfg,
             _ => return Ok(Vec::new()),
         };
-        let client_id = match config.client_id {
-            Some(ref val) if !val.trim().is_empty() => val.clone(),
-            _ => return Ok(Vec::new()),
-        };
-        let client_secret = match config.client_secret {
-            Some(ref val) if !val.trim().is_empty() => val.clone(),
-            _ => return Ok(Vec::new()),
-        };
+        if config
+            .sp_dc
+            .as_ref()
+            .map(|cookie| cookie.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Ok(Vec::new());
+        }
 
         let settings = crate::audio::runtime::settings();
         let timeout = crate::audio::runtime::duration_from_millis(settings.spotify_timeout_ms);
 
-        let access_token =
-            get_spotify_access_token(http_client, &client_id, &client_secret, timeout).await?;
+        let access_token = get_spotify_access_token(http_client, timeout).await?;
 
         let market = if config.market.trim().is_empty() {
             "US"

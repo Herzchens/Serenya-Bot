@@ -1,4 +1,5 @@
 use crate::utils::{Context, Error};
+use poise::serenity_prelude as serenity;
 
 /// Show bot latency.
 #[poise::command(slash_command, prefix_command)]
@@ -42,20 +43,73 @@ pub async fn help(
     #[autocomplete = "poise::builtins::autocomplete_command"]
     command: Option<String>,
 ) -> Result<(), Error> {
-    poise::builtins::help(
-        ctx,
-        command.as_deref(),
-        poise::builtins::HelpConfiguration {
-            extra_text_at_bottom: "Type /help <command> for more details.",
-            ..Default::default()
-        },
-    )
-    .await?;
+    if let Some(cmd_name) = command {
+        let cmd = ctx.framework().options().commands.iter().find(|c| {
+            c.name.eq_ignore_ascii_case(&cmd_name)
+                || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(&cmd_name))
+        });
+
+        if let Some(c) = cmd {
+            let mut desc = c.description.clone().unwrap_or_else(|| "No description provided.".to_string());
+            if !c.aliases.is_empty() {
+                desc.push_str(&format!("\n\n**Aliases:** {}", c.aliases.join(", ")));
+            }
+
+            if !c.subcommands.is_empty() {
+                let subs: Vec<String> = c.subcommands.iter().map(|s| format!("`{}`", s.name)).collect();
+                desc.push_str(&format!("\n**Subcommands:** {}", subs.join(", ")));
+            }
+
+            let embed = serenity::CreateEmbed::new()
+                .title(format!("📖 Help: /{}", c.name))
+                .description(desc)
+                .color(0x5865F2);
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        } else {
+            let embed = serenity::CreateEmbed::new()
+                .title("❌ Command Not Found")
+                .description(format!("Could not find a command named `{}`.", cmd_name))
+                .color(0xFF0000);
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        }
+    } else {
+        let embed = serenity::CreateEmbed::new()
+            .title("🎶 Serenya Help Menu")
+            .description("Here is a list of all available commands grouped by category. Type `/help <command>` to see more details about a specific command.")
+            .field(
+                "🎵 Music / Phát nhạc",
+                "`play` - Play a song/playlist\n`search` - Search songs on YouTube\n`lyrics` - Search lyrics\n`playlist` - Manage custom playlists\n`join` - Join voice channel\n`leave` - Leave voice channel",
+                false
+            )
+            .field(
+                "🎛️ Control / Điều khiển",
+                "`pause` - Pause playback\n`resume` - Resume playback\n`stop` - Stop & clear queue\n`skip` - Skip current track\n`replay` - Replay current song\n`previous` - Play previous track\n`loop` - Change loop mode\n`seek` - Seek to time\n`forward` - Fast forward\n`rewind` - Rewind song\n`8d` - Toggle 8D sound effect",
+                false
+            )
+            .field(
+                "📋 Queue / Hàng đợi",
+                "`queue` - View queue\n`remove` - Remove from queue\n`clear` - Clear queue\n`shuffle` - Shuffle queue\n`jump` - Jump to track\n`move` - Move track in queue",
+                false
+            )
+            .field(
+                "⚙️ Settings / Cài đặt",
+                "`prefix` - View or set guild prefix\n`quality` - Change audio quality\n`announce_track` - Toggle song announcement",
+                false
+            )
+            .field(
+                "ℹ️ General / Thông tin",
+                "`ping` - Show latency\n`about` - Bot info\n`stats` - Show bot stats\n`songinfo` - Show track info\n`invite` - Invite link\n`support` - Support server\n`cleanup` - Clean bot chats",
+                false
+            )
+            .footer(serenity::CreateEmbedFooter::new("Type /help <command> for more details."))
+            .color(0x5865F2);
+
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    }
     Ok(())
 }
 
 /// Reload the configuration and clear all caches.
-#[allow(deprecated)]
 #[poise::command(slash_command, prefix_command)]
 pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
     let owner_id = {
@@ -72,7 +126,8 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
     if !is_allowed {
         if let Some(guild_id) = ctx.guild_id() {
             if let Ok(member) = guild_id.member(ctx, ctx.author().id).await {
-                if let Ok(permissions) = member.permissions(ctx) {
+                if let Some(guild) = ctx.guild() {
+                    let permissions = guild.member_permissions(&member);
                     if permissions.administrator() {
                         is_allowed = true;
                     }
@@ -107,8 +162,8 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
 
     // Register secrets for redaction on reload
     crate::logging::register_secret_to_redact(&new_config.bot.token);
-    if let Some(ref secret) = new_config.spotify.client_secret {
-        crate::logging::register_secret_to_redact(secret);
+    if let Some(ref cookie) = new_config.spotify.sp_dc {
+        crate::logging::register_secret_to_redact(cookie);
     }
     if let Some(ref url) = new_config.logging.webhook_url {
         crate::logging::register_secret_to_redact(url);

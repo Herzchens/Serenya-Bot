@@ -2,21 +2,10 @@ use std::time::Duration;
 
 use poise::serenity_prelude as serenity;
 
+use crate::audio::{ResolvedInput, resolve_input};
 use crate::core::Track;
 use crate::discord::embeds::now_playing_embed;
 use crate::utils::{Context, Error, SerenyaError};
-
-#[derive(serde::Deserialize, Debug)]
-struct YtDlpSearchResult {
-    entries: Option<Vec<YtDlpEntry>>,
-}
-
-#[derive(serde::Deserialize, Debug)]
-struct YtDlpEntry {
-    title: Option<String>,
-    id: Option<String>,
-    duration: Option<f64>,
-}
 
 /// Show details of the currently playing track.
 #[poise::command(
@@ -60,47 +49,6 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
     let reply = poise::CreateReply::default().embed(embed);
     ctx.send(reply).await?;
     Ok(())
-}
-
-async fn search_ytdl(query: &str, user_id: serenity::UserId) -> Result<Vec<Track>, SerenyaError> {
-    let settings = crate::audio::runtime::settings();
-    let output = crate::audio::runtime::run_ytdlp(
-        "manual search",
-        vec![
-            "--flat-playlist".to_owned(),
-            "--dump-single-json".to_owned(),
-            format!("ytsearch5:{query}"),
-        ],
-        crate::audio::runtime::duration_from_millis(settings.ytsearch_timeout_ms),
-        true,
-        Some(crate::audio::runtime::negative_cache_key("ytsearch", query)),
-    )
-    .await?;
-
-    let search_result: YtDlpSearchResult = serde_json::from_slice(&output.stdout)
-        .map_err(|e| SerenyaError::Audio(format!("Failed to parse search results: {}", e)))?;
-
-    let entries = search_result.entries.unwrap_or_default();
-    let mut tracks = Vec::new();
-    for entry in entries {
-        if let Some(id) = entry.id {
-            tracks.push(Track {
-                title: entry.title.unwrap_or_else(|| "Unknown Title".to_string()),
-                url: format!("https://www.youtube.com/watch?v={}", id),
-                duration: entry
-                    .duration
-                    .map(|d| std::time::Duration::from_secs(d as u64)),
-                requester_id: user_id,
-                requester_name: String::new(),
-                source_type: crate::core::SourceType::Search,
-                resolved_url: None,
-                thumbnail: None,
-                source_provider: "YouTube".to_owned(),
-            });
-        }
-    }
-
-    Ok(tracks)
 }
 
 pub fn build_search_menu(ctx_id: u64, tracks: &[Track]) -> serenity::CreateSelectMenu {
@@ -151,9 +99,13 @@ async fn enqueue_selected_track(
             .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel.".into()))?;
         let resolved_url =
             crate::audio::extract_stream_url_for_guild(guild_id.get(), &selected_track.url).await?;
+        let eight_d_enabled = player.eight_d_enabled;
         let mut call = call_lock.lock().await;
-        let source: songbird::input::Input =
-            songbird::input::HttpRequest::new(ctx.data().http_client.clone(), resolved_url).into();
+        let source = crate::audio::source::create_stream_input(
+            ctx.data().http_client.clone(),
+            resolved_url,
+            eight_d_enabled,
+        )?;
         let handle = call.play_input(source);
 
         let _ = handle.add_event(
@@ -210,7 +162,18 @@ pub async fn search(
 
     ctx.defer().await?;
 
-    let mut tracks = search_ytdl(&query, ctx.author().id).await?;
+    let mut tracks = match resolve_input(
+        &query,
+        ctx.author().id.get(),
+        &ctx.data().database,
+        &ctx.data().http_client,
+    )
+    .await?
+    {
+        ResolvedInput::SearchResults(tracks) => tracks,
+        ResolvedInput::Track(track) => vec![track],
+        ResolvedInput::Playlist(tracks) => tracks,
+    };
     if tracks.is_empty() {
         ctx.say("No search results found.").await?;
         return Ok(());
@@ -228,7 +191,7 @@ pub async fn search(
     let collector = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
         .author_id(ctx.author().id)
         .message_id(msg_inner.id)
-        .timeout(std::time::Duration::from_secs(30));
+        .timeout(std::time::Duration::from_secs(60));
 
     if let Some(interaction) = collector.next().await {
         let selected_idx_str = match &interaction.data.kind {
@@ -241,7 +204,23 @@ pub async fn search(
             .parse()
             .map_err(|_| SerenyaError::Audio("Invalid selection index.".into()))?;
 
-        let mut selected_track = tracks.remove(selected_idx);
+        let selected_track = tracks.remove(selected_idx);
+        let mut selected_tracks = if is_metadata_search_option(&selected_track) {
+            resolve_input(
+                &selected_track.url,
+                ctx.author().id.get(),
+                &ctx.data().database,
+                &ctx.data().http_client,
+            )
+            .await?
+            .into_tracks_or_top()
+        } else {
+            vec![selected_track]
+        };
+        let mut selected_track = selected_tracks
+            .drain(..)
+            .next()
+            .ok_or_else(|| SerenyaError::Audio("No playable track resolved.".into()))?;
         selected_track.requester_id = ctx.author().id;
         selected_track.requester_name = ctx.author().name.clone();
 
@@ -269,4 +248,10 @@ pub async fn search(
     }
 
     Ok(())
+}
+
+fn is_metadata_search_option(track: &Track) -> bool {
+    track.source_provider.starts_with("Deezer")
+        || track.source_provider.starts_with("Spotify")
+        || track.source_provider.starts_with("Apple Music")
 }

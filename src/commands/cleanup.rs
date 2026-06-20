@@ -1,7 +1,6 @@
 use crate::utils::{Context, Error, SerenyaError};
 use poise::serenity_prelude as serenity;
 
-#[allow(deprecated)]
 async fn check_cleanup_permissions(ctx: Context<'_>) -> Result<bool, Error> {
     let author_id = ctx.author().id.get();
     let owner_id = ctx.data().config().bot.owner;
@@ -11,9 +10,11 @@ async fn check_cleanup_permissions(ctx: Context<'_>) -> Result<bool, Error> {
 
     if let Some(guild_id) = ctx.guild_id() {
         let member = guild_id.member(ctx, ctx.author().id).await?;
-        let permissions = member.permissions(ctx)?;
-        if permissions.administrator() {
-            return Ok(true);
+        if let Some(guild) = ctx.guild() {
+            let permissions = guild.member_permissions(&member);
+            if permissions.administrator() {
+                return Ok(true);
+            }
         }
     }
 
