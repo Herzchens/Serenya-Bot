@@ -53,6 +53,27 @@ audio:
     - performance
     - balanced
     - quality
+
+resolver:
+  max_concurrent_ytdlp: 2
+  max_concurrent_resolves_per_guild: 1
+  global_search_timeout_ms: 1800
+  deezer_timeout_ms: 800
+  apple_music_timeout_ms: 800
+  youtube_music_timeout_ms: 1000
+  soundcloud_timeout_ms: 1500
+  spotify_timeout_ms: 800
+  youtube_timeout_ms: 1500
+  ytsearch_timeout_ms: 3000
+  yt_dlp_timeout_seconds: 10
+  prefetch_timeout_seconds: 8
+  prefetch_when_remaining_seconds: 10
+  query_cache_ttl_seconds: 3600
+  metadata_cache_ttl_seconds: 86400
+  stream_cache_ttl_seconds: 3600
+  negative_cache_ttl_seconds: 1800
+  auto_pick_threshold: 0.90
+  perfect_threshold: 0.97
 ```
 
 Ensure your `DISCORD_TOKEN` environment variable is set.

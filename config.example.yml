@@ -1,0 +1,47 @@
+bot:
+  token: "YOUR_DISCORD_BOT_TOKEN_HERE"
+  prefix: "s."
+  owner: 984085171408080897
+  instance_id: "serenya-1"
+  display_name: "Serenya"
+
+logging:
+  level: debug
+  webhook_enabled: true
+  webhook_url: "YOUR_DISCORD_WEBHOOK_URL_HERE"
+  webhook_min_level: debug
+  webhook_plain_text: true
+
+spotify:
+  enabled: true
+  client_id: "YOUR_SPOTIFY_CLIENT_ID_HERE"
+  client_secret: "YOUR_SPOTIFY_CLIENT_SECRET_HERE"
+  enable_track: true
+  enable_playlist: true
+  enable_album: true
+  enable_artist_top_tracks: true
+  enable_text_search: true
+  max_playlist_import: 500
+  max_album_import: 500
+  max_artist_top_tracks: 50
+  market: "VN"
+
+playback:
+  stay_in_voice: true
+  announce_track: true
+  max_queue_size: 1000
+  max_playlist_import: 500
+  max_user_playlists: 10
+  max_tracks_per_user_playlist: 500
+
+audio:
+  default_quality: balanced
+  modes:
+    - performance
+    - balanced
+    - quality
+
+resolver:
+  max_concurrent_ytdlp: 4
+  max_concurrent_resolves_per_guild: 2
+  soundcloud_timeout_ms: 500
