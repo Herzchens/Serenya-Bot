@@ -124,9 +124,7 @@ async fn send_batch(
             let msg_truncated = crate::utils::truncate_chars(&entry.message, 300);
             let log_line = format!(
                 "**[{}] {}:** {}\n",
-                entry.level,
-                entry.target,
-                msg_truncated
+                entry.level, entry.target, msg_truncated
             );
 
             // Redact secrets in the log line!
