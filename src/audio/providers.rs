@@ -176,6 +176,23 @@ pub(crate) async fn get_spotify_access_token(
     .map_err(|_| SerenyaError::Audio("Spotify token request timed out".to_owned()))?
     .map_err(|e| SerenyaError::Audio(format!("Spotify token request failed: {e}")))?;
 
+    let status = token_response.status();
+    if !status.is_success() {
+        let err_body = token_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read response body".to_string());
+        tracing::error!(
+            "Spotify token request failed with status: {}, body: {}",
+            status,
+            err_body
+        );
+        return Err(SerenyaError::Audio(format!(
+            "Spotify token request failed with status: {}, body: {}",
+            status, err_body
+        )));
+    }
+
     let token_json = token_response
         .json::<serde_json::Value>()
         .await
