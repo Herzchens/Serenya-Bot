@@ -124,7 +124,7 @@ async fn send_batch(
             let msg_truncated = crate::utils::truncate_chars(&entry.message, 300);
             let log_line = format!(
                 "**[{}] {}:** {}\n",
-                entry.level.to_string(),
+                entry.level,
                 entry.target,
                 msg_truncated
             );

@@ -26,24 +26,28 @@ async fn seek_by_restart(
 
     let stream_url = match resolved_url {
         Some(url) => url,
-        None => {
-            crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?
-        }
+        None => crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?,
     };
 
     // 2. Spawn FFMPEG process starting at target_position
     let seek_time_secs = target_position.as_secs();
-    
+
     use std::process::{Command, Stdio};
     let child = Command::new("ffmpeg")
-        .args(&[
-            "-ss", &seek_time_secs.to_string(),
-            "-i", &stream_url,
-            "-f", "wav",
-            "-acodec", "pcm_s16le",
-            "-ar", "48000",
-            "-ac", "2",
-            "pipe:1"
+        .args([
+            "-ss",
+            &seek_time_secs.to_string(),
+            "-i",
+            &stream_url,
+            "-f",
+            "wav",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "pipe:1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -68,7 +72,7 @@ async fn seek_by_restart(
         let has_old_handle = player.current_track_handle.is_some();
         player.is_seeking = has_old_handle;
         player.seek_offset = target_position;
-        
+
         if let Some(old_handle) = player.current_track_handle.take() {
             let _ = old_handle.stop();
         }
@@ -193,8 +197,12 @@ pub async fn forward(
 
     seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
     let new_pos_fmt = format_seek_time(new_pos);
-    ctx.say(format!("⏩ Forwarded by **{}s** → `{}`", duration.as_secs(), new_pos_fmt))
-        .await?;
+    ctx.say(format!(
+        "⏩ Forwarded by **{}s** → `{}`",
+        duration.as_secs(),
+        new_pos_fmt
+    ))
+    .await?;
     Ok(())
 }
 
@@ -237,12 +245,18 @@ pub async fn rewind(
 
     let info = handle.get_info().await?;
     let total_elapsed = seek_offset + info.position;
-    let new_pos = total_elapsed.checked_sub(duration).unwrap_or(Duration::from_secs(0));
+    let new_pos = total_elapsed
+        .checked_sub(duration)
+        .unwrap_or(Duration::from_secs(0));
 
     seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
     let new_pos_fmt = format_seek_time(new_pos);
-    ctx.say(format!("⏪ Rewound by **{}s** → `{}`", duration.as_secs(), new_pos_fmt))
-        .await?;
+    ctx.say(format!(
+        "⏪ Rewound by **{}s** → `{}`",
+        duration.as_secs(),
+        new_pos_fmt
+    ))
+    .await?;
     Ok(())
 }
 

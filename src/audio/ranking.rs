@@ -187,9 +187,9 @@ pub fn contains_unrequested_variant(candidate_title: &str, query: &str) -> bool 
 fn duration_tolerance_seconds(expected: Duration, strict: bool) -> f64 {
     let expected_secs = expected.as_secs_f64();
     if strict {
-        (expected_secs * 0.50).max(80.0).min(120.0)
+        (expected_secs * 0.50).clamp(80.0, 120.0)
     } else {
-        (expected_secs * 0.60).max(90.0).min(150.0)
+        (expected_secs * 0.60).clamp(90.0, 150.0)
     }
 }
 
@@ -403,7 +403,8 @@ pub fn score_candidates(
         }
 
         // 5b. Lyric video boost (often contains original high-quality audio)
-        let is_lyric = candidate_title_lower.contains("lyric") || candidate_title_lower.contains("lyrics");
+        let is_lyric =
+            candidate_title_lower.contains("lyric") || candidate_title_lower.contains("lyrics");
         if is_lyric {
             score += 0.20;
         }
