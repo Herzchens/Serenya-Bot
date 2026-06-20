@@ -626,13 +626,17 @@ pub async fn resolve_input(
                 None => (true, 100),
             };
             if !enabled {
-                return Err(SerenyaError::Audio("Spotify playlist import is disabled in configuration.".into()));
+                return Err(SerenyaError::Audio(
+                    "Spotify playlist import is disabled in configuration.".into(),
+                ));
             }
             if let Some(id) = extract_spotify_id(query_trimmed, "spotify.com/playlist/") {
                 let tracks = resolve_spotify_playlist(&id, limit, user_id, http_client).await?;
                 return Ok(ResolvedInput::Playlist(tracks));
             } else {
-                return Err(SerenyaError::Audio("Failed to extract Spotify playlist ID.".into()));
+                return Err(SerenyaError::Audio(
+                    "Failed to extract Spotify playlist ID.".into(),
+                ));
             }
         }
 
@@ -643,13 +647,17 @@ pub async fn resolve_input(
                 None => (true, 100),
             };
             if !enabled {
-                return Err(SerenyaError::Audio("Spotify album import is disabled in configuration.".into()));
+                return Err(SerenyaError::Audio(
+                    "Spotify album import is disabled in configuration.".into(),
+                ));
             }
             if let Some(id) = extract_spotify_id(query_trimmed, "spotify.com/album/") {
                 let tracks = resolve_spotify_album(&id, limit, user_id, http_client).await?;
                 return Ok(ResolvedInput::Playlist(tracks));
             } else {
-                return Err(SerenyaError::Audio("Failed to extract Spotify album ID.".into()));
+                return Err(SerenyaError::Audio(
+                    "Failed to extract Spotify album ID.".into(),
+                ));
             }
         }
 
@@ -660,13 +668,18 @@ pub async fn resolve_input(
                 None => (true, 20),
             };
             if !enabled {
-                return Err(SerenyaError::Audio("Spotify artist top tracks import is disabled in configuration.".into()));
+                return Err(SerenyaError::Audio(
+                    "Spotify artist top tracks import is disabled in configuration.".into(),
+                ));
             }
             if let Some(id) = extract_spotify_id(query_trimmed, "spotify.com/artist/") {
-                let tracks = resolve_spotify_artist_top_tracks(&id, limit, user_id, http_client).await?;
+                let tracks =
+                    resolve_spotify_artist_top_tracks(&id, limit, user_id, http_client).await?;
                 return Ok(ResolvedInput::Playlist(tracks));
             } else {
-                return Err(SerenyaError::Audio("Failed to extract Spotify artist ID.".into()));
+                return Err(SerenyaError::Audio(
+                    "Failed to extract Spotify artist ID.".into(),
+                ));
             }
         }
 
@@ -996,7 +1009,7 @@ fn parse_spotify_track_json(track_val: &serde_json::Value, user_id: u64) -> Opti
     let name = track_val.get("name")?.as_str()?.to_owned();
     let id = track_val.get("id")?.as_str()?;
     let duration_ms = track_val.get("duration_ms")?.as_u64()?;
-    
+
     let mut artists_vec = Vec::new();
     if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
         for a in artists {
@@ -1122,14 +1135,20 @@ async fn resolve_spotify_embed_fallback(
         .map_err(|e| SerenyaError::Audio(format!("Failed to send Spotify embed request: {}", e)))?;
 
     if !response.status().is_success() {
-        return Err(SerenyaError::Audio(format!("Spotify embed page returned status: {}", response.status())));
+        return Err(SerenyaError::Audio(format!(
+            "Spotify embed page returned status: {}",
+            response.status()
+        )));
     }
 
-    let html = response.text().await
+    let html = response
+        .text()
+        .await
         .map_err(|e| SerenyaError::Audio(format!("Failed to read Spotify embed HTML: {}", e)))?;
 
-    let json_str = extract_next_data(&html)
-        .ok_or_else(|| SerenyaError::Audio("Failed to extract __NEXT_DATA__ from Spotify embed HTML".into()))?;
+    let json_str = extract_next_data(&html).ok_or_else(|| {
+        SerenyaError::Audio("Failed to extract __NEXT_DATA__ from Spotify embed HTML".into())
+    })?;
 
     let data: NextDataJson = serde_json::from_str(json_str)
         .map_err(|e| SerenyaError::Audio(format!("Failed to parse __NEXT_DATA__ JSON: {}", e)))?;
@@ -1185,10 +1204,16 @@ async fn resolve_spotify_playlist_fallback(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
-    tracing::info!("Attempting Spotify playlist fallback scraping for ID: {}", playlist_id);
+    tracing::info!(
+        "Attempting Spotify playlist fallback scraping for ID: {}",
+        playlist_id
+    );
     let url = format!("https://open.spotify.com/embed/playlist/{}", playlist_id);
     let tracks = resolve_spotify_embed_fallback(&url, limit, user_id, http_client).await?;
-    tracing::info!("Successfully resolved {} tracks via Spotify playlist fallback scraper", tracks.len());
+    tracing::info!(
+        "Successfully resolved {} tracks via Spotify playlist fallback scraper",
+        tracks.len()
+    );
     Ok(tracks)
 }
 
@@ -1198,10 +1223,16 @@ async fn resolve_spotify_album_fallback(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
-    tracing::info!("Attempting Spotify album fallback scraping for ID: {}", album_id);
+    tracing::info!(
+        "Attempting Spotify album fallback scraping for ID: {}",
+        album_id
+    );
     let url = format!("https://open.spotify.com/embed/album/{}", album_id);
     let tracks = resolve_spotify_embed_fallback(&url, limit, user_id, http_client).await?;
-    tracing::info!("Successfully resolved {} tracks via Spotify album fallback scraper", tracks.len());
+    tracing::info!(
+        "Successfully resolved {} tracks via Spotify album fallback scraper",
+        tracks.len()
+    );
     Ok(tracks)
 }
 
@@ -1213,6 +1244,7 @@ async fn resolve_spotify_playlist_api(
     client_secret: &str,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!("Requesting Spotify API access token for playlist resolution...");
     let token = crate::audio::providers::get_spotify_access_token(
         http_client,
         client_id,
@@ -1220,6 +1252,7 @@ async fn resolve_spotify_playlist_api(
         Duration::from_secs(5),
     )
     .await?;
+    tracing::info!("Spotify API access token retrieved successfully.");
 
     let mut tracks = Vec::new();
     let mut offset = 0;
@@ -1231,37 +1264,75 @@ async fn resolve_spotify_playlist_api(
             playlist_id, chunk_limit, offset
         );
 
+        tracing::info!(
+            "Fetching Spotify playlist tracks: offset = {}, limit = {} (total resolved so far: {})",
+            offset,
+            chunk_limit,
+            tracks.len()
+        );
+
         let response = http_client
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await
-            .map_err(|e| SerenyaError::Audio(format!("Failed to send Spotify playlist API request: {}", e)))?;
+            .map_err(|e| {
+                SerenyaError::Audio(format!(
+                    "Failed to send Spotify playlist API request: {}",
+                    e
+                ))
+            })?;
 
-        if !response.status().is_success() {
-            return Err(SerenyaError::Audio(format!("Spotify playlist API returned status: {}", response.status())));
+        let status = response.status();
+        if !status.is_success() {
+            let err_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read response body".to_string());
+            tracing::error!(
+                "Spotify playlist API request failed with status: {}, body: {}",
+                status,
+                err_body
+            );
+            return Err(SerenyaError::Audio(format!(
+                "Spotify playlist API returned status: {}, body: {}",
+                status, err_body
+            )));
         }
 
-        let body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| SerenyaError::Audio(format!("Failed to parse Spotify playlist API JSON: {}", e)))?;
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            SerenyaError::Audio(format!("Failed to parse Spotify playlist API JSON: {}", e))
+        })?;
 
         let items = match body.get("items").and_then(|v| v.as_array()) {
             Some(arr) => arr,
-            None => break,
+            None => {
+                tracing::warn!("Spotify playlist response missing 'items' array or it is empty.");
+                break;
+            }
         };
 
         if items.is_empty() {
+            tracing::info!("No more items found in Spotify playlist response.");
             break;
         }
 
+        let items_len = items.len();
         for item in items {
-            let Some(track_val) = item.get("track") else { continue; };
-            if track_val.is_null() { continue; }
-            
-            let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else { continue; };
-            let duration_ms = track_val.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+            let Some(track_val) = item.get("track") else {
+                continue;
+            };
+            if track_val.is_null() {
+                continue;
+            }
+
+            let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let duration_ms = track_val
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             let mut artists_vec = Vec::new();
             if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
@@ -1310,13 +1381,23 @@ async fn resolve_spotify_playlist_api(
             }
         }
 
+        tracing::info!(
+            "Successfully processed {} tracks from current batch.",
+            items_len
+        );
+
         if body.get("next").and_then(|v| v.as_str()).is_none() {
+            tracing::info!("Spotify API response does not have a next page link.");
             break;
         }
 
         offset += chunk_limit;
     }
 
+    tracing::info!(
+        "Finished Spotify API playlist resolution. Total resolved: {} tracks",
+        tracks.len()
+    );
     Ok(tracks)
 }
 
@@ -1326,17 +1407,299 @@ async fn resolve_spotify_playlist(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!(
+        "Resolving Spotify playlist ID: {} (limit: {})",
+        playlist_id,
+        limit
+    );
     if let Some(config) = crate::audio::runtime::spotify_settings() {
         if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
-            match resolve_spotify_playlist_api(playlist_id, limit, user_id, client_id, client_secret, http_client).await {
-                Ok(tracks) => return Ok(tracks),
+            tracing::info!(
+                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+            );
+            match resolve_spotify_playlist_api(
+                playlist_id,
+                limit,
+                user_id,
+                client_id,
+                client_secret,
+                http_client,
+            )
+            .await
+            {
+                Ok(tracks) => {
+                    tracing::info!(
+                        "Successfully resolved {} tracks via Spotify Web API",
+                        tracks.len()
+                    );
+                    return Ok(tracks);
+                }
                 Err(err) => {
-                    tracing::warn!("Failed to resolve Spotify playlist via API, falling back to scraper: {:?}", err);
+                    tracing::warn!(
+                        "Spotify Web API playlist resolution failed ({:?}). Falling back to Spotify embed scraper...",
+                        err
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Spotify settings missing in config. Falling back to Spotify embed scraper."
+        );
+    }
+    resolve_spotify_playlist_fallback(playlist_id, limit, user_id, http_client).await
+}
+
+async fn resolve_spotify_album_api(
+    album_id: &str,
+    limit: usize,
+    user_id: u64,
+    client_id: &str,
+    client_secret: &str,
+    http_client: &reqwest::Client,
+) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!("Requesting Spotify API access token for album resolution...");
+    let token = crate::audio::providers::get_spotify_access_token(
+        http_client,
+        client_id,
+        client_secret,
+        Duration::from_secs(5),
+    )
+    .await?;
+    tracing::info!("Spotify API access token retrieved successfully.");
+
+    let mut tracks = Vec::new();
+
+    let url = format!("https://api.spotify.com/v1/albums/{}", album_id);
+    tracing::info!("Fetching Spotify album details: {}", url);
+    let response = http_client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| {
+            SerenyaError::Audio(format!("Failed to send Spotify album API request: {}", e))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read response body".to_string());
+        tracing::error!(
+            "Spotify album API request failed with status: {}, body: {}",
+            status,
+            err_body
+        );
+        return Err(SerenyaError::Audio(format!(
+            "Spotify album API returned status: {}, body: {}",
+            status, err_body
+        )));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(|e| {
+        SerenyaError::Audio(format!("Failed to parse Spotify album API JSON: {}", e))
+    })?;
+
+    let thumbnail = body
+        .get("images")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|img| img.get("url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    let tracks_obj = body
+        .get("tracks")
+        .ok_or_else(|| SerenyaError::Audio("Missing tracks field in Spotify album JSON".into()))?;
+
+    let mut next_url = tracks_obj
+        .get("next")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+    let items = tracks_obj
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| SerenyaError::Audio("Missing items in Spotify album tracks JSON".into()))?;
+
+    tracing::info!(
+        "Processing first page of Spotify album tracks (items: {})",
+        items.len()
+    );
+    for item in items {
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let duration_ms = item
+            .get("duration_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mut artists_vec = Vec::new();
+        if let Some(artists) = item.get("artists").and_then(|v| v.as_array()) {
+            for a in artists {
+                if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
+                    artists_vec.push(a_name.to_owned());
                 }
             }
         }
+        let artist_str = if artists_vec.is_empty() {
+            "".to_owned()
+        } else {
+            artists_vec.join(", ")
+        };
+
+        let search_query = if artist_str.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{} - {}", artist_str, name)
+        };
+        let track_url = format!("ytsearch1:{}", search_query);
+
+        tracks.push(Track {
+            title: name.to_owned(),
+            url: track_url,
+            duration: Some(Duration::from_millis(duration_ms)),
+            requester_id: serenity::UserId::new(user_id),
+            requester_name: "".to_owned(),
+            source_type: SourceType::Url,
+            resolved_url: None,
+            thumbnail: thumbnail.clone(),
+            source_provider: "Spotify".to_owned(),
+        });
+
+        if tracks.len() >= limit {
+            tracing::info!(
+                "Reached track limit of {} while parsing first album page.",
+                limit
+            );
+            return Ok(tracks);
+        }
     }
-    resolve_spotify_playlist_fallback(playlist_id, limit, user_id, http_client).await
+
+    while let Some(url) = next_url {
+        if tracks.len() >= limit {
+            break;
+        }
+
+        tracing::info!(
+            "Fetching next page of Spotify album tracks: {} (total resolved so far: {})",
+            url,
+            tracks.len()
+        );
+        let response = http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| {
+                SerenyaError::Audio(format!(
+                    "Failed to send Spotify album pagination request: {}",
+                    e
+                ))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let err_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read response body".to_string());
+            tracing::error!(
+                "Spotify album pagination API request failed with status: {}, body: {}",
+                status,
+                err_body
+            );
+            return Err(SerenyaError::Audio(format!(
+                "Spotify album pagination API returned status: {}, body: {}",
+                status, err_body
+            )));
+        }
+
+        let body: serde_json::Value = response.json().await.map_err(|e| {
+            SerenyaError::Audio(format!(
+                "Failed to parse Spotify album pagination JSON: {}",
+                e
+            ))
+        })?;
+
+        let items = match body.get("items").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => break,
+        };
+
+        if items.is_empty() {
+            break;
+        }
+
+        let items_len = items.len();
+        for item in items {
+            let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let duration_ms = item
+                .get("duration_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            let mut artists_vec = Vec::new();
+            if let Some(artists) = item.get("artists").and_then(|v| v.as_array()) {
+                for a in artists {
+                    if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
+                        artists_vec.push(a_name.to_owned());
+                    }
+                }
+            }
+            let artist_str = if artists_vec.is_empty() {
+                "".to_owned()
+            } else {
+                artists_vec.join(", ")
+            };
+
+            let search_query = if artist_str.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{} - {}", artist_str, name)
+            };
+            let track_url = format!("ytsearch1:{}", search_query);
+
+            tracks.push(Track {
+                title: name.to_owned(),
+                url: track_url,
+                duration: Some(Duration::from_millis(duration_ms)),
+                requester_id: serenity::UserId::new(user_id),
+                requester_name: "".to_owned(),
+                source_type: SourceType::Url,
+                resolved_url: None,
+                thumbnail: thumbnail.clone(),
+                source_provider: "Spotify".to_owned(),
+            });
+
+            if tracks.len() >= limit {
+                break;
+            }
+        }
+        tracing::info!(
+            "Processed {} tracks from album pagination batch.",
+            items_len
+        );
+
+        next_url = body
+            .get("next")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+    }
+
+    tracing::info!(
+        "Finished Spotify API album resolution. Total resolved: {} tracks",
+        tracks.len()
+    );
+    Ok(tracks)
 }
 
 async fn resolve_spotify_album(
@@ -1345,6 +1708,50 @@ async fn resolve_spotify_album(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!(
+        "Resolving Spotify album ID: {} (limit: {})",
+        album_id,
+        limit
+    );
+    if let Some(config) = crate::audio::runtime::spotify_settings() {
+        if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
+            tracing::info!(
+                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+            );
+            match resolve_spotify_album_api(
+                album_id,
+                limit,
+                user_id,
+                client_id,
+                client_secret,
+                http_client,
+            )
+            .await
+            {
+                Ok(tracks) => {
+                    tracing::info!(
+                        "Successfully resolved {} tracks via Spotify Web API",
+                        tracks.len()
+                    );
+                    return Ok(tracks);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Spotify Web API album resolution failed ({:?}). Falling back to Spotify embed scraper...",
+                        err
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Spotify settings missing in config. Falling back to Spotify embed scraper."
+        );
+    }
     resolve_spotify_album_fallback(album_id, limit, user_id, http_client).await
 }
 
@@ -1354,10 +1761,151 @@ async fn resolve_spotify_artist_top_tracks_fallback(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
-    tracing::info!("Attempting Spotify artist fallback scraping for ID: {}", artist_id);
+    tracing::info!(
+        "Attempting Spotify artist fallback scraping for ID: {}",
+        artist_id
+    );
     let url = format!("https://open.spotify.com/embed/artist/{}", artist_id);
     let tracks = resolve_spotify_embed_fallback(&url, limit, user_id, http_client).await?;
-    tracing::info!("Successfully resolved {} tracks via Spotify artist fallback scraper", tracks.len());
+    tracing::info!(
+        "Successfully resolved {} tracks via Spotify artist fallback scraper",
+        tracks.len()
+    );
+    Ok(tracks)
+}
+
+async fn resolve_spotify_artist_top_tracks_api(
+    artist_id: &str,
+    limit: usize,
+    user_id: u64,
+    client_id: &str,
+    client_secret: &str,
+    http_client: &reqwest::Client,
+) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!("Requesting Spotify API access token for artist top tracks resolution...");
+    let token = crate::audio::providers::get_spotify_access_token(
+        http_client,
+        client_id,
+        client_secret,
+        Duration::from_secs(5),
+    )
+    .await?;
+    tracing::info!("Spotify API access token retrieved successfully.");
+
+    let market = crate::audio::runtime::spotify_settings()
+        .map(|cfg| cfg.market.clone())
+        .unwrap_or_else(|| "VN".to_owned());
+
+    let url = format!(
+        "https://api.spotify.com/v1/artists/{}/top-tracks?market={}",
+        artist_id, market
+    );
+    tracing::info!("Fetching Spotify artist top tracks: {}", url);
+
+    let response = http_client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await
+        .map_err(|e| {
+            SerenyaError::Audio(format!(
+                "Failed to send Spotify artist top tracks request: {}",
+                e
+            ))
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let err_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read response body".to_string());
+        tracing::error!(
+            "Spotify artist top tracks API request failed with status: {}, body: {}",
+            status,
+            err_body
+        );
+        return Err(SerenyaError::Audio(format!(
+            "Spotify artist top-tracks API returned status: {}, body: {}",
+            status, err_body
+        )));
+    }
+
+    let body: serde_json::Value = response.json().await.map_err(|e| {
+        SerenyaError::Audio(format!(
+            "Failed to parse Spotify artist top tracks JSON: {}",
+            e
+        ))
+    })?;
+
+    let tracks_arr = body
+        .get("tracks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            SerenyaError::Audio("Missing tracks field in Spotify artist top tracks JSON".into())
+        })?;
+
+    tracing::info!(
+        "Processing Spotify artist top tracks (items: {})",
+        tracks_arr.len()
+    );
+    let mut tracks = Vec::new();
+    for track_val in tracks_arr.iter().take(limit) {
+        let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let duration_ms = track_val
+            .get("duration_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mut artists_vec = Vec::new();
+        if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
+            for a in artists {
+                if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
+                    artists_vec.push(a_name.to_owned());
+                }
+            }
+        }
+        let artist_str = if artists_vec.is_empty() {
+            "".to_owned()
+        } else {
+            artists_vec.join(", ")
+        };
+
+        let thumbnail = track_val
+            .get("album")
+            .and_then(|v| v.get("images"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|img| img.get("url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+
+        let search_query = if artist_str.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{} - {}", artist_str, name)
+        };
+        let track_url = format!("ytsearch1:{}", search_query);
+
+        tracks.push(Track {
+            title: name.to_owned(),
+            url: track_url,
+            duration: Some(Duration::from_millis(duration_ms)),
+            requester_id: serenity::UserId::new(user_id),
+            requester_name: "".to_owned(),
+            source_type: SourceType::Url,
+            resolved_url: None,
+            thumbnail,
+            source_provider: "Spotify".to_owned(),
+        });
+    }
+
+    tracing::info!(
+        "Finished Spotify API artist top tracks resolution. Total resolved: {} tracks",
+        tracks.len()
+    );
     Ok(tracks)
 }
 
@@ -1367,6 +1915,50 @@ async fn resolve_spotify_artist_top_tracks(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
+    tracing::info!(
+        "Resolving Spotify artist ID: {} (limit: {})",
+        artist_id,
+        limit
+    );
+    if let Some(config) = crate::audio::runtime::spotify_settings() {
+        if let (Some(client_id), Some(client_secret)) = (&config.client_id, &config.client_secret) {
+            tracing::info!(
+                "Spotify API credentials found. Attempting resolution via Spotify Web API..."
+            );
+            match resolve_spotify_artist_top_tracks_api(
+                artist_id,
+                limit,
+                user_id,
+                client_id,
+                client_secret,
+                http_client,
+            )
+            .await
+            {
+                Ok(tracks) => {
+                    tracing::info!(
+                        "Successfully resolved {} tracks via Spotify Web API",
+                        tracks.len()
+                    );
+                    return Ok(tracks);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Spotify Web API artist top tracks resolution failed ({:?}). Falling back to Spotify embed scraper...",
+                        err
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Spotify API credentials missing in config. Falling back to Spotify embed scraper."
+            );
+        }
+    } else {
+        tracing::warn!(
+            "Spotify settings missing in config. Falling back to Spotify embed scraper."
+        );
+    }
     resolve_spotify_artist_top_tracks_fallback(artist_id, limit, user_id, http_client).await
 }
 
@@ -1381,14 +1973,8 @@ pub async fn resolve_ytsearch_track(
     let query = &track.url["ytsearch1:".len()..];
     tracing::info!(query, "Resolving ytsearch1 query lazily to YouTube URL");
 
-    let scored = perform_parallel_search(
-        query,
-        &track.title,
-        None,
-        track.duration,
-        http_client,
-    )
-    .await?;
+    let scored =
+        perform_parallel_search(query, &track.title, None, track.duration, http_client).await?;
 
     if let Some((best_candidate, score)) = scored.into_iter().next() {
         tracing::info!(
@@ -1422,7 +2008,9 @@ pub async fn resolve_ytsearch_track(
                 } else {
                     3600.0
                 };
-                diff_a.partial_cmp(&diff_b).unwrap_or(std::cmp::Ordering::Equal)
+                diff_a
+                    .partial_cmp(&diff_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             candidates.into_iter().next()
         } else {
@@ -1529,12 +2117,21 @@ mod tests {
         assert!(data.is_some());
         let json_str = data.unwrap();
         let parsed: NextDataJson = serde_json::from_str(json_str).unwrap();
-        let entity = parsed.props.unwrap().page_props.unwrap().state.unwrap().data.unwrap().entity.unwrap();
+        let entity = parsed
+            .props
+            .unwrap()
+            .page_props
+            .unwrap()
+            .state
+            .unwrap()
+            .data
+            .unwrap()
+            .entity
+            .unwrap();
         let tracks = entity.track_list.unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].title, "Hello");
         assert_eq!(tracks[0].uri, "spotify:track:123");
         assert_eq!(tracks[0].duration, Some(1000));
     }
-
 }
