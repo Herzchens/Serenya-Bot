@@ -234,7 +234,6 @@ async fn run_ytdlp_stream_resolution(
         vec![
             "--ignore-config".to_owned(),
             "--no-warnings".to_owned(),
-            "--no-call-home".to_owned(),
             "--socket-timeout".to_owned(),
             "5".to_owned(),
             "--no-check-formats".to_owned(),
