@@ -30,6 +30,8 @@ pub struct GuildPlayer {
     pub seek_offset: std::time::Duration,
     pub is_seeking: bool,
     pub skip_forced: bool,
+    pub eight_d_enabled: bool,
+    pub consecutive_errors: usize,
 }
 
 impl GuildPlayer {
@@ -48,6 +50,8 @@ impl GuildPlayer {
             seek_offset: std::time::Duration::from_secs(0),
             is_seeking: false,
             skip_forced: false,
+            eight_d_enabled: false,
+            consecutive_errors: 0,
         }
     }
 
@@ -69,6 +73,8 @@ impl GuildPlayer {
         self.seek_offset = std::time::Duration::from_secs(0);
         self.is_seeking = false;
         self.skip_forced = false;
+        self.eight_d_enabled = false;
+        self.consecutive_errors = 0;
     }
 
     pub fn advance_queue(&mut self) {

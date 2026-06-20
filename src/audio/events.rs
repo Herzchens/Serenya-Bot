@@ -73,10 +73,12 @@ pub struct TrackErrorHandler {
 impl EventHandler for TrackErrorHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::Track(_) = ctx {
-            // NOTE: When a track errors, songbird fires BOTH End and Error events.
-            // The TrackEndHandler already calls play_next on End, so we only log here
-            // to avoid double-advancing the queue (which causes cascade skipping).
             tracing::error!(guild_id = %self.guild_id, "Track errored (End handler will advance queue)");
+            if let Some(player_lock) = self.guild_players.get(&self.guild_id) {
+                let mut player = player_lock.value().write().await;
+                player.consecutive_errors += 1;
+                tracing::warn!(guild_id = %self.guild_id, "Consecutive error count incremented to {}", player.consecutive_errors);
+            }
         }
         None
     }
@@ -139,11 +141,28 @@ pub async fn play_next(
     }
 
     // Advance queue and get the next track to play
-    let (track, announce_channel) = {
+    let (track, announce_channel, consecutive_errors) = {
         let mut player = player_lock.write().await;
         player.advance_queue();
-        (player.now_playing.clone(), player.announce_channel)
+        (player.now_playing.clone(), player.announce_channel, player.consecutive_errors)
     };
+
+    if consecutive_errors >= 3 {
+        tracing::error!("Aborting play_next: too many consecutive errors ({})", consecutive_errors);
+        let mut call = call_lock.lock().await;
+        call.stop();
+        {
+            let mut player = player_lock.write().await;
+            player.reset();
+        }
+        if let Some(channel) = announce_channel {
+            let ctx_clone = serenity_ctx.clone();
+            tokio::spawn(async move {
+                let _ = channel.say(&ctx_clone.http, "❌ Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.").await;
+            });
+        }
+        return Ok(());
+    }
 
     let Some(mut track) = track else {
         // No more tracks, stop player
@@ -202,8 +221,15 @@ pub async fn play_next(
         "Playing resolved stream URL"
     );
 
-    let source: songbird::input::Input =
-        songbird::input::HttpRequest::new(http_client.clone(), resolved.clone()).into();
+    let eight_d_enabled = {
+        let player = player_lock.read().await;
+        player.eight_d_enabled
+    };
+    let source = crate::audio::source::create_stream_input(
+        http_client.clone(),
+        resolved.clone(),
+        eight_d_enabled,
+    )?;
 
     let handle = {
         let mut call = call_lock.lock().await;
@@ -243,8 +269,22 @@ pub async fn play_next(
             if let Some(ref mut np) = player.now_playing {
                 np.resolved_url = Some(resolved.clone()); // Save the resolved URL!
             }
-            player.current_track_handle = Some(handle);
+            player.current_track_handle = Some(handle.clone());
             player.playback_status = crate::core::PlaybackStatus::Playing;
+
+            // Reset consecutive errors after 5 seconds of successful playback
+            let player_lock_clone = player_lock.clone();
+            let track_uuid = handle.uuid();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let mut player = player_lock_clone.write().await;
+                if let Some(ref current_handle) = player.current_track_handle {
+                    if current_handle.uuid() == track_uuid {
+                        player.consecutive_errors = 0;
+                        tracing::info!("Reset consecutive errors to 0 after 5 seconds of successful playback");
+                    }
+                }
+            });
         } else {
             let _ = handle.stop();
             return Ok(());
