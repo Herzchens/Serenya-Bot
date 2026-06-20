@@ -4,7 +4,9 @@ use crate::utils::{Context, Error, SerenyaError};
 #[poise::command(slash_command, prefix_command)]
 pub async fn create(
     ctx: Context<'_>,
-    #[description = "Playlist name"] name: String,
+    #[description = "Playlist name"]
+    #[rest]
+    name: String,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id.get();
     let db = &ctx.data().database;

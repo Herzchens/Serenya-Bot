@@ -30,6 +30,7 @@ pub async fn delete(
     ctx: Context<'_>,
     #[autocomplete = "super::autocomplete_playlist"]
     #[description = "Playlist name"]
+    #[rest]
     name: String,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id.get();
@@ -91,6 +92,7 @@ pub async fn info(
     ctx: Context<'_>,
     #[autocomplete = "super::autocomplete_playlist"]
     #[description = "Playlist name"]
+    #[rest]
     name: String,
 ) -> Result<(), Error> {
     let user_id = ctx.author().id.get();

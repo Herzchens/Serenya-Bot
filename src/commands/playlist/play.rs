@@ -97,6 +97,7 @@ pub async fn play(
     ctx: Context<'_>,
     #[autocomplete = "super::autocomplete_playlist"]
     #[description = "Playlist name"]
+    #[rest]
     name: String,
 ) -> Result<(), Error> {
     let guild_id = ctx

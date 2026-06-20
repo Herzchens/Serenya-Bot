@@ -10,6 +10,7 @@ pub async fn play(
     ctx: Context<'_>,
     #[autocomplete = "crate::commands::playlist::autocomplete_playlist"]
     #[description = "Search query, URL, or playlist name"]
+    #[rest]
     query: String,
 ) -> Result<(), Error> {
     let guild_id = ctx
