@@ -27,6 +27,9 @@ pub struct GuildPlayer {
     pub current_track_handle: Option<TrackHandle>,
     pub skip_votes: HashSet<serenity::UserId>,
     pub requester_absence_timer: Option<Instant>,
+    pub seek_offset: std::time::Duration,
+    pub is_seeking: bool,
+    pub skip_forced: bool,
 }
 
 impl GuildPlayer {
@@ -42,6 +45,9 @@ impl GuildPlayer {
             current_track_handle: None,
             skip_votes: HashSet::new(),
             requester_absence_timer: None,
+            seek_offset: std::time::Duration::from_secs(0),
+            is_seeking: false,
+            skip_forced: false,
         }
     }
 
@@ -60,12 +66,28 @@ impl GuildPlayer {
             let _ = handle.stop();
         }
         self.clear_skip_votes();
+        self.seek_offset = std::time::Duration::from_secs(0);
+        self.is_seeking = false;
+        self.skip_forced = false;
     }
 
     pub fn advance_queue(&mut self) {
         self.clear_skip_votes();
+        self.seek_offset = std::time::Duration::from_secs(0);
+        self.is_seeking = false;
 
-        match self.loop_mode {
+        let effective_loop = if self.skip_forced {
+            self.skip_forced = false;
+            if self.loop_mode == LoopMode::Track {
+                LoopMode::Off
+            } else {
+                self.loop_mode
+            }
+        } else {
+            self.loop_mode
+        };
+
+        match effective_loop {
             LoopMode::Track => {
                 // Keep now_playing as-is so it can be replayed
             }

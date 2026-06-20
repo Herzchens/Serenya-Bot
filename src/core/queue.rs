@@ -109,6 +109,10 @@ impl Queue {
         self.tracks.get(index)
     }
 
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Track> {
+        self.tracks.get_mut(index)
+    }
+
     pub fn len(&self) -> usize {
         self.tracks.len()
     }
