@@ -90,15 +90,13 @@ pub async fn quality(
                 return Ok(());
             }
         }
-        Quality::Max | Quality::Lossless => {
-            if premium_tier < serenity::PremiumTier::Tier3 {
-                let embed = serenity::CreateEmbed::new()
+        Quality::Max | Quality::Lossless if premium_tier < serenity::PremiumTier::Tier3 => {
+            let embed = serenity::CreateEmbed::new()
                     .title("❌ Boost Level Required")
                     .description("Cấp độ này yêu cầu Server đạt tối thiểu **Boost Level 3** để mở khóa bitrate lớn hơn 256Kbps.")
                     .color(0xFF0000);
-                ctx.send(poise::CreateReply::default().embed(embed)).await?;
-                return Ok(());
-            }
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+            return Ok(());
         }
         _ => {}
     }

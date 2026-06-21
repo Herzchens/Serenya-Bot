@@ -19,12 +19,12 @@ pub fn register_secret_to_redact(secret: &str) {
 
 pub fn redact_secrets(input: &str) -> String {
     let mut output = input.to_owned();
-    if let Some(registry) = SECRETS_TO_REDACT.get() {
-        if let Ok(guard) = registry.lock() {
-            for secret in guard.iter() {
-                if !secret.is_empty() {
-                    output = output.replace(secret, "[REDACTED]");
-                }
+    if let Some(registry) = SECRETS_TO_REDACT.get()
+        && let Ok(guard) = registry.lock()
+    {
+        for secret in guard.iter() {
+            if !secret.is_empty() {
+                output = output.replace(secret, "[REDACTED]");
             }
         }
     }

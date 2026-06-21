@@ -93,11 +93,10 @@ impl DatabaseManager {
                         break;
                     }
                     _ = ticker.tick() => {
-                        if manager.is_dirty.load(std::sync::atomic::Ordering::SeqCst) {
-                            if let Err(e) = manager.save().await {
+                        if manager.is_dirty.load(std::sync::atomic::Ordering::SeqCst)
+                            && let Err(e) = manager.save().await {
                                 tracing::error!(error = %e, "auto-save failed");
                             }
-                        }
                     }
                 }
             }

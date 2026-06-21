@@ -265,50 +265,49 @@ pub fn score_candidates(
         let candidate_title_lower = candidate.title.to_lowercase();
 
         // 1. Duration Tolerance Guard (Hard Reject)
-        if let Some(expected) = expected_duration {
-            if let Some(candidate_dur) = candidate.duration {
-                let diff = (expected.as_secs_f64() - candidate_dur.as_secs_f64()).abs();
-                let tolerance = duration_tolerance_seconds(expected, expected_artist.is_some());
-                if diff > tolerance {
-                    tracing::info!(
-                        "candidate_rejected reason=duration_mismatch expected={}s actual={}s",
-                        expected.as_secs(),
-                        candidate_dur.as_secs()
-                    );
-                    tracing::debug!(
-                        candidate = %candidate.title,
-                        candidate_duration = candidate_dur.as_secs(),
-                        expected_duration = expected.as_secs(),
-                        diff_s = %diff,
-                        tolerance_s = %tolerance,
-                        reject_reason = "duration_mismatch",
-                        "rejecting search candidate"
-                    );
-                    continue; // Exclude candidate
-                }
+        if let Some(expected) = expected_duration
+            && let Some(candidate_dur) = candidate.duration
+        {
+            let diff = (expected.as_secs_f64() - candidate_dur.as_secs_f64()).abs();
+            let tolerance = duration_tolerance_seconds(expected, expected_artist.is_some());
+            if diff > tolerance {
+                tracing::info!(
+                    "candidate_rejected reason=duration_mismatch expected={}s actual={}s",
+                    expected.as_secs(),
+                    candidate_dur.as_secs()
+                );
+                tracing::debug!(
+                    candidate = %candidate.title,
+                    candidate_duration = candidate_dur.as_secs(),
+                    expected_duration = expected.as_secs(),
+                    diff_s = %diff,
+                    tolerance_s = %tolerance,
+                    reject_reason = "duration_mismatch",
+                    "rejecting search candidate"
+                );
+                continue; // Exclude candidate
             }
         }
 
-        if expected_duration.is_some() {
-            if let Some(rule) = find_unrequested_variant(
+        if expected_duration.is_some()
+            && let Some(rule) = find_unrequested_variant(
                 &candidate_title_lower,
                 &query_lower,
                 &expected_title_lower,
-            ) {
-                if rule.hard_reject_with_duration {
-                    tracing::info!(
-                        "candidate_rejected reason=variant_conflict variant={}",
-                        rule.term
-                    );
-                    tracing::debug!(
-                        candidate = %candidate.title,
-                        variant = rule.term,
-                        reject_reason = "variant_conflict",
-                        "rejecting search candidate"
-                    );
-                    continue;
-                }
-            }
+            )
+            && rule.hard_reject_with_duration
+        {
+            tracing::info!(
+                "candidate_rejected reason=variant_conflict variant={}",
+                rule.term
+            );
+            tracing::debug!(
+                candidate = %candidate.title,
+                variant = rule.term,
+                reject_reason = "variant_conflict",
+                "rejecting search candidate"
+            );
+            continue;
         }
 
         // 2. Title Match Score

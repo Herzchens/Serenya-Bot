@@ -263,30 +263,30 @@ fn init_tracing(logging: &crate::config::LoggingSection) {
 
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 
-    if logging.webhook_enabled {
-        if let Some(ref url) = logging.webhook_url {
-            let http_client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("failed to build webhook http client");
-            let min_level = match logging.webhook_min_level.to_lowercase().as_str() {
-                "error" => Level::ERROR,
-                "warn" => Level::WARN,
-                "info" => Level::INFO,
-                "debug" => Level::DEBUG,
-                "trace" => Level::TRACE,
-                _ => Level::INFO,
-            };
-            let webhook_layer = logging::webhook::WebhookLayer::new(
-                url.clone(),
-                http_client,
-                min_level,
-                logging.webhook_plain_text,
-            );
-            let _ = registry.with(webhook_layer).try_init();
-            return;
-        }
+    if logging.webhook_enabled
+        && let Some(ref url) = logging.webhook_url
+    {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to build webhook http client");
+        let min_level = match logging.webhook_min_level.to_lowercase().as_str() {
+            "error" => Level::ERROR,
+            "warn" => Level::WARN,
+            "info" => Level::INFO,
+            "debug" => Level::DEBUG,
+            "trace" => Level::TRACE,
+            _ => Level::INFO,
+        };
+        let webhook_layer = logging::webhook::WebhookLayer::new(
+            url.clone(),
+            http_client,
+            min_level,
+            logging.webhook_plain_text,
+        );
+        let _ = registry.with(webhook_layer).try_init();
+        return;
     }
     let _ = registry.try_init();
 }
@@ -357,14 +357,14 @@ fn start_empty_room_monitor(
             for guild_id in guild_ids {
                 if let Some(player_lock) = guild_players.get(&guild_id) {
                     let player = player_lock.read().await;
-                    if let Some(empty_since) = player.empty_since {
-                        if now.duration_since(empty_since).as_secs() >= 10800 {
-                            // 3 hours
-                            if !player.queue.is_empty()
-                                || player.playback_status != crate::core::PlaybackStatus::Idle
-                            {
-                                to_clear.push((guild_id, player.announce_channel));
-                            }
+                    if let Some(empty_since) = player.empty_since
+                        && now.duration_since(empty_since).as_secs() >= 10800
+                    {
+                        // 3 hours
+                        if !player.queue.is_empty()
+                            || player.playback_status != crate::core::PlaybackStatus::Idle
+                        {
+                            to_clear.push((guild_id, player.announce_channel));
                         }
                     }
                 }
@@ -455,26 +455,26 @@ async fn handle_voice_state_update(
             player.empty_since = Some(std::time::Instant::now());
         }
 
-        if player.playback_status == crate::core::PlaybackStatus::Playing {
-            if let Some(ref handle) = player.current_track_handle {
-                if let Err(e) = handle.pause() {
-                    tracing::error!("Failed to auto-pause track in empty channel: {:?}", e);
-                } else {
-                    player.playback_status = crate::core::PlaybackStatus::Paused;
-                    info!(
-                        guild_id = %guild_id,
-                        channel_id = %bot_channel_id,
-                        "Playback auto-paused because voice channel is empty"
-                    );
+        if player.playback_status == crate::core::PlaybackStatus::Playing
+            && let Some(ref handle) = player.current_track_handle
+        {
+            if let Err(e) = handle.pause() {
+                tracing::error!("Failed to auto-pause track in empty channel: {:?}", e);
+            } else {
+                player.playback_status = crate::core::PlaybackStatus::Paused;
+                info!(
+                    guild_id = %guild_id,
+                    channel_id = %bot_channel_id,
+                    "Playback auto-paused because voice channel is empty"
+                );
 
-                    if let Some(announce_channel) = player.announce_channel {
-                        let embed = serenity::CreateEmbed::new()
+                if let Some(announce_channel) = player.announce_channel {
+                    let embed = serenity::CreateEmbed::new()
                             .description("Không có ai trong room nên âm nhạc sẽ tạm dừng `s.resume` để tiếp tục từ chỗ đã stop")
                             .color(0x5865F2);
-                        let _ = announce_channel
-                            .send_message(&ctx.http, serenity::CreateMessage::new().embed(embed))
-                            .await;
-                    }
+                    let _ = announce_channel
+                        .send_message(&ctx.http, serenity::CreateMessage::new().embed(embed))
+                        .await;
                 }
             }
         }

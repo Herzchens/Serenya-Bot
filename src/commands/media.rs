@@ -87,34 +87,34 @@ pub async fn lyrics(
         track.title.clone()
     };
 
-    if let Some(matched) = fetch_lyrics(&ctx.data().http_client, &query_str).await? {
-        if let Some(lyrics_str) = matched.plain_lyrics {
-            let pages = chunk_lyrics(&lyrics_str);
-            if pages.is_empty() {
-                ctx.say("❌ Lyrics for this song are empty.").await?;
-                return Ok(());
-            }
-
-            if pages.len() == 1 {
-                let embed = serenity::CreateEmbed::new()
-                    .title(format!(
-                        "🎤 Lyrics: {} - {}",
-                        matched.track_name, matched.artist_name
-                    ))
-                    .description(&pages[0])
-                    .color(0x5865F2);
-                ctx.send(poise::CreateReply::default().embed(embed)).await?;
-            } else {
-                crate::discord::pagination::paginate_lyrics(
-                    ctx,
-                    &matched.track_name,
-                    &matched.artist_name,
-                    &pages,
-                )
-                .await?;
-            }
+    if let Some(matched) = fetch_lyrics(&ctx.data().http_client, &query_str).await?
+        && let Some(lyrics_str) = matched.plain_lyrics
+    {
+        let pages = chunk_lyrics(&lyrics_str);
+        if pages.is_empty() {
+            ctx.say("❌ Lyrics for this song are empty.").await?;
             return Ok(());
         }
+
+        if pages.len() == 1 {
+            let embed = serenity::CreateEmbed::new()
+                .title(format!(
+                    "🎤 Lyrics: {} - {}",
+                    matched.track_name, matched.artist_name
+                ))
+                .description(&pages[0])
+                .color(0x5865F2);
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        } else {
+            crate::discord::pagination::paginate_lyrics(
+                ctx,
+                &matched.track_name,
+                &matched.artist_name,
+                &pages,
+            )
+            .await?;
+        }
+        return Ok(());
     }
 
     ctx.say(format!("❌ No lyrics found for query: **{query_str}**"))
@@ -141,10 +141,10 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?;
 
     let mut elapsed = Duration::from_secs(0);
-    if let Some(handle) = &player.current_track_handle {
-        if let Ok(info) = handle.get_info().await {
-            elapsed = player.seek_offset + info.position;
-        }
+    if let Some(handle) = &player.current_track_handle
+        && let Ok(info) = handle.get_info().await
+    {
+        elapsed = player.seek_offset + info.position;
     }
 
     let loop_str = match player.loop_mode {
@@ -171,7 +171,7 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
     };
 
     let source = track.clean_source();
-    let provider_emoji = crate::discord::embeds::get_provider_emoji(&track, &ctx.data().config());
+    let provider_emoji = crate::discord::embeds::get_provider_emoji(track, &ctx.data().config());
 
     let mut embed = serenity::CreateEmbed::new()
         .title("ℹ️ Detailed Song Information")

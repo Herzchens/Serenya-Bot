@@ -54,18 +54,18 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
         let player = player_lock.read().await;
         queue_size = player.queue.len();
 
-        if let Some(vc_channel_id) = player.voice_channel {
-            if let Some(guild) = ctx.guild() {
-                for state in guild.voice_states.values() {
-                    if state.channel_id == Some(vc_channel_id) {
-                        let is_bot = ctx
-                            .cache()
-                            .user(state.user_id)
-                            .map(|u| u.bot)
-                            .unwrap_or(false);
-                        if !is_bot {
-                            listeners += 1;
-                        }
+        if let Some(vc_channel_id) = player.voice_channel
+            && let Some(guild) = ctx.guild()
+        {
+            for state in guild.voice_states.values() {
+                if state.channel_id == Some(vc_channel_id) {
+                    let is_bot = ctx
+                        .cache()
+                        .user(state.user_id)
+                        .map(|u| u.bot)
+                        .unwrap_or(false);
+                    if !is_bot {
+                        listeners += 1;
                     }
                 }
             }

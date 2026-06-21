@@ -391,8 +391,8 @@ async fn fetch_track_metadata_with_backoff(
     track_url: &str,
 ) -> Result<crate::audio::providers::SoundCloudTrackMetadata, SerenyaError> {
     let mut final_url = track_url.to_owned();
-    if track_url.contains("on.soundcloud.com/") {
-        if let Ok(res) = HTTP_CLIENT.head(track_url)
+    if track_url.contains("on.soundcloud.com/")
+        && let Ok(res) = HTTP_CLIENT.head(track_url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
             .send()
             .await
@@ -400,7 +400,6 @@ async fn fetch_track_metadata_with_backoff(
             final_url = res.url().as_str().to_owned();
             tracing::info!("Redirected shortened SoundCloud stream URL: {} -> {}", track_url, final_url);
         }
-    }
 
     let mut attempt = 0;
     let max_attempts = 3;
@@ -618,14 +617,14 @@ async fn resolve_youtube_stream_native(track_url: &str) -> Option<String> {
     }
 
     // 2. Fallback to Invidious/Piped Proxy
-    if let Some(video_id) = extract_youtube_video_id(track_url) {
-        if let Some(url) = resolve_via_invidious_or_piped(video_id, &HTTP_CLIENT).await {
-            if is_direct_stream_url(&url) {
-                tracing::debug!(track_url, stream_url = %url, "invidious/piped resolved direct stream");
-                return Some(url);
-            }
-            tracing::debug!(url = %url, "rejecting non-direct stream URL from proxies");
+    if let Some(video_id) = extract_youtube_video_id(track_url)
+        && let Some(url) = resolve_via_invidious_or_piped(video_id, &HTTP_CLIENT).await
+    {
+        if is_direct_stream_url(&url) {
+            tracing::debug!(track_url, stream_url = %url, "invidious/piped resolved direct stream");
+            return Some(url);
         }
+        tracing::debug!(url = %url, "rejecting non-direct stream URL from proxies");
     }
 
     None

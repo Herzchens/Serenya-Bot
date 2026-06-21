@@ -146,6 +146,7 @@ impl EventHandler for TrackErrorHandler {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn play_next(
     guild_id: serenity::GuildId,
     database: std::sync::Arc<DatabaseManager>,
@@ -176,11 +177,11 @@ pub fn play_next(
                 tracing::info!("Ignoring End/Error event because player is seeking");
                 return Ok(());
             }
-            if let Some(ref current_handle) = player.current_track_handle {
-                if current_handle.uuid() != ended {
-                    tracing::info!("Ignoring End/Error event from stale track handle");
-                    return Ok(());
-                }
+            if let Some(ref current_handle) = player.current_track_handle
+                && current_handle.uuid() != ended
+            {
+                tracing::info!("Ignoring End/Error event from stale track handle");
+                return Ok(());
             }
         }
 
@@ -259,13 +260,11 @@ pub fn play_next(
                 .await
                 .announce_track;
 
-            if announce_setting {
-                if let Some(channel) = announce_channel {
-                    let ctx_clone = serenity_ctx.clone();
-                    tokio::spawn(async move {
-                        let _ = channel.say(&ctx_clone.http, "Queue finished. ⏹️").await;
-                    });
-                }
+            if announce_setting && let Some(channel) = announce_channel {
+                let ctx_clone = serenity_ctx.clone();
+                tokio::spawn(async move {
+                    let _ = channel.say(&ctx_clone.http, "Queue finished. ⏹️").await;
+                });
             }
             return Ok(());
         };
@@ -279,10 +278,10 @@ pub fn play_next(
             } else {
                 // Update player's now_playing field with the resolved track
                 let mut player = player_lock.write().await;
-                if let Some(ref mut np) = player.now_playing {
-                    if np.url.starts_with("ytsearch1:") {
-                        *np = track.clone();
-                    }
+                if let Some(ref mut np) = player.now_playing
+                    && np.url.starts_with("ytsearch1:")
+                {
+                    *np = track.clone();
                 }
             }
         }
@@ -428,13 +427,13 @@ pub fn play_next(
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     let mut player = player_lock_clone.write().await;
-                    if let Some(ref current_handle) = player.current_track_handle {
-                        if current_handle.uuid() == track_uuid {
-                            player.consecutive_errors = 0;
-                            tracing::info!(
-                                "Reset consecutive errors to 0 after 5 seconds of successful playback"
-                            );
-                        }
+                    if let Some(ref current_handle) = player.current_track_handle
+                        && current_handle.uuid() == track_uuid
+                    {
+                        player.consecutive_errors = 0;
+                        tracing::info!(
+                            "Reset consecutive errors to 0 after 5 seconds of successful playback"
+                        );
                     }
                 });
             } else {
@@ -457,22 +456,20 @@ pub fn play_next(
             .await
             .announce_track;
 
-        if announce_setting {
-            if let Some(channel) = announce_channel {
-                let ctx_clone = serenity_ctx.clone();
-                let config_clone = config.clone();
-                tokio::spawn(async move {
-                    let embed = now_playing_announce_embed(&track, &config_clone);
-                    let _ = channel
-                        .send_message(
-                            &ctx_clone.http,
-                            serenity::CreateMessage::new()
-                                .embed(embed)
-                                .flags(serenity::MessageFlags::SUPPRESS_NOTIFICATIONS),
-                        )
-                        .await;
-                });
-            }
+        if announce_setting && let Some(channel) = announce_channel {
+            let ctx_clone = serenity_ctx.clone();
+            let config_clone = config.clone();
+            tokio::spawn(async move {
+                let embed = now_playing_announce_embed(&track, &config_clone);
+                let _ = channel
+                    .send_message(
+                        &ctx_clone.http,
+                        serenity::CreateMessage::new()
+                            .embed(embed)
+                            .flags(serenity::MessageFlags::SUPPRESS_NOTIFICATIONS),
+                    )
+                    .await;
+            });
         }
 
         Ok(())
@@ -510,22 +507,18 @@ pub async fn trigger_prefetch(
         }
     };
 
-    if needs_resolution {
-        if let Some(ref mut track) = track_to_resolve {
-            if let Err(e) =
-                crate::audio::resolver::resolve_ytsearch_track(track, &http_client).await
+    if needs_resolution && let Some(ref mut track) = track_to_resolve {
+        if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(track, &http_client).await {
+            tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
+        } else {
+            // Update it in the queue
+            let mut player = player_lock.write().await;
+            if let Some(t) = player.queue.get_mut(0)
+                && t.url.starts_with("ytsearch1:")
             {
-                tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
-            } else {
-                // Update it in the queue
-                let mut player = player_lock.write().await;
-                if let Some(t) = player.queue.get_mut(0) {
-                    if t.url.starts_with("ytsearch1:") {
-                        t.url = track.url.clone();
-                        if t.thumbnail.is_none() {
-                            t.thumbnail = track.thumbnail.clone();
-                        }
-                    }
+                t.url = track.url.clone();
+                if t.thumbnail.is_none() {
+                    t.thumbnail = track.thumbnail.clone();
                 }
             }
         }
@@ -555,11 +548,11 @@ pub async fn trigger_prefetch(
     {
         Ok(Some(resolved_url)) => {
             let mut player = player_lock.write().await;
-            if let Some(track) = player.queue.get_mut(0) {
-                if track.url == url_to_resolve {
-                    track.resolved_url = Some(resolved_url);
-                    tracing::info!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
-                }
+            if let Some(track) = player.queue.get_mut(0)
+                && track.url == url_to_resolve
+            {
+                track.resolved_url = Some(resolved_url);
+                tracing::info!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
             }
         }
         Ok(None) => {}

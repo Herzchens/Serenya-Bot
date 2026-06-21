@@ -6,6 +6,7 @@ echo.
 
 :: Cau hinh bien moi truong CMake ep su dung ban VS o o D
 set CMAKE_GENERATOR_INSTANCE=D:\Visual Studio 2022
+set CMAKE_GENERATOR=NMake Makefiles
 
 :: Them CMake vao PATH tam thoi neu no chua co san
 set PATH=D:\CMake\bin;%PATH%
@@ -18,7 +19,7 @@ call "D:\Visual Studio 2022\VC\Auxiliary\Build\vcvars64.bat"
 echo.
 echo [2/2] Running Cargo command...
 if "%~1"=="" (
-    cargo build
+    "%USERPROFILE%\.cargo\bin\cargo" build
 ) else (
-    cargo %*
+    "%USERPROFILE%\.cargo\bin\cargo" %*
 )

@@ -212,15 +212,14 @@ pub(crate) async fn get_spotify_session_info(
     let now = std::time::Instant::now();
     {
         let cache = cache_lock.lock().await;
-        if let Some(ref token) = *cache {
-            if token.cookie_hash == cookie_hash
-                && token.expires_at > now + std::time::Duration::from_secs(60)
-            {
-                return Ok(SpotifySessionInfo {
-                    access_token: token.access_token.clone(),
-                    client_id: token.client_id.clone(),
-                });
-            }
+        if let Some(ref token) = *cache
+            && token.cookie_hash == cookie_hash
+            && token.expires_at > now + std::time::Duration::from_secs(60)
+        {
+            return Ok(SpotifySessionInfo {
+                access_token: token.access_token.clone(),
+                client_id: token.client_id.clone(),
+            });
         }
     }
 
@@ -286,14 +285,14 @@ pub(crate) async fn get_spotify_client_token_info(
     let now = std::time::Instant::now();
     {
         let cache = cache_lock.lock().await;
-        if let Some(ref cached) = *cache {
-            if cached.expires_at > now {
-                return Ok(SpotifyClientTokenInfo {
-                    client_token: cached.client_token.clone(),
-                    client_version: cached.client_version.clone(),
-                    device_id: cached.device_id.clone(),
-                });
-            }
+        if let Some(ref cached) = *cache
+            && cached.expires_at > now
+        {
+            return Ok(SpotifyClientTokenInfo {
+                client_token: cached.client_token.clone(),
+                client_version: cached.client_version.clone(),
+                device_id: cached.device_id.clone(),
+            });
         }
     }
 
@@ -322,15 +321,13 @@ pub(crate) async fn get_spotify_client_token_info(
 
     let mut device_id = "some_random_device_id".to_owned();
     for cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
-        if let Ok(cookie_str) = cookie.to_str() {
-            if cookie_str.starts_with("sp_t=") {
-                if let Some(val) = cookie_str.split(';').next() {
-                    if let Some(val_parts) = val.split('=').nth(1) {
-                        device_id = val_parts.to_owned();
-                        break;
-                    }
-                }
-            }
+        if let Ok(cookie_str) = cookie.to_str()
+            && cookie_str.starts_with("sp_t=")
+            && let Some(val) = cookie_str.split(';').next()
+            && let Some(val_parts) = val.split('=').nth(1)
+        {
+            device_id = val_parts.to_owned();
+            break;
         }
     }
 
@@ -959,30 +956,29 @@ impl DeezerProvider {
         // 10s Timeout guard
         let response = tokio::time::timeout(Duration::from_secs(10), response_fut).await;
 
-        if let Ok(Ok(res)) = response {
-            if let Ok(val) = res.json::<serde_json::Value>().await {
-                if let Some(title) = val.get("title").and_then(|t| t.as_str()) {
-                    let artist = val
-                        .pointer("/artist/name")
-                        .and_then(|n| n.as_str())
-                        .map(|s| s.to_owned());
-                    let duration = val
-                        .get("duration")
-                        .and_then(|d| d.as_u64())
-                        .map(Duration::from_secs);
-                    let thumbnail = val
-                        .pointer("/album/cover_medium")
-                        .and_then(|c| c.as_str())
-                        .map(|s| s.to_owned());
+        if let Ok(Ok(res)) = response
+            && let Ok(val) = res.json::<serde_json::Value>().await
+            && let Some(title) = val.get("title").and_then(|t| t.as_str())
+        {
+            let artist = val
+                .pointer("/artist/name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_owned());
+            let duration = val
+                .get("duration")
+                .and_then(|d| d.as_u64())
+                .map(Duration::from_secs);
+            let thumbnail = val
+                .pointer("/album/cover_medium")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_owned());
 
-                    return Ok(ExternalTrackMeta {
-                        title: title.to_owned(),
-                        artist,
-                        duration,
-                        thumbnail: thumbnail.map(std::sync::Arc::from),
-                    });
-                }
-            }
+            return Ok(ExternalTrackMeta {
+                title: title.to_owned(),
+                artist,
+                duration,
+                thumbnail: thumbnail.map(std::sync::Arc::from),
+            });
         }
 
         // 2. Fallback to HTML scrape
@@ -1515,10 +1511,10 @@ pub async fn get_or_fetch_client_id(http_client: &reqwest::Client) -> Result<Str
     // 1. Read lock check
     {
         let read_guard = SOUNDCLOUD_STATE.read().await;
-        if let Some(ref state) = *read_guard {
-            if state.obtained_at.elapsed() < Duration::from_secs(3600) {
-                return Ok(state.client_id.clone());
-            }
+        if let Some(ref state) = *read_guard
+            && state.obtained_at.elapsed() < Duration::from_secs(3600)
+        {
+            return Ok(state.client_id.clone());
         }
     }
 
@@ -1526,10 +1522,10 @@ pub async fn get_or_fetch_client_id(http_client: &reqwest::Client) -> Result<Str
     let _refresh_permit = SOUNDCLOUD_REFRESH_MUTEX.lock().await;
     {
         let mut write_guard = SOUNDCLOUD_STATE.write().await;
-        if let Some(ref state) = *write_guard {
-            if state.obtained_at.elapsed() < Duration::from_secs(3600) {
-                return Ok(state.client_id.clone());
-            }
+        if let Some(ref state) = *write_guard
+            && state.obtained_at.elapsed() < Duration::from_secs(3600)
+        {
+            return Ok(state.client_id.clone());
         }
 
         tracing::info!("SoundCloud client_id is expired or None, fetching fresh one...");
@@ -1572,18 +1568,17 @@ fn regex_extract_client_id(html: &str) -> Option<String> {
             let json_str = &rest[..end_pos];
             if let Some(eq_pos) = json_str.find('=') {
                 let json_data_str = json_str[eq_pos + 1..].trim();
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data_str) {
-                    if let Some(arr) = parsed.as_array() {
-                        for val in arr {
-                            if val.get("hydratable").and_then(|h| h.as_str()) == Some("apiClient") {
-                                if let Some(client_id) = val
-                                    .get("data")
-                                    .and_then(|d| d.get("id"))
-                                    .and_then(|id| id.as_str())
-                                {
-                                    return Some(client_id.to_owned());
-                                }
-                            }
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data_str)
+                    && let Some(arr) = parsed.as_array()
+                {
+                    for val in arr {
+                        if val.get("hydratable").and_then(|h| h.as_str()) == Some("apiClient")
+                            && let Some(client_id) = val
+                                .get("data")
+                                .and_then(|d| d.get("id"))
+                                .and_then(|id| id.as_str())
+                        {
+                            return Some(client_id.to_owned());
                         }
                     }
                 }
@@ -1677,7 +1672,7 @@ impl MetadataProvider for SoundCloudProvider {
                 source: "SoundCloud".to_owned(),
                 title: entry.title.unwrap_or_else(|| "Unknown Title".to_string()),
                 artist,
-                duration: entry.duration.map(|d| Duration::from_millis(d)),
+                duration: entry.duration.map(Duration::from_millis),
                 popularity: None,
                 is_official: false,
                 is_topic_channel: false,
@@ -1700,8 +1695,8 @@ impl SoundCloudProvider {
         http_client: &reqwest::Client,
     ) -> Result<Vec<Track>, SerenyaError> {
         let mut final_url = url.to_owned();
-        if url.contains("on.soundcloud.com/") {
-            if let Ok(res) = http_client.head(url)
+        if url.contains("on.soundcloud.com/")
+            && let Ok(res) = http_client.head(url)
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
                 .send()
                 .await
@@ -1709,7 +1704,6 @@ impl SoundCloudProvider {
                 final_url = res.url().as_str().to_owned();
                 tracing::info!("Redirected shortened SoundCloud URL: {} -> {}", url, final_url);
             }
-        }
 
         let url_enc = url_encode(&final_url);
         let res = send_soundcloud_request(http_client, |cid| {
@@ -1777,7 +1771,7 @@ impl SoundCloudProvider {
                     })?;
 
                 for meta in bulk_tracks {
-                    let duration = meta.duration.map(|d| Duration::from_millis(d));
+                    let duration = meta.duration.map(Duration::from_millis);
                     let track_url = meta.permalink_url.clone().unwrap_or_else(|| {
                         format!("https://api.soundcloud.com/tracks/{}", meta.id)
                     });
@@ -1801,7 +1795,7 @@ impl SoundCloudProvider {
                 SerenyaError::Audio(format!("Failed to parse SoundCloud track metadata: {}", e))
             })?;
 
-            let duration = meta.duration.map(|d| Duration::from_millis(d));
+            let duration = meta.duration.map(Duration::from_millis);
 
             Ok(vec![Track {
                 title: meta.title.unwrap_or_else(|| "SoundCloud Track".to_owned()),

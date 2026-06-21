@@ -130,16 +130,14 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
     let author_id = ctx.author().id.get();
     let mut is_allowed = author_id == owner_id;
 
-    if !is_allowed {
-        if let Some(guild_id) = ctx.guild_id() {
-            if let Ok(member) = guild_id.member(ctx, ctx.author().id).await {
-                if let Some(guild) = ctx.guild() {
-                    let permissions = guild.member_permissions(&member);
-                    if permissions.administrator() {
-                        is_allowed = true;
-                    }
-                }
-            }
+    if !is_allowed
+        && let Some(guild_id) = ctx.guild_id()
+        && let Ok(member) = guild_id.member(ctx, ctx.author().id).await
+        && let Some(guild) = ctx.guild()
+    {
+        let permissions = guild.member_permissions(&member);
+        if permissions.administrator() {
+            is_allowed = true;
         }
     }
 

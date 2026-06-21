@@ -176,10 +176,10 @@ pub async fn run_ytdlp(
         if youtube_sensitive && contains_youtube_rate_limit(&stderr) {
             mark_youtube_degraded(YOUTUBE_RATE_LIMIT_COOLDOWN);
         }
-        if should_negative_cache(&stderr) {
-            if let Some(key) = negative_cache_key {
-                remember_negative(key, summarize_stderr(&stderr)).await;
-            }
+        if should_negative_cache(&stderr)
+            && let Some(key) = negative_cache_key
+        {
+            remember_negative(key, summarize_stderr(&stderr)).await;
         }
         return Err(SerenyaError::Audio(format!(
             "yt-dlp {context} error: {}",
@@ -244,13 +244,12 @@ pub fn mark_youtube_degraded(cooldown: Duration) {
 }
 
 fn clear_youtube_degraded_if_expired() {
-    if let Ok(mut degraded_until) = RESOLVER_RUNTIME.youtube_degraded_until.write() {
-        if degraded_until
+    if let Ok(mut degraded_until) = RESOLVER_RUNTIME.youtube_degraded_until.write()
+        && degraded_until
             .map(|until| until <= Instant::now())
             .unwrap_or(false)
-        {
-            *degraded_until = None;
-        }
+    {
+        *degraded_until = None;
     }
 }
 

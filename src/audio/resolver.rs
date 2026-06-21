@@ -575,16 +575,15 @@ async fn run_provider_batch(
                 expected_duration,
             );
 
-            if let Some((candidate, top_score)) = scored.first() {
-                if *top_score >= settings.auto_pick_threshold
-                    && !contains_unrequested_variant(&candidate.title, search_query)
-                {
-                    perfect_found = true;
-                    all_scored.extend(scored);
-                    cancel_token.cancel();
-                    join_set.abort_all();
-                    break;
-                }
+            if let Some((candidate, top_score)) = scored.first()
+                && *top_score >= settings.auto_pick_threshold
+                && !contains_unrequested_variant(&candidate.title, search_query)
+            {
+                perfect_found = true;
+                all_scored.extend(scored);
+                cancel_token.cancel();
+                join_set.abort_all();
+                break;
             }
 
             all_scored.extend(scored);
@@ -920,10 +919,10 @@ async fn mirror_metadata(
         )
         .await?;
 
-        if let Some((_, best_new)) = fallback_scored.first() {
-            if *best_new > scored.first().map(|(_, s)| *s).unwrap_or(0.0) {
-                scored = fallback_scored;
-            }
+        if let Some((_, best_new)) = fallback_scored.first()
+            && *best_new > scored.first().map(|(_, s)| *s).unwrap_or(0.0)
+        {
+            scored = fallback_scored;
         }
     }
 
@@ -1391,17 +1390,17 @@ async fn resolve_spotify_playlist_api(
             SerenyaError::Audio(format!("Failed to parse Spotify Partner API JSON: {}", e))
         })?;
 
-        if let Some(errors) = body.get("errors").and_then(|e| e.as_array()) {
-            if !errors.is_empty() {
-                let first_err = errors[0]
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown GraphQL error");
-                return Err(SerenyaError::Audio(format!(
-                    "Spotify GraphQL error: {}",
-                    first_err
-                )));
-            }
+        if let Some(errors) = body.get("errors").and_then(|e| e.as_array())
+            && !errors.is_empty()
+        {
+            let first_err = errors[0]
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown GraphQL error");
+            return Err(SerenyaError::Audio(format!(
+                "Spotify GraphQL error: {}",
+                first_err
+            )));
         }
 
         let playlist_v2 = body.pointer("/data/playlistV2").ok_or_else(|| {
@@ -1531,10 +1530,10 @@ async fn resolve_spotify_playlist_api(
         );
 
         offset += items_len;
-        if let Some(tc) = total_count {
-            if offset >= tc {
-                break;
-            }
+        if let Some(tc) = total_count
+            && offset >= tc
+        {
+            break;
         }
     }
 
@@ -2120,10 +2119,11 @@ pub async fn resolve_ytsearch_track(
         Ok(())
     } else {
         let mut candidates = YouTubeProvider.search(&query, http_client).await?;
-        if candidates.is_empty() && crate::audio::runtime::ytdlp_enabled() {
-            if let Ok(ytdl_candidates) = YouTubeProvider.search_fallback_ytdl(&query).await {
-                candidates = ytdl_candidates;
-            }
+        if candidates.is_empty()
+            && crate::audio::runtime::ytdlp_enabled()
+            && let Ok(ytdl_candidates) = YouTubeProvider.search_fallback_ytdl(&query).await
+        {
+            candidates = ytdl_candidates;
         }
 
         let best_candidate = if let Some(expected) = track.duration {
