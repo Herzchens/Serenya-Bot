@@ -70,6 +70,8 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         player.voice_channel = None;
         player.announce_channel = None;
     }
+    
+    crate::audio::runtime::cleanup_guild(guild_id.get());
 
     ctx.say("👋 Left voice channel and cleared state.").await?;
     Ok(())

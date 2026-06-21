@@ -1256,7 +1256,7 @@ async fn resolve_spotify_playlist_api(
         .filter(|cookie| !cookie.trim().is_empty())
         .ok_or_else(|| SerenyaError::Audio("Spotify sp_dc cookie is not configured.".to_owned()))?;
 
-    let mut tracks = Vec::new();
+    let mut tracks = Vec::with_capacity(limit);
     let mut offset = 0;
     let mut total_count = None;
 
@@ -1553,7 +1553,7 @@ async fn resolve_spotify_album_api(
             .await?;
     tracing::info!("Spotify API access token retrieved successfully.");
 
-    let mut tracks = Vec::new();
+    let mut tracks = Vec::with_capacity(limit);
 
     let url = format!("https://api.spotify.com/v1/albums/{}", album_id);
     tracing::info!("Fetching Spotify album details: {}", url);
@@ -1920,7 +1920,7 @@ async fn resolve_spotify_artist_top_tracks_api(
         "Processing Spotify artist top tracks (items: {})",
         tracks_arr.len()
     );
-    let mut tracks = Vec::new();
+    let mut tracks = Vec::with_capacity(limit.min(tracks_arr.len()));
     for track_val in tracks_arr.iter().take(limit) {
         let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else {
             continue;

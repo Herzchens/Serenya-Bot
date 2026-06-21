@@ -55,6 +55,10 @@ pub fn configure(settings: &ResolverSection, spotify: &crate::config::SpotifySec
     RESOLVER_RUNTIME.guild_resolve_semaphores.clear();
 }
 
+pub fn cleanup_guild(guild_id: u64) {
+    RESOLVER_RUNTIME.guild_resolve_semaphores.remove(&guild_id);
+}
+
 pub fn settings() -> ResolverSection {
     RESOLVER_RUNTIME
         .settings

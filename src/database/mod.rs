@@ -15,7 +15,7 @@ use models::{Database, GuildSettings, PlaylistTrack, UserSettings};
 
 #[derive(Clone)]
 pub struct DatabaseManager {
-    data: Arc<RwLock<Database>>,
+    data: Arc<RwLock<Arc<Database>>>,
     path: PathBuf,
     is_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -41,7 +41,7 @@ impl DatabaseManager {
 
         tracing::info!(path = %path.display(), "database loaded");
         Ok(Self {
-            data: Arc::new(RwLock::new(db)),
+            data: Arc::new(RwLock::new(Arc::new(db))),
             path,
             is_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -50,7 +50,7 @@ impl DatabaseManager {
     pub async fn save(&self) -> Result<(), SerenyaError> {
         let db_clone = {
             let data = self.data.read().await;
-            data.clone()
+            Arc::clone(&*data)
         };
 
         let yaml = tokio::task::spawn_blocking(move || {
@@ -118,7 +118,8 @@ impl DatabaseManager {
     }
 
     pub async fn update_guild_settings(&self, guild_id: u64, settings: GuildSettings) {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         data.guild_settings.insert(guild_id.to_string(), settings);
         self.is_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -130,7 +131,8 @@ impl DatabaseManager {
     }
 
     pub async fn update_user_settings(&self, user_id: u64, settings: UserSettings) {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         data.user_settings.insert(user_id.to_string(), settings);
         self.is_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -163,7 +165,8 @@ impl DatabaseManager {
         name: &str,
         max_playlists: usize,
     ) -> Result<(), SerenyaError> {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = user_id.to_string();
         let user_playlists = data.user_playlists.entry(key).or_default();
 
@@ -202,7 +205,8 @@ impl DatabaseManager {
         track: PlaylistTrack,
         max_tracks: usize,
     ) -> Result<(), SerenyaError> {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = user_id.to_string();
 
         let playlist = data
@@ -224,7 +228,8 @@ impl DatabaseManager {
     }
 
     pub async fn delete_playlist(&self, user_id: u64, name: &str) -> Result<(), SerenyaError> {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = user_id.to_string();
 
         let removed = data
@@ -248,7 +253,8 @@ impl DatabaseManager {
         name: &str,
         index: usize,
     ) -> Result<(), SerenyaError> {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = user_id.to_string();
         let playlist = data
             .user_playlists
@@ -275,7 +281,8 @@ impl DatabaseManager {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), SerenyaError> {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = user_id.to_string();
         let playlists = data
             .user_playlists
@@ -299,7 +306,8 @@ impl DatabaseManager {
     }
 
     pub async fn increment_songs_played(&self, guild_id: u64) {
-        let mut data = self.data.write().await;
+        let mut data_guard = self.data.write().await;
+        let data = Arc::make_mut(&mut *data_guard);
         let key = guild_id.to_string();
         let settings = data.guild_settings.entry(key).or_default();
         settings.total_songs_played += 1;
