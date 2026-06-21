@@ -236,85 +236,14 @@ pub fn clean_title(title: &str) -> String {
 }
 
 pub fn jaro_winkler_similarity(s1: &str, s2: &str) -> f64 {
-    const MAX_LEN: usize = 128;
-
-    let mut s1_chars = ['\0'; MAX_LEN];
-    let mut len1 = 0;
-    for c in s1.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).take(MAX_LEN) {
-        s1_chars[len1] = c;
-        len1 += 1;
-    }
-
-    let mut s2_chars = ['\0'; MAX_LEN];
-    let mut len2 = 0;
-    for c in s2.chars().map(|c| c.to_lowercase().next().unwrap_or(c)).take(MAX_LEN) {
-        s2_chars[len2] = c;
-        len2 += 1;
-    }
-
-    if len1 == 0 && len2 == 0 {
+    if s1.is_empty() && s2.is_empty() {
         return 1.0;
     }
-    if len1 == 0 || len2 == 0 {
+    if s1.is_empty() || s2.is_empty() {
         return 0.0;
     }
-
-    let match_distance = (len1.max(len2) / 2).saturating_sub(1);
-
-    let mut s1_matches = [false; MAX_LEN];
-    let mut s2_matches = [false; MAX_LEN];
-
-    let mut matches = 0.0;
-    let mut transpositions = 0.0;
-
-    for i in 0..len1 {
-        let start = i.saturating_sub(match_distance);
-        let end = (i + match_distance + 1).min(len2);
-
-        for j in start..end {
-            if !s2_matches[j] && s1_chars[i] == s2_chars[j] {
-                s1_matches[i] = true;
-                s2_matches[j] = true;
-                matches += 1.0;
-                break;
-            }
-        }
-    }
-
-    if matches == 0.0 {
-        return 0.0;
-    }
-
-    let mut k = 0;
-    for i in 0..len1 {
-        if s1_matches[i] {
-            while k < len2 && !s2_matches[k] {
-                k += 1;
-            }
-            if k < len2 && s1_chars[i] != s2_chars[k] {
-                transpositions += 1.0;
-            }
-            k += 1;
-        }
-    }
-
-    let jaro = (matches / len1 as f64
-        + matches / len2 as f64
-        + (matches - transpositions / 2.0) / matches)
-        / 3.0;
-
-    // Winkler bonus for prefix matching
-    let mut prefix_len = 0;
-    for i in 0..4.min(len1).min(len2) {
-        if s1_chars[i] == s2_chars[i] {
-            prefix_len += 1;
-        } else {
-            break;
-        }
-    }
-
-    let p = 0.1; // scaling factor
-    jaro + prefix_len as f64 * p * (1.0 - jaro)
+    // Leverage the highly optimized strsim implementation
+    strsim::jaro_winkler(&s1.to_lowercase(), &s2.to_lowercase())
 }
 
 /// Score and rank candidates based on metadata relevance and quality signals.

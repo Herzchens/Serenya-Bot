@@ -27,18 +27,7 @@ pub trait MetadataProvider: Send + Sync {
 // Utilities
 // ----------------------------------------------------
 pub fn url_encode(s: &str) -> String {
-    let mut encoded = String::new();
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(b as char);
-            }
-            _ => {
-                encoded.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    encoded
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 fn decode_html_entities(s: &str) -> String {

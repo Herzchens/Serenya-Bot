@@ -6,33 +6,26 @@ use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-#[derive(Clone)]
-struct TimedCacheEntry<T> {
-    value: T,
-    inserted_at: Instant,
-}
+static QUERY_CACHE: LazyLock<Cache<String, Track>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(2048)
+        .time_to_live(Duration::from_secs(crate::audio::runtime::settings().query_cache_ttl_seconds))
+        .build()
+});
 
-impl<T> TimedCacheEntry<T> {
-    fn new(value: T) -> Self {
-        Self {
-            value,
-            inserted_at: Instant::now(),
-        }
-    }
+static METADATA_CACHE: LazyLock<Cache<String, Track>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(Duration::from_secs(crate::audio::runtime::settings().metadata_cache_ttl_seconds))
+        .build()
+});
 
-    fn is_fresh(&self, ttl_seconds: u64) -> bool {
-        self.inserted_at.elapsed().as_secs() <= ttl_seconds
-    }
-}
-
-static QUERY_CACHE: LazyLock<Cache<String, TimedCacheEntry<Track>>> =
-    LazyLock::new(|| Cache::builder().max_capacity(2048).build());
-
-static METADATA_CACHE: LazyLock<Cache<String, TimedCacheEntry<Track>>> =
-    LazyLock::new(|| Cache::builder().max_capacity(4096).build());
-
-static STREAM_CACHE: LazyLock<Cache<String, TimedCacheEntry<String>>> =
-    LazyLock::new(|| Cache::builder().max_capacity(4096).build());
+static STREAM_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(Duration::from_secs(crate::audio::runtime::settings().stream_cache_ttl_seconds))
+        .build()
+});
 
 /// Shared HTTP client for internal network calls (Invidious, Piped, OEmbed, etc.).
 /// Avoids creating a new TLS session per track resolve — reuses connection pool.
@@ -48,45 +41,37 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 pub async fn cache_get_metadata(query: &str) -> Option<Track> {
-    let entry = QUERY_CACHE.get(query).await?;
-    if entry.is_fresh(crate::audio::runtime::settings().query_cache_ttl_seconds) {
+    if let Some(track) = QUERY_CACHE.get(query).await {
         tracing::debug!(query, cache = "query", "cache hit");
-        return Some(entry.value);
+        return Some(track);
     }
-    QUERY_CACHE.invalidate(query).await;
-    tracing::debug!(query, cache = "query", "cache expired");
+    tracing::debug!(query, cache = "query", "cache miss/expired");
     None
 }
 
 pub async fn cache_set_metadata(query: String, track: Track) {
-    QUERY_CACHE.insert(query, TimedCacheEntry::new(track)).await;
+    QUERY_CACHE.insert(query, track).await;
 }
 
 pub async fn cache_get_url_metadata(url: &str) -> Option<Track> {
-    let entry = METADATA_CACHE.get(url).await?;
-    if entry.is_fresh(crate::audio::runtime::settings().metadata_cache_ttl_seconds) {
+    if let Some(track) = METADATA_CACHE.get(url).await {
         tracing::debug!(url, cache = "metadata", "cache hit");
-        return Some(entry.value);
+        return Some(track);
     }
-    METADATA_CACHE.invalidate(url).await;
-    tracing::debug!(url, cache = "metadata", "cache expired");
+    tracing::debug!(url, cache = "metadata", "cache miss/expired");
     None
 }
 
 pub async fn cache_set_url_metadata(url: String, track: Track) {
-    METADATA_CACHE
-        .insert(url, TimedCacheEntry::new(track))
-        .await;
+    METADATA_CACHE.insert(url, track).await;
 }
 
 pub async fn cache_get_stream(url: &str) -> Option<String> {
-    let entry = STREAM_CACHE.get(url).await?;
-    if entry.is_fresh(crate::audio::runtime::settings().stream_cache_ttl_seconds) {
+    if let Some(stream_url) = STREAM_CACHE.get(url).await {
         tracing::debug!(url, cache = "stream", "cache hit");
-        return Some(entry.value);
+        return Some(stream_url);
     }
-    STREAM_CACHE.invalidate(url).await;
-    tracing::debug!(url, cache = "stream", "cache expired");
+    tracing::debug!(url, cache = "stream", "cache miss/expired");
     None
 }
 
@@ -96,24 +81,11 @@ pub async fn cache_invalidate_stream(url: &str) {
 }
 
 pub async fn cache_set_stream(url: String, stream_url: String) {
-    STREAM_CACHE
-        .insert(url, TimedCacheEntry::new(stream_url))
-        .await;
+    STREAM_CACHE.insert(url, stream_url).await;
 }
 
 fn url_encode(s: &str) -> String {
-    let mut encoded = String::new();
-    for b in s.bytes() {
-        match b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(b as char);
-            }
-            _ => {
-                encoded.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    encoded
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 #[derive(Deserialize)]
@@ -295,27 +267,21 @@ async fn run_ytdlp_stream_resolution(
     Ok(stream_url)
 }
 
-#[derive(Clone)]
-pub struct SoundCloudStreamInfo {
-    pub stream_url: String,
-    pub expires_at: Instant,
-}
-
-static SOUNDCLOUD_STREAM_CACHE: LazyLock<Cache<String, SoundCloudStreamInfo>> =
-    LazyLock::new(|| Cache::builder().build());
+static SOUNDCLOUD_STREAM_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+    Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(Duration::from_secs(300)) // 5 minutes
+        .build()
+});
 
 static SOUNDCLOUD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
 async fn resolve_soundcloud_stream_url(track_url: &str) -> Result<String, SerenyaError> {
     // 1. Check cache
-    if let Some(info) = SOUNDCLOUD_STREAM_CACHE.get(track_url).await {
-        if Instant::now() < info.expires_at {
-            tracing::debug!(track_url, "SoundCloud stream cache hit");
-            return Ok(info.stream_url);
-        } else {
-            SOUNDCLOUD_STREAM_CACHE.invalidate(track_url).await;
-        }
+    if let Some(stream_url) = SOUNDCLOUD_STREAM_CACHE.get(track_url).await {
+        tracing::debug!(track_url, "SoundCloud stream cache hit");
+        return Ok(stream_url);
     }
 
     // 2. Concurrency control via Semaphore
@@ -344,13 +310,9 @@ async fn resolve_soundcloud_stream_url(track_url: &str) -> Result<String, Sereny
     let stream_url = fetch_stream_url_with_backoff(&transcoding_url).await?;
 
     // 6. Cache the result for 5 minutes (SoundCloud signed URLs expire quickly)
-    let expires_at = Instant::now() + Duration::from_secs(300); // 5 minutes
     SOUNDCLOUD_STREAM_CACHE.insert(
         track_url.to_owned(),
-        SoundCloudStreamInfo {
-            stream_url: stream_url.clone(),
-            expires_at,
-        },
+        stream_url.clone(),
     ).await;
 
     Ok(stream_url)
@@ -569,50 +531,29 @@ fn is_direct_stream_url(url: &str) -> bool {
 }
 
 async fn resolve_youtube_stream_native(track_url: &str) -> Option<String> {
-    let mut join_set = tokio::task::JoinSet::new();
-    let track_url_owned = track_url.to_owned();
-
-    join_set.spawn(async move {
-        match resolve_via_rusty_ytdl(&track_url_owned).await {
-            Ok(url) => {
-                tracing::debug!(track_url = %track_url_owned, stream_url = %url, "rusty_ytdl resolved");
-                Some(url)
-            }
-            Err(err) => {
-                tracing::debug!(track_url = %track_url_owned, %err, "rusty_ytdl stream resolution failed");
-                None
-            }
+    // 1. Try rusty_ytdl first (direct Google stream)
+    let rusty_future = resolve_via_rusty_ytdl(track_url);
+    if let Ok(Ok(url)) = tokio::time::timeout(Duration::from_secs(4), rusty_future).await {
+        if is_direct_stream_url(&url) {
+            tracing::debug!(track_url, stream_url = %url, "rusty_ytdl resolved direct stream");
+            return Some(url);
         }
-    });
-
-    if let Some(video_id) = extract_youtube_video_id(track_url).map(str::to_owned) {
-        join_set.spawn(async move {
-            resolve_via_invidious_or_piped(&video_id, &HTTP_CLIENT).await
-        });
+        tracing::debug!(url = %url, "rejecting non-direct stream URL from rusty_ytdl");
+    } else {
+        tracing::debug!(track_url, "rusty_ytdl stream resolution failed or timed out");
     }
 
-    let deadline = Duration::from_secs(4);
-    let started = Instant::now();
-    while started.elapsed() < deadline {
-        let remaining = deadline.saturating_sub(started.elapsed());
-        match tokio::time::timeout(remaining, join_set.join_next()).await {
-            Ok(Some(Ok(Some(url)))) => {
-                // Only accept direct Google video URLs — reject piped/invidious proxy URLs
-                // which are unreliable and often broken
-                if is_direct_stream_url(&url) {
-                    join_set.abort_all();
-                    while join_set.join_next().await.is_some() {}
-                    return Some(url);
-                }
-                tracing::debug!(url = %url, "rejecting non-direct stream URL from native resolver");
+    // 2. Fallback to Invidious/Piped Proxy
+    if let Some(video_id) = extract_youtube_video_id(track_url) {
+        if let Some(url) = resolve_via_invidious_or_piped(video_id, &HTTP_CLIENT).await {
+            if is_direct_stream_url(&url) {
+                tracing::debug!(track_url, stream_url = %url, "invidious/piped resolved direct stream");
+                return Some(url);
             }
-            Ok(Some(Ok(None))) | Ok(Some(Err(_))) => {}
-            Ok(None) | Err(_) => break,
+            tracing::debug!(url = %url, "rejecting non-direct stream URL from proxies");
         }
     }
 
-    join_set.abort_all();
-    while join_set.join_next().await.is_some() {}
     None
 }
 
