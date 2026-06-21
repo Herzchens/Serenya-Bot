@@ -805,18 +805,22 @@ pub async fn resolve_input(
                 ))
             }
         } else if soundcloud_provider.supports(query_trimmed) {
-            let mut tracks = soundcloud_provider
+            let tracks = soundcloud_provider
                 .load(query_trimmed, user_id, http_client)
                 .await?;
             if !tracks.is_empty() {
-                let mut track = tracks.remove(0);
-                track.requester_id = serenity::UserId::new(user_id);
-                crate::audio::source::cache_set_url_metadata(
-                    query_trimmed.to_owned(),
-                    track.clone(),
-                )
-                .await;
-                Ok(ResolvedInput::Track(track))
+                if tracks.len() > 1 {
+                    Ok(ResolvedInput::Playlist(tracks))
+                } else {
+                    let mut track = tracks[0].clone();
+                    track.requester_id = serenity::UserId::new(user_id);
+                    crate::audio::source::cache_set_url_metadata(
+                        query_trimmed.to_owned(),
+                        track.clone(),
+                    )
+                    .await;
+                    Ok(ResolvedInput::Track(track))
+                }
             } else {
                 Err(SerenyaError::Audio(
                     "Failed to load SoundCloud track".to_owned(),
@@ -882,7 +886,7 @@ async fn mirror_metadata(
         "Mirroring external metadata to YouTube/SoundCloud/YouTubeMusic search query"
     );
 
-    let scored = perform_parallel_search(
+    let mut scored = perform_parallel_search(
         &search_query,
         &meta.title,
         meta.artist.as_deref(),
@@ -890,6 +894,29 @@ async fn mirror_metadata(
         http_client,
     )
     .await?;
+
+    // If the results are poor (e.g. max score < 0.80) and we searched with an artist,
+    // the artist name might have confused the search engine. Fall back to searching just the title.
+    if meta.artist.is_some() && (scored.is_empty() || scored.first().map(|(_, s)| *s).unwrap_or(0.0) < 0.80) {
+        tracing::info!(
+            query = %meta.title,
+            "First mirror search yielded poor results. Retrying with only title."
+        );
+        let fallback_scored = perform_parallel_search(
+            &meta.title,
+            &meta.title,
+            meta.artist.as_deref(),
+            meta.duration,
+            http_client,
+        )
+        .await?;
+
+        if let Some((_, best_new)) = fallback_scored.first() {
+            if *best_new > scored.first().map(|(_, s)| *s).unwrap_or(0.0) {
+                scored = fallback_scored;
+            }
+        }
+    }
 
     if scored.is_empty() {
         return Err(SerenyaError::Audio(format!(
@@ -2040,11 +2067,7 @@ pub async fn resolve_ytsearch_track(
     }
 
     let raw_query = &track.url["ytsearch1:".len()..];
-    let query = if !raw_query.to_lowercase().contains("lyric") {
-        format!("{} lyrics", raw_query)
-    } else {
-        raw_query.to_owned()
-    };
+    let query = raw_query.to_owned();
     tracing::info!(query, "Resolving ytsearch1 query lazily to YouTube URL");
 
     let scored =

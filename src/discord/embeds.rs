@@ -1,5 +1,6 @@
 #![allow(dead_code, clippy::too_many_arguments)]
 use crate::core::Track;
+use crate::config::BotConfig;
 use poise::serenity_prelude as serenity;
 use std::time::Duration;
 
@@ -49,23 +50,54 @@ pub fn make_progress_bar(elapsed: Duration, duration: Option<Duration>) -> Strin
     }
 }
 
+/// Helper to get the provider emoji from config.
+pub fn get_provider_emoji(track: &Track, config: &BotConfig) -> String {
+    let default_emoji = "🎵".to_string();
+    let emojis = match &config.emojis {
+        Some(e) => e,
+        None => return default_emoji,
+    };
+    
+    let source = track.clean_source().to_lowercase();
+    let emoji_opt = if source.contains("spotify") {
+        emojis.spotify.as_deref()
+    } else if source.contains("youtube") {
+        emojis.youtube.as_deref()
+    } else if source.contains("soundcloud") {
+        emojis.soundcloud.as_deref()
+    } else if source.contains("apple") {
+        emojis.apple_music.as_deref()
+    } else if source.contains("deezer") {
+        emojis.deezer.as_deref()
+    } else {
+        None
+    };
+
+    emoji_opt
+        .or(emojis.default.as_deref())
+        .map(|s| s.to_string())
+        .unwrap_or(default_emoji)
+}
+
 /// Creates a now playing embed.
 pub fn now_playing_embed(
     track: &Track,
     _elapsed: Duration,
     queue_pos: Option<usize>,
+    config: &BotConfig,
 ) -> serenity::CreateEmbed {
     let duration_str = track
         .duration
         .map(format_duration)
         .unwrap_or_else(|| "Live".to_string());
 
+    let provider_emoji = get_provider_emoji(track, config);
     let mut embed = serenity::CreateEmbed::new()
         .title("🎶 Now Playing")
         .description(if track.url.starts_with("http") {
-            format!("🎵 [{}]({})", track.title, track.url)
+            format!("{} [{}]({})", provider_emoji, track.title, track.url)
         } else {
-            format!("🎵 **{}**", track.title)
+            format!("{} **{}**", provider_emoji, track.title)
         })
         .field("Requested By", &track.requester_name, true)
         .field("Duration", duration_str, true)
@@ -84,29 +116,43 @@ pub fn now_playing_embed(
 }
 
 /// Creates a simplified minimal now playing embed for announcements.
-pub fn now_playing_announce_embed(track: &Track) -> serenity::CreateEmbed {
+pub fn now_playing_announce_embed(track: &Track, config: &BotConfig) -> serenity::CreateEmbed {
+    let provider_emoji = get_provider_emoji(track, config);
     serenity::CreateEmbed::new()
-        .description(if track.url.starts_with("http") {
-            format!("🎶 **Now Playing:** [{}]({})", track.title, track.url)
-        } else {
-            format!("🎶 **Now Playing:** **{}**", track.title)
-        })
         .color(0x5865F2)
+        .description(if track.url.starts_with("http") {
+            format!("{} **Now Playing:** [{}]({})", provider_emoji, track.title, track.url)
+        } else {
+            format!("{} **Now Playing:** **{}**", provider_emoji, track.title)
+        })
+}
+
+/// Creates a simplified minimal embed when a track is added to queue.
+pub fn minimal_track_added_embed(track: &Track, config: &BotConfig) -> serenity::CreateEmbed {
+    let provider_emoji = get_provider_emoji(track, config);
+    serenity::CreateEmbed::new()
+        .color(0x5865F2)
+        .description(if track.url.starts_with("http") {
+            format!("{} **Added to queue:** [{}]({})", provider_emoji, track.title, track.url)
+        } else {
+            format!("{} **Added to queue:** **{}**", provider_emoji, track.title)
+        })
 }
 
 /// Creates a track added to queue embed.
-pub fn track_added_embed(track: &Track, queue_pos: usize) -> serenity::CreateEmbed {
+pub fn track_added_embed(track: &Track, queue_pos: usize, config: &BotConfig) -> serenity::CreateEmbed {
     let duration_str = track
         .duration
         .map(format_duration)
         .unwrap_or_else(|| "Live".to_string());
 
+    let provider_emoji = get_provider_emoji(track, config);
     let mut embed = serenity::CreateEmbed::new()
         .title("📝 Track Enqueued")
         .description(if track.url.starts_with("http") {
-            format!("🎵 [{}]({})", track.title, track.url)
+            format!("{} [{}]({})", provider_emoji, track.title, track.url)
         } else {
-            format!("🎵 **{}**", track.title)
+            format!("{} **{}**", provider_emoji, track.title)
         })
         .field("Requested By", &track.requester_name, true)
         .field("Duration", duration_str, true)

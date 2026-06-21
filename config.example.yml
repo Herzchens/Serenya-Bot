@@ -38,3 +38,11 @@ resolver:
   max_concurrent_ytdlp: 4
   max_concurrent_resolves_per_guild: 2
   soundcloud_timeout_ms: 500
+
+emojis:
+  spotify: "<:spotify:123456789>"
+  youtube: "<:youtube:123456789>"
+  soundcloud: "<:soundcloud:123456789>"
+  apple_music: "<:apple:123456789>"
+  deezer: "<:deezer:123456789>"
+  default: "💿"

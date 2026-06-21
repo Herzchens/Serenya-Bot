@@ -99,16 +99,21 @@ impl GuildPlayer {
         match effective_loop {
             LoopMode::Track => {
                 // Keep now_playing as-is so it can be replayed
+                if let Some(ref mut np) = self.now_playing {
+                    np.resolved_url = None;
+                }
             }
             LoopMode::Queue => {
-                if let Some(track) = self.now_playing.take() {
+                if let Some(mut track) = self.now_playing.take() {
+                    track.resolved_url = None;
                     self.previous_track = Some(track.clone());
                     let _ = self.queue.push(track, usize::MAX);
                 }
                 self.now_playing = self.queue.pop_front();
             }
             LoopMode::Off => {
-                if let Some(track) = self.now_playing.take() {
+                if let Some(mut track) = self.now_playing.take() {
+                    track.resolved_url = None;
                     self.previous_track = Some(track);
                 }
                 self.now_playing = self.queue.pop_front();

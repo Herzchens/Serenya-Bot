@@ -64,30 +64,30 @@ pub(crate) async fn seek_by_restart(
     };
 
     // 4. Register event handlers
-    let database = ctx.data().database.clone();
-    let guild_players = ctx.data().guild_players.clone();
-    let http_client = ctx.data().http_client.clone();
-    let serenity_ctx = ctx.serenity_context().clone();
-
+    let end_handler = crate::audio::events::TrackEndHandler {
+        guild_id,
+        database: std::sync::Arc::clone(&ctx.data().database),
+        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+        http_client: ctx.data().http_client.clone(),
+        serenity_ctx: ctx.serenity_context().clone(),
+        config: ctx.data().config(),
+    };
     let _ = handle.add_event(
         songbird::Event::Track(songbird::TrackEvent::End),
-        crate::audio::events::TrackEndHandler {
-            guild_id,
-            database: database.clone(),
-            guild_players: guild_players.clone(),
-            http_client: http_client.clone(),
-            serenity_ctx: serenity_ctx.clone(),
-        },
+        end_handler,
     );
+
+    let error_handler = crate::audio::events::TrackErrorHandler {
+        guild_id,
+        database: std::sync::Arc::clone(&ctx.data().database),
+        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+        http_client: ctx.data().http_client.clone(),
+        serenity_ctx: ctx.serenity_context().clone(),
+        config: ctx.data().config(),
+    };
     let _ = handle.add_event(
         songbird::Event::Track(songbird::TrackEvent::Error),
-        crate::audio::events::TrackErrorHandler {
-            guild_id,
-            database,
-            guild_players,
-            http_client,
-            serenity_ctx,
-        },
+        error_handler,
     );
 
     // 5. Update player's track handle
@@ -103,6 +103,7 @@ pub(crate) async fn seek_by_restart(
         } else {
             let _ = handle.stop();
         }
+        player.is_seeking = false;
     }
 
     Ok(())
@@ -275,7 +276,9 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
             std::sync::Arc::clone(&ctx.data().guild_players),
             ctx.data().http_client.clone(),
             ctx.serenity_context().clone(),
+            ctx.data().config(),
             None,
+            true,
         )
         .await?;
     } else {
@@ -311,6 +314,13 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
 
     ctx.say(format!("⏮️ Playing previous track: **{}**", prev.title))
         .await?;
+
+    if let Some(mut curr) = player.now_playing.take() {
+        curr.resolved_url = None;
+        player.queue.push_front(curr);
+    }
+    let mut prev = prev;
+    prev.resolved_url = None;
     player.queue.push_front(prev);
 
     player.skip_forced = true;
@@ -324,7 +334,9 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
             std::sync::Arc::clone(&ctx.data().guild_players),
             ctx.data().http_client.clone(),
             ctx.serenity_context().clone(),
+            ctx.data().config(),
             None,
+            true,
         )
         .await?;
     }
@@ -390,7 +402,9 @@ pub async fn jump(
             std::sync::Arc::clone(&ctx.data().guild_players),
             ctx.data().http_client.clone(),
             ctx.serenity_context().clone(),
+            ctx.data().config(),
             None,
+            true,
         )
         .await?;
     }

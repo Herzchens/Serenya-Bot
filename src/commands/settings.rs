@@ -136,7 +136,7 @@ pub async fn quality(
             }
 
             // Update Songbird encoder bitrate if connected
-            let manager = songbird::get(ctx.serenity_context()).await.unwrap().clone();
+            let manager = songbird::get(ctx.serenity_context()).await.ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized".into()))?.clone();
             if let Some(call_lock) = manager.get(guild_id) {
                 let mut call = call_lock.lock().await;
                 if quality_mode == Quality::Auto {
@@ -173,7 +173,7 @@ pub async fn prefix(
     ctx: Context<'_>,
     #[description = "New prefix (optional)"] set: Option<String>,
 ) -> Result<(), Error> {
-    let guild_id = ctx.guild_id().unwrap();
+    let guild_id = ctx.guild_id().ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
     let db = &ctx.data().database;
 
     if let Some(new_prefix) = set {

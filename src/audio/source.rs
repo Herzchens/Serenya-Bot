@@ -90,6 +90,10 @@ pub async fn cache_get_stream(url: &str) -> Option<String> {
     None
 }
 
+pub async fn cache_invalidate_stream(url: &str) {
+    STREAM_CACHE.invalidate(url).await;
+}
+
 pub async fn cache_set_stream(url: String, stream_url: String) {
     STREAM_CACHE
         .insert(url, TimedCacheEntry::new(stream_url))
@@ -137,25 +141,6 @@ pub async fn resolve_youtube_oembed(
     Ok((val.title, val.thumbnail_url))
 }
 
-pub async fn resolve_soundcloud_oembed(
-    url: &str,
-    http_client: &reqwest::Client,
-) -> Result<(String, Option<String>), SerenyaError> {
-    let oembed_url = format!(
-        "https://soundcloud.com/oembed?url={}&format=json",
-        url_encode(url)
-    );
-    let val = http_client
-        .get(&oembed_url)
-        .send()
-        .await
-        .map_err(|e| SerenyaError::Audio(format!("failed to fetch SoundCloud oEmbed: {}", e)))?
-        .json::<OEmbedResponse>()
-        .await
-        .map_err(|e| SerenyaError::Audio(format!("failed to parse SoundCloud oEmbed JSON: {}", e)))?;
-
-    Ok((val.title, val.thumbnail_url))
-}
 
 fn is_youtube_url(url: &str) -> bool {
     url.contains("youtube.com/") || url.contains("youtu.be/")
@@ -309,6 +294,200 @@ async fn run_ytdlp_stream_resolution(
     Ok(stream_url)
 }
 
+#[derive(Clone)]
+pub struct SoundCloudStreamInfo {
+    pub stream_url: String,
+    pub expires_at: Instant,
+}
+
+static SOUNDCLOUD_STREAM_CACHE: LazyLock<Cache<String, SoundCloudStreamInfo>> =
+    LazyLock::new(|| Cache::builder().build());
+
+static SOUNDCLOUD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(4));
+
+async fn resolve_soundcloud_stream_url(track_url: &str) -> Result<String, SerenyaError> {
+    // 1. Check cache
+    if let Some(info) = SOUNDCLOUD_STREAM_CACHE.get(track_url).await {
+        if Instant::now() < info.expires_at {
+            tracing::debug!(track_url, "SoundCloud stream cache hit");
+            return Ok(info.stream_url);
+        } else {
+            SOUNDCLOUD_STREAM_CACHE.invalidate(track_url).await;
+        }
+    }
+
+    // 2. Concurrency control via Semaphore
+    let _permit = SOUNDCLOUD_SEMAPHORE.acquire().await.map_err(|_| {
+        SerenyaError::Audio("SoundCloud semaphore is closed".to_owned())
+    })?;
+
+    tracing::info!(track_url, "Resolving SoundCloud stream URL natively...");
+
+    // 3. Resolve URL to track metadata with retry and exponential backoff
+    let metadata = fetch_track_metadata_with_backoff(track_url).await?;
+
+    // 4. Select the best transcoding
+    let media = metadata.media.ok_or_else(|| {
+        SerenyaError::Audio("SoundCloud track is missing media transcodings".to_owned())
+    })?;
+
+    let transcoding = select_best_transcoding(&media.transcodings).ok_or_else(|| {
+        SerenyaError::Audio("No supported transcodings found for SoundCloud track".to_owned())
+    })?;
+
+    let transcoding_url = transcoding.url.clone();
+    tracing::debug!(transcoding_url, "Selected SoundCloud transcoding");
+
+    // 5. Query transcoding URL to get direct playable URL
+    let stream_url = fetch_stream_url_with_backoff(&transcoding_url).await?;
+
+    // 6. Cache the result for 30 minutes
+    let expires_at = Instant::now() + Duration::from_secs(1800); // 30 minutes
+    SOUNDCLOUD_STREAM_CACHE.insert(
+        track_url.to_owned(),
+        SoundCloudStreamInfo {
+            stream_url: stream_url.clone(),
+            expires_at,
+        },
+    ).await;
+
+    Ok(stream_url)
+}
+
+fn select_best_transcoding(transcodings: &[crate::audio::providers::SoundCloudTranscoding]) -> Option<&crate::audio::providers::SoundCloudTranscoding> {
+    // 1. Check for Opus HLS
+    if let Some(t) = transcodings.iter().find(|t| {
+        t.format.protocol == "hls" && t.format.mime_type.as_ref().map(|m| m.contains("opus")).unwrap_or(false)
+    }) {
+        return Some(t);
+    }
+
+    // 2. Check for AAC HLS
+    if let Some(t) = transcodings.iter().find(|t| {
+        t.format.protocol == "hls" && t.format.mime_type.as_ref().map(|m| m.contains("mp4a") || m.contains("mpegurl")).unwrap_or(false)
+    }) {
+        return Some(t);
+    }
+
+    // 3. Check for any HLS
+    if let Some(t) = transcodings.iter().find(|t| t.format.protocol == "hls") {
+        return Some(t);
+    }
+
+    // 4. Check for Progressive
+    if let Some(t) = transcodings.iter().find(|t| t.format.protocol == "progressive") {
+        return Some(t);
+    }
+
+    None
+}
+
+async fn fetch_track_metadata_with_backoff(track_url: &str) -> Result<crate::audio::providers::SoundCloudTrackMetadata, SerenyaError> {
+    let mut final_url = track_url.to_owned();
+    if track_url.contains("on.soundcloud.com/") {
+        if let Ok(res) = HTTP_CLIENT.head(track_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+            .send()
+            .await 
+        {
+            final_url = res.url().as_str().to_owned();
+            tracing::info!("Redirected shortened SoundCloud stream URL: {} -> {}", track_url, final_url);
+        }
+    }
+
+    let mut attempt = 0;
+    let max_attempts = 3;
+    let url_enc = crate::audio::providers::url_encode(&final_url);
+
+    loop {
+        let res = crate::audio::providers::send_soundcloud_request(&HTTP_CLIENT, |cid| {
+            format!("https://api-v2.soundcloud.com/resolve?url={}&client_id={}", url_enc, cid)
+        }).await;
+
+        match res {
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(SerenyaError::Audio("SoundCloud rate limited (429) after max retries".to_owned()));
+                    }
+                    let delay = calculate_backoff(attempt);
+                    tracing::warn!(attempt, delay_ms = delay.as_millis(), "SoundCloud resolve rate-limited. Retrying...");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                
+                let metadata: crate::audio::providers::SoundCloudTrackMetadata = resp.json().await.map_err(|e| {
+                    SerenyaError::Audio(format!("Failed to parse SoundCloud track metadata: {}", e))
+                })?;
+                return Ok(metadata);
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err(e);
+                }
+                let delay = calculate_backoff(attempt);
+                tracing::warn!(attempt, delay_ms = delay.as_millis(), err = %e, "SoundCloud resolve failed. Retrying...");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+async fn fetch_stream_url_with_backoff(transcoding_url: &str) -> Result<String, SerenyaError> {
+    let mut attempt = 0;
+    let max_attempts = 3;
+
+    loop {
+        let res = crate::audio::providers::send_soundcloud_request(&HTTP_CLIENT, |cid| {
+            format!("{}?client_id={}", transcoding_url, cid)
+        }).await;
+
+        match res {
+            Ok(resp) => {
+                if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    attempt += 1;
+                    if attempt >= max_attempts {
+                        return Err(SerenyaError::Audio("SoundCloud rate limited (429) on stream resolution after max retries".to_owned()));
+                    }
+                    let delay = calculate_backoff(attempt);
+                    tracing::warn!(attempt, delay_ms = delay.as_millis(), "SoundCloud stream rate-limited. Retrying...");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                #[derive(serde::Deserialize)]
+                struct StreamResponse {
+                    url: String,
+                }
+
+                let stream_res: StreamResponse = resp.json().await.map_err(|e| {
+                    SerenyaError::Audio(format!("Failed to parse SoundCloud stream URL JSON: {}", e))
+                })?;
+                return Ok(stream_res.url);
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    return Err(e);
+                }
+                let delay = calculate_backoff(attempt);
+                tracing::warn!(attempt, delay_ms = delay.as_millis(), err = %e, "SoundCloud stream resolution failed. Retrying...");
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+fn calculate_backoff(attempt: u32) -> Duration {
+    use rand::Rng;
+    let base = 2u64.pow(attempt);
+    let jitter = rand::rng().random_range(0..200);
+    Duration::from_millis(base * 500 + jitter)
+}
+
 async fn extract_stream_url_inner(track_url: &str) -> Result<String, SerenyaError> {
     if let Some(stream_url) = cache_get_stream(track_url).await {
         tracing::debug!(track_url, stream_url = %stream_url, "stream cache hit");
@@ -333,6 +512,23 @@ async fn extract_stream_url_inner(track_url: &str) -> Result<String, SerenyaErro
             return Ok(stream_url);
         }
         tracing::debug!(track_url, "native stream resolution failed, falling back to yt-dlp");
+    }
+
+    if track_url.contains("soundcloud.com/") {
+        match resolve_soundcloud_stream_url(track_url).await {
+            Ok(stream_url) => {
+                cache_set_stream(track_url.to_owned(), stream_url.clone()).await;
+                return Ok(stream_url);
+            }
+            Err(e) => {
+                crate::audio::runtime::remember_negative(
+                    negative_key.clone(),
+                    format!("SoundCloud native resolution failed: {e}"),
+                )
+                .await;
+                return Err(e);
+            }
+        }
     }
 
     // Non-YouTube URL or fallback when native resolution fails

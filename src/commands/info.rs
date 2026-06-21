@@ -45,7 +45,7 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
         Duration::from_secs(0)
     };
 
-    let embed = now_playing_embed(track, elapsed, None);
+    let embed = now_playing_embed(track, elapsed, None, &ctx.data().config());
     let reply = poise::CreateReply::default().embed(embed);
     ctx.send(reply).await?;
     Ok(())
@@ -111,20 +111,22 @@ async fn enqueue_selected_track(
             songbird::Event::Track(songbird::TrackEvent::End),
             crate::audio::events::TrackEndHandler {
                 guild_id,
-                database: ctx.data().database.clone(),
-                guild_players: ctx.data().guild_players.clone(),
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
                 http_client: ctx.data().http_client.clone(),
                 serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
             },
         );
         let _ = handle.add_event(
             songbird::Event::Track(songbird::TrackEvent::Error),
             crate::audio::events::TrackErrorHandler {
                 guild_id,
-                database: ctx.data().database.clone(),
-                guild_players: ctx.data().guild_players.clone(),
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
                 http_client: ctx.data().http_client.clone(),
                 serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
             },
         );
         player.current_track_handle = Some(handle);

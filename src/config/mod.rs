@@ -10,6 +10,18 @@ pub struct BotConfig {
     pub playback: PlaybackSection,
     #[serde(default)]
     pub resolver: ResolverSection,
+    #[serde(default)]
+    pub emojis: Option<EmojisSection>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct EmojisSection {
+    pub spotify: Option<String>,
+    pub apple_music: Option<String>,
+    pub deezer: Option<String>,
+    pub youtube: Option<String>,
+    pub soundcloud: Option<String>,
+    pub default: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -245,6 +257,7 @@ mod tests {
             spotify: test_spotify(),
             playback: test_playback(),
             resolver: ResolverSection::default(),
+            emojis: Some(crate::config::EmojisSection::default()),
         };
         assert!(validate_config(&config).is_err());
     }
@@ -266,6 +279,7 @@ mod tests {
             spotify: test_spotify(),
             playback: test_playback(),
             resolver: ResolverSection::default(),
+            emojis: Some(crate::config::EmojisSection::default()),
         };
         assert!(validate_config(&config).is_err());
     }
@@ -287,6 +301,7 @@ mod tests {
             spotify: test_spotify(),
             playback: test_playback(),
             resolver: ResolverSection::default(),
+            emojis: Some(crate::config::EmojisSection::default()),
         };
         assert!(validate_config(&config).is_err());
     }
@@ -308,6 +323,7 @@ mod tests {
             spotify: test_spotify(),
             playback: test_playback(),
             resolver: ResolverSection::default(),
+            emojis: Some(crate::config::EmojisSection::default()),
         };
         assert!(validate_config(&config).is_ok());
     }

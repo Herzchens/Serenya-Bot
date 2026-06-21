@@ -197,6 +197,7 @@ pub(crate) async fn enqueue_and_play_resolved(
         let database_clone = ctx.data().database.clone();
         let guild_players_clone = ctx.data().guild_players.clone();
         let serenity_ctx_clone = ctx.serenity_context().clone();
+        let config_clone = ctx.data().config();
         let first_track_clone = first_track.clone();
 
         tokio::spawn(async move {
@@ -293,7 +294,9 @@ pub(crate) async fn enqueue_and_play_resolved(
                         std::sync::Arc::clone(&guild_players_clone),
                         http_client_clone.clone(),
                         serenity_ctx_clone.clone(),
+                        config_clone.clone(),
                         None,
+                        true,
                     )
                     .await
                     {
@@ -334,16 +337,18 @@ pub(crate) async fn enqueue_and_play_resolved(
                     guild_players: guild_players_clone.clone(),
                     http_client: http_client_clone.clone(),
                     serenity_ctx: serenity_ctx_clone.clone(),
+                    config: config_clone.clone(),
                 },
             );
             let _ = handle.add_event(
                 songbird::Event::Track(songbird::TrackEvent::Error),
                 TrackErrorHandler {
                     guild_id,
-                    database: database_clone,
+                    database: database_clone.clone(),
                     guild_players: guild_players_clone.clone(),
                     http_client: http_client_clone.clone(),
-                    serenity_ctx: serenity_ctx_clone,
+                    serenity_ctx: serenity_ctx_clone.clone(),
+                    config: config_clone.clone(),
                 },
             );
 
@@ -357,10 +362,41 @@ pub(crate) async fn enqueue_and_play_resolved(
                         player.current_track_handle = Some(handle);
                         crate::audio::events::schedule_prefetch(
                             guild_id,
-                            guild_players_clone,
+                            guild_players_clone.clone(),
                             current_track.duration,
-                            http_client_clone,
+                            http_client_clone.clone(),
                         );
+                        
+                        let announce_channel = player.announce_channel;
+                        let track_for_ann = current_track.clone();
+                        let db_for_ann = database_clone.clone();
+                        let ctx_for_ann = serenity_ctx_clone.clone();
+                        let cfg_for_ann = config_clone.clone();
+
+                        tokio::spawn(async move {
+                            let announce_setting = db_for_ann
+                                .get_guild_settings(guild_id.get())
+                                .await
+                                .announce_track;
+
+                            if announce_setting {
+                                if let Some(channel) = announce_channel {
+                                    let embed = crate::discord::embeds::now_playing_announce_embed(
+                                        &track_for_ann,
+                                        &cfg_for_ann,
+                                    );
+                                    let _ = channel
+                                        .send_message(
+                                            &ctx_for_ann.http,
+                                            serenity::CreateMessage::new()
+                                                .embed(embed)
+                                                .flags(serenity::MessageFlags::SUPPRESS_NOTIFICATIONS),
+                                        )
+                                        .await;
+                                }
+                            }
+                        });
+
                         return;
                     }
                 }
@@ -376,7 +412,7 @@ pub(crate) async fn enqueue_and_play_resolved(
             let queue_tracks = queue_snapshot(&player_lock).await;
             crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue").await?;
         } else if added > 0 {
-            let mut embed = crate::discord::embeds::now_playing_announce_embed(&first_track);
+            let mut embed = crate::discord::embeds::minimal_track_added_embed(&first_track, &ctx.data().config());
             embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
                 "Enqueued {} other tracks.",
                 added
@@ -384,7 +420,7 @@ pub(crate) async fn enqueue_and_play_resolved(
             let reply = poise::CreateReply::default().embed(embed);
             ctx.send(reply).await?;
         } else {
-            let embed = crate::discord::embeds::now_playing_announce_embed(&first_track);
+            let embed = crate::discord::embeds::minimal_track_added_embed(&first_track, &ctx.data().config());
             let reply = poise::CreateReply::default().embed(embed);
             ctx.send(reply).await?;
         }
@@ -417,7 +453,7 @@ pub(crate) async fn enqueue_and_play_resolved(
         } else if added == 1 && track_count == 1 {
             let queue_pos = player.queue.len();
             if let Some(track) = player.queue.get(queue_pos - 1) {
-                let embed = crate::discord::embeds::track_added_embed(track, queue_pos);
+                let embed = crate::discord::embeds::track_added_embed(track, queue_pos, &ctx.data().config());
                 let reply = poise::CreateReply::default().embed(embed);
                 ctx.send(reply).await?;
             } else {
@@ -699,7 +735,9 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
                 std::sync::Arc::clone(&ctx.data().guild_players),
                 ctx.data().http_client.clone(),
                 ctx.serenity_context().clone(),
+                ctx.data().config(),
                 None,
+                true,
             )
             .await?;
         }

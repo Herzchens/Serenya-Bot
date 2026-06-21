@@ -1428,8 +1428,169 @@ impl MetadataProvider for YouTubeMusicProvider {
 }
 
 // ----------------------------------------------------
-// SoundCloud Provider (using yt-dlp scsearch)
+// SoundCloud Provider (using api-v2.soundcloud.com)
 // ----------------------------------------------------
+use std::sync::LazyLock;
+use tokio::sync::{RwLock, Mutex};
+use std::time::Instant;
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SoundCloudTrackUser {
+    pub username: String,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SoundCloudTranscodingFormat {
+    pub protocol: String,
+    pub mime_type: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SoundCloudTranscoding {
+    pub url: String,
+    pub format: SoundCloudTranscodingFormat,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SoundCloudMedia {
+    pub transcodings: Vec<SoundCloudTranscoding>,
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct SoundCloudTrackMetadata {
+    pub id: i64,
+    pub title: Option<String>,
+    pub duration: Option<u64>, // milliseconds
+    pub permalink_url: Option<String>,
+    pub user: Option<SoundCloudTrackUser>,
+    pub media: Option<SoundCloudMedia>,
+    pub artwork_url: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+struct SoundCloudSearchResponse {
+    collection: Vec<SoundCloudTrackMetadata>,
+}
+
+struct ClientIdState {
+    client_id: String,
+    obtained_at: Instant,
+}
+
+static SOUNDCLOUD_STATE: LazyLock<RwLock<Option<ClientIdState>>> = LazyLock::new(|| RwLock::new(None));
+static SOUNDCLOUD_REFRESH_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+pub async fn get_or_fetch_client_id(http_client: &reqwest::Client) -> Result<String, SerenyaError> {
+    // 1. Read lock check
+    {
+        let read_guard = SOUNDCLOUD_STATE.read().await;
+        if let Some(ref state) = *read_guard {
+            if state.obtained_at.elapsed() < Duration::from_secs(3600) {
+                return Ok(state.client_id.clone());
+            }
+        }
+    }
+
+    // 2. Write lock check (Double Checked Locking under Mutex)
+    let _refresh_permit = SOUNDCLOUD_REFRESH_MUTEX.lock().await;
+    {
+        let mut write_guard = SOUNDCLOUD_STATE.write().await;
+        if let Some(ref state) = *write_guard {
+            if state.obtained_at.elapsed() < Duration::from_secs(3600) {
+                return Ok(state.client_id.clone());
+            }
+        }
+
+        tracing::info!("SoundCloud client_id is expired or None, fetching fresh one...");
+        let url = "https://soundcloud.com";
+        let res = http_client.get(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+            .send()
+            .await
+            .map_err(|e| SerenyaError::Audio(format!("Failed to fetch SoundCloud homepage for client_id: {}", e)))?;
+
+        let html = res.text().await
+            .map_err(|e| SerenyaError::Audio(format!("Failed to read SoundCloud homepage body: {}", e)))?;
+
+        let client_id = if let Some(cap) = regex_extract_client_id(&html) {
+            cap
+        } else {
+            return Err(SerenyaError::Audio("Failed to extract client_id from SoundCloud hydration data".to_owned()));
+        };
+
+        tracing::info!("Successfully extracted new SoundCloud client_id: {}", client_id);
+        *write_guard = Some(ClientIdState {
+            client_id: client_id.clone(),
+            obtained_at: Instant::now(),
+        });
+        Ok(client_id)
+    }
+}
+
+fn regex_extract_client_id(html: &str) -> Option<String> {
+    let start_pat = "window.__sc_hydration";
+    if let Some(pos) = html.find(start_pat) {
+        let rest = &html[pos..];
+        if let Some(end_pos) = rest.find(";</script>") {
+            let json_str = &rest[..end_pos];
+            if let Some(eq_pos) = json_str.find('=') {
+                let json_data_str = json_str[eq_pos + 1..].trim();
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_data_str) {
+                    if let Some(arr) = parsed.as_array() {
+                        for val in arr {
+                            if val.get("hydratable").and_then(|h| h.as_str()) == Some("apiClient") {
+                                if let Some(client_id) = val.get("data").and_then(|d| d.get("id")).and_then(|id| id.as_str()) {
+                                    return Some(client_id.to_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub async fn send_soundcloud_request(
+    http_client: &reqwest::Client,
+    url_factory: impl Fn(&str) -> String,
+) -> Result<reqwest::Response, SerenyaError> {
+    let mut client_id = get_or_fetch_client_id(http_client).await?;
+    let url = url_factory(&client_id);
+
+    let res = http_client.get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+        .send()
+        .await
+        .map_err(|e| SerenyaError::Audio(format!("SoundCloud request failed: {}", e)))?;
+
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED || res.status() == reqwest::StatusCode::FORBIDDEN {
+        tracing::warn!("SoundCloud request unauthorized (401/403). Clearing client_id and retrying once...");
+        {
+            let mut write_guard = SOUNDCLOUD_STATE.write().await;
+            *write_guard = None;
+        }
+        
+        client_id = get_or_fetch_client_id(http_client).await?;
+        let retry_url = url_factory(&client_id);
+        
+        let retry_res = http_client.get(&retry_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+            .send()
+            .await
+            .map_err(|e| SerenyaError::Audio(format!("SoundCloud retry request failed: {}", e)))?;
+            
+        if retry_res.status() == reqwest::StatusCode::UNAUTHORIZED || retry_res.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(SerenyaError::Audio("SoundCloud request unauthorized even after client_id refresh".to_owned()));
+        }
+        
+        Ok(retry_res)
+    } else {
+        Ok(res)
+    }
+}
+
 pub struct SoundCloudProvider;
 
 #[async_trait]
@@ -1441,43 +1602,31 @@ impl MetadataProvider for SoundCloudProvider {
     async fn search(
         &self,
         query: &str,
-        _http_client: &reqwest::Client,
+        http_client: &reqwest::Client,
     ) -> Result<Vec<TrackCandidate>, SerenyaError> {
-        let settings = crate::audio::runtime::settings();
-        let output = crate::audio::runtime::run_ytdlp(
-            "SoundCloud search",
-            vec![
-                "--flat-playlist".to_owned(),
-                "--dump-single-json".to_owned(),
-                format!("scsearch5:{query}"),
-            ],
-            crate::audio::runtime::duration_from_millis(settings.soundcloud_timeout_ms),
-            false,
-            Some(crate::audio::runtime::negative_cache_key("scsearch", query)),
-        )
-        .await?;
+        let query_enc = url_encode(query);
+        let res = send_soundcloud_request(http_client, |cid| {
+            format!("https://api-v2.soundcloud.com/search/tracks?q={}&client_id={}&limit=5", query_enc, cid)
+        }).await?;
 
-        let search_result: YtDlpSearchResult =
-            serde_json::from_slice(&output.stdout).map_err(|e| {
-                SerenyaError::Audio(format!("Failed to parse SoundCloud results: {}", e))
-            })?;
+        let search_result: SoundCloudSearchResponse = res.json().await.map_err(|e| {
+            SerenyaError::Audio(format!("Failed to parse SoundCloud search response: {}", e))
+        })?;
 
-        let entries = search_result.entries.unwrap_or_default();
         let mut candidates = Vec::new();
-        for entry in entries {
-            if let Some(id) = entry.id {
-                candidates.push(TrackCandidate {
-                    source: "SoundCloud".to_owned(),
-                    title: entry.title.unwrap_or_else(|| "Unknown Title".to_string()),
-                    artist: "SoundCloud Artist".to_owned(),
-                    duration: entry.duration.map(|d| Duration::from_secs(d as u64)),
-                    popularity: None,
-                    is_official: false,
-                    is_topic_channel: false,
-                    url: format!("https://api.soundcloud.com/tracks/{}", id),
-                    thumbnail: None,
-                });
-            }
+        for entry in search_result.collection {
+            let artist = entry.user.as_ref().map(|u| u.username.clone()).unwrap_or_else(|| "SoundCloud Artist".to_owned());
+            candidates.push(TrackCandidate {
+                source: "SoundCloud".to_owned(),
+                title: entry.title.unwrap_or_else(|| "Unknown Title".to_string()),
+                artist,
+                duration: entry.duration.map(|d| Duration::from_millis(d)),
+                popularity: None,
+                is_official: false,
+                is_topic_channel: false,
+                url: entry.permalink_url.unwrap_or_else(|| format!("https://api.soundcloud.com/tracks/{}", entry.id)),
+                thumbnail: entry.artwork_url.map(std::sync::Arc::from),
+            });
         }
 
         Ok(candidates)
@@ -1491,22 +1640,99 @@ impl SoundCloudProvider {
         user_id: u64,
         http_client: &reqwest::Client,
     ) -> Result<Vec<Track>, SerenyaError> {
-        let (title, thumbnail) =
-            match crate::audio::source::resolve_soundcloud_oembed(url, http_client).await {
-                Ok(res) => res,
-                Err(_) => ("SoundCloud Track".to_owned(), None),
-            };
-        Ok(vec![Track {
-            title,
-            url: url.to_owned(),
-            duration: None,
-            requester_id: serenity::UserId::new(user_id),
-            requester_name: "".to_owned(),
-            source_type: SourceType::Url,
-            resolved_url: None,
-            thumbnail: thumbnail.map(std::sync::Arc::from),
-            source_provider: "SoundCloud".to_owned(),
-        }])
+        let mut final_url = url.to_owned();
+        if url.contains("on.soundcloud.com/") {
+            if let Ok(res) = http_client.head(url)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
+                .send()
+                .await 
+            {
+                final_url = res.url().as_str().to_owned();
+                tracing::info!("Redirected shortened SoundCloud URL: {} -> {}", url, final_url);
+            }
+        }
+
+        let url_enc = url_encode(&final_url);
+        let res = send_soundcloud_request(http_client, |cid| {
+            format!("https://api-v2.soundcloud.com/resolve?url={}&client_id={}", url_enc, cid)
+        }).await?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(SerenyaError::Audio("SoundCloud URL not found".to_owned()));
+        }
+
+        let resolved: serde_json::Value = res.json().await.map_err(|e| {
+            SerenyaError::Audio(format!("Failed to parse SoundCloud resolve response: {}", e))
+        })?;
+
+        let kind = resolved.get("kind").and_then(|k| k.as_str()).unwrap_or("track");
+
+        if kind == "playlist" || kind == "system-playlist" {
+            let tracks_arr = resolved.get("tracks").and_then(|t| t.as_array()).ok_or_else(|| {
+                SerenyaError::Audio("SoundCloud playlist is missing 'tracks' field".to_owned())
+            })?;
+
+            let mut track_ids = Vec::new();
+            for t in tracks_arr {
+                if let Some(id) = t.get("id").and_then(|id| id.as_i64()) {
+                    track_ids.push(id);
+                }
+            }
+
+            if track_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let mut tracks = Vec::new();
+            for chunk in track_ids.chunks(50) {
+                let ids_str: Vec<String> = chunk.iter().map(|id| id.to_string()).collect();
+                let query_ids = ids_str.join(",");
+                
+                let bulk_res = send_soundcloud_request(http_client, |cid| {
+                    format!("https://api-v2.soundcloud.com/tracks?ids={}&client_id={}", query_ids, cid)
+                }).await?;
+                
+                let bulk_tracks: Vec<SoundCloudTrackMetadata> = bulk_res.json().await.map_err(|e| {
+                    SerenyaError::Audio(format!("Failed to parse SoundCloud bulk tracks response: {}", e))
+                })?;
+                
+                for meta in bulk_tracks {
+                    let duration = meta.duration.map(|d| Duration::from_millis(d));
+                    let track_url = meta.permalink_url.clone().unwrap_or_else(|| format!("https://api.soundcloud.com/tracks/{}", meta.id));
+                    
+                    tracks.push(Track {
+                        title: meta.title.unwrap_or_else(|| "SoundCloud Track".to_owned()),
+                        url: track_url,
+                        duration,
+                        requester_id: serenity::UserId::new(user_id),
+                        requester_name: "".to_owned(),
+                        source_type: SourceType::Playlist,
+                        resolved_url: None,
+                        thumbnail: meta.artwork_url.map(std::sync::Arc::from),
+                        source_provider: "SoundCloud".to_owned(),
+                    });
+                }
+            }
+            Ok(tracks)
+        } else {
+            let meta: SoundCloudTrackMetadata = serde_json::from_value(resolved).map_err(|e| {
+                SerenyaError::Audio(format!("Failed to parse SoundCloud track metadata: {}", e))
+            })?;
+
+            let duration = meta.duration.map(|d| Duration::from_millis(d));
+
+            Ok(vec![Track {
+                title: meta.title.unwrap_or_else(|| "SoundCloud Track".to_owned()),
+                url: final_url.to_owned(),
+                duration,
+                requester_id: serenity::UserId::new(user_id),
+                requester_name: "".to_owned(),
+                source_type: SourceType::Url,
+                resolved_url: None,
+                thumbnail: meta.artwork_url.map(std::sync::Arc::from),
+                source_provider: "SoundCloud".to_owned(),
+            }])
+        }
     }
 }
 

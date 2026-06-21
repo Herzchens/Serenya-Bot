@@ -57,6 +57,11 @@ const VARIANTS: &[VariantRule] = &[
         hard_reject_with_duration: false,
     },
     VariantRule {
+        term: "clean",
+        penalty: 0.25,
+        hard_reject_with_duration: false,
+    },
+    VariantRule {
         term: "cover",
         penalty: 0.30,
         hard_reject_with_duration: false,
@@ -174,14 +179,17 @@ fn variant_requested(query_lower: &str, term: &str) -> bool {
 fn find_unrequested_variant(
     candidate_title_lower: &str,
     query_lower: &str,
+    expected_title_lower: &str,
 ) -> Option<&'static VariantRule> {
     VARIANTS.iter().find(|rule| {
-        candidate_title_lower.contains(rule.term) && !variant_requested(query_lower, rule.term)
+        candidate_title_lower.contains(rule.term) 
+            && !variant_requested(query_lower, rule.term)
+            && !variant_requested(expected_title_lower, rule.term)
     })
 }
 
 pub fn contains_unrequested_variant(candidate_title: &str, query: &str) -> bool {
-    find_unrequested_variant(&candidate_title.to_lowercase(), &query.to_lowercase()).is_some()
+    find_unrequested_variant(&candidate_title.to_lowercase(), &query.to_lowercase(), "").is_some()
 }
 
 fn duration_tolerance_seconds(expected: Duration, strict: bool) -> f64 {
@@ -319,6 +327,7 @@ pub fn score_candidates(
     expected_duration: Option<Duration>,
 ) -> Vec<(TrackCandidate, f64)> {
     let query_lower = query.to_lowercase();
+    let expected_title_lower = expected_title.to_lowercase();
     let clean_expected_title = clean_title(expected_title);
     let mut scored = Vec::new();
 
@@ -351,7 +360,7 @@ pub fn score_candidates(
         }
 
         if expected_duration.is_some() {
-            if let Some(rule) = find_unrequested_variant(&candidate_title_lower, &query_lower) {
+            if let Some(rule) = find_unrequested_variant(&candidate_title_lower, &query_lower, &expected_title_lower) {
                 if rule.hard_reject_with_duration {
                     tracing::info!(
                         "candidate_rejected reason=variant_conflict variant={}",
@@ -418,8 +427,8 @@ pub fn score_candidates(
         // 5b. Lyric video boost (often contains original high-quality audio)
         let is_lyric =
             candidate_title_lower.contains("lyric") || candidate_title_lower.contains("lyrics");
-        if is_lyric {
-            score += 0.50;
+        if is_lyric && title_similarity > 0.5 {
+            score += 0.10;
         }
 
         // 6. Popularity boost (view count logarithmic scale)
@@ -440,20 +449,68 @@ pub fn score_candidates(
         };
         score += rank_boost;
 
+        // 8. Variant Boosts
+        for rule in VARIANTS {
+            let candidate_has_variant = candidate_title_lower.contains(rule.term);
+            let is_requested = variant_requested(&query_lower, rule.term) || variant_requested(&expected_title_lower, rule.term);
+
+            if is_requested {
+                if candidate_has_variant {
+                    score += rule.penalty;
+                } else {
+                    let channel_lower = candidate.artist.to_lowercase();
+                    if title_similarity > 0.6 && channel_lower.len() > 3 && expected_title_lower.contains(&channel_lower) {
+                        score += rule.penalty;
+                    }
+                }
+            }
+        }
+
+        // 9. Unrequested Number/Part Penalty
+        // If the candidate contains " 2", "pt. 2", "vol 2" etc. but the query doesn't, heavily penalize it.
+        let has_unrequested_number = [" 2", " 3", " 4", " pt. 2", " pt. 3"].iter().any(|&num| {
+            candidate_title_lower.contains(num) && !expected_title_lower.contains(num)
+        });
+        if has_unrequested_number {
+            score -= 0.40;
+        }
+
+        // 10. Exact Title Boost
+        // Strongly prefer exact matches over fuzzy matches (prevents "Interstellar Journey" from beating "Interstellar Drift")
+        if title_similarity > 0.98 {
+            score += 0.25;
+        }
+
         // Clamp base score to 1.0 before applying penalties
         let mut final_score = score.min(1.0);
 
-        // 8. Variant Penalties
+        // 9. Variant Penalties
         for rule in VARIANTS {
-            if candidate_title_lower.contains(rule.term)
-                && !variant_requested(&query_lower, rule.term)
-            {
+            let candidate_has_variant = candidate_title_lower.contains(rule.term);
+            let is_requested = variant_requested(&query_lower, rule.term) || variant_requested(&expected_title_lower, rule.term);
+
+            if is_requested {
+                if !candidate_has_variant {
+                    let channel_lower = candidate.artist.to_lowercase();
+                    let channel_match = title_similarity > 0.6 && channel_lower.len() > 3 && expected_title_lower.contains(&channel_lower);
+                    if !channel_match {
+                        final_score = (final_score - rule.penalty * 1.5).max(0.0);
+                        tracing::debug!(
+                            candidate = %candidate.title,
+                            variant = %rule.term,
+                            penalty = %(rule.penalty * 1.5),
+                            reject_reason = "missing_requested_variant",
+                            "penalized search candidate"
+                        );
+                    }
+                }
+            } else if candidate_has_variant {
                 final_score = (final_score - rule.penalty).max(0.0);
                 tracing::debug!(
                     candidate = %candidate.title,
                     variant = %rule.term,
                     penalty = %rule.penalty,
-                    reject_reason = "variant_penalty",
+                    reject_reason = "unrequested_variant_penalty",
                     "penalized search candidate"
                 );
             }
@@ -817,5 +874,195 @@ mod tests {
                 score
             );
         }
+    }
+
+    #[test]
+    fn test_variant_remix_requested() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Original Song".to_owned(),
+                artist: "Original Artist".to_owned(),
+                url: "https://youtube.com/original".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(1000000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Original Song (Remixer Remix)".to_owned(),
+                artist: "Remixer Channel".to_owned(),
+                url: "https://youtube.com/remix".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(50000),
+                is_official: false,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "Original Artist - Original Song (Remixer Remix)",
+            "Original Song (Remixer Remix)",
+            Some("Original Artist"),
+            Some(Duration::from_secs(200)),
+        );
+
+        assert_eq!(scored[0].0.url, "https://youtube.com/remix");
+    }
+
+    #[test]
+    fn test_variant_cover_requested() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Someone Like You".to_owned(),
+                artist: "Adele".to_owned(),
+                url: "https://youtube.com/original".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(1000000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Someone Like You (Boyce Avenue acoustic cover)".to_owned(),
+                artist: "Boyce Avenue".to_owned(),
+                url: "https://youtube.com/cover".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(50000),
+                is_official: false,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "Someone Like You (Cover)",
+            "Someone Like You (Cover)",
+            Some("Adele"),
+            Some(Duration::from_secs(200)),
+        );
+
+        assert_eq!(scored[0].0.url, "https://youtube.com/cover");
+    }
+
+    #[test]
+    fn test_variant_slowed_requested() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "My Song".to_owned(),
+                artist: "Artist".to_owned(),
+                url: "https://youtube.com/original".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(1000000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "My Song (Slowed + Reverb)".to_owned(),
+                artist: "Slowed Channel".to_owned(),
+                url: "https://youtube.com/slowed".to_owned(),
+                duration: Some(Duration::from_secs(240)),
+                popularity: Some(50000),
+                is_official: false,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "My Song slowed",
+            "My Song", // Expected title doesn't always have slowed if it was appended to query
+            Some("Artist"),
+            Some(Duration::from_secs(240)),
+        );
+
+        assert_eq!(scored[0].0.url, "https://youtube.com/slowed");
+    }
+
+    #[test]
+    fn test_variant_nightcore_requested() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Rockefeller Street".to_owned(),
+                artist: "Getter Jaani".to_owned(),
+                url: "https://youtube.com/original".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(1000000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "Rockefeller Street (Nightcore)".to_owned(),
+                artist: "Nightcore Channel".to_owned(),
+                url: "https://youtube.com/nightcore".to_owned(),
+                duration: Some(Duration::from_secs(160)),
+                popularity: Some(50000),
+                is_official: false,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "Rockefeller Street Nightcore",
+            "Rockefeller Street (Nightcore)",
+            Some("Getter Jaani"),
+            Some(Duration::from_secs(160)),
+        );
+
+        assert_eq!(scored[0].0.url, "https://youtube.com/nightcore");
+    }
+
+    #[test]
+    fn test_variant_original_track_requested() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "On My Way".to_owned(),
+                artist: "Sabrina Carpenter".to_owned(),
+                url: "https://youtube.com/original".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(1000000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "On My Way (Da Tweekaz Remix)".to_owned(),
+                artist: "Da Tweekaz".to_owned(),
+                url: "https://youtube.com/remix".to_owned(),
+                duration: Some(Duration::from_secs(200)),
+                popularity: Some(50000),
+                is_official: false,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "On My Way",
+            "On My Way",
+            Some("Sabrina Carpenter"),
+            Some(Duration::from_secs(200)),
+        );
+
+        assert_eq!(scored[0].0.url, "https://youtube.com/original");
     }
 }

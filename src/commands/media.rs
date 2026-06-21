@@ -171,6 +171,7 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
     };
 
     let source = track.clean_source();
+    let provider_emoji = crate::discord::embeds::get_provider_emoji(&track, &ctx.data().config());
 
     let mut embed = serenity::CreateEmbed::new()
         .title("ℹ️ Detailed Song Information")
@@ -185,7 +186,7 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
             format!("⏱️ **{} / {}**", elapsed_str, duration_str),
             true,
         )
-        .field("Source", format!("💿 **{}**", source), true)
+        .field("Source", format!("{} **{}**", provider_emoji, source), true)
         .field("Loop State", format!("🔁 **{}**", loop_str), true)
         .field(
             "Playback Status",

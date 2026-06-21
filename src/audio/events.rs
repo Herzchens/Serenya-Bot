@@ -18,6 +18,7 @@ pub struct TrackEndHandler {
     >,
     pub http_client: reqwest::Client,
     pub serenity_ctx: serenity::Context,
+    pub config: std::sync::Arc<crate::config::BotConfig>,
 }
 
 #[async_trait]
@@ -44,6 +45,7 @@ impl EventHandler for TrackEndHandler {
         };
 
         if let Some(ended) = ended_uuid {
+            let mut retry_current = false;
             // Check if track ended almost immediately after starting (i.e. play_time < 2s)
             // and it wasn't manually skipped. This handles silent/immediate decoder failures
             // that Songbird/Symphonia treats as normal EOF instead of decode error.
@@ -58,6 +60,13 @@ impl EventHandler for TrackEndHandler {
                     drop(player_lock_ref);
                     let mut player = player_lock.write().await;
                     player.consecutive_errors += 1;
+                    retry_current = true;
+                    
+                    if let Some(np) = &mut player.now_playing {
+                        crate::audio::source::cache_invalidate_stream(&np.url).await;
+                        np.resolved_url = None;
+                    }
+
                     tracing::warn!(
                         guild_id = %self.guild_id,
                         consecutive_errors = player.consecutive_errors,
@@ -72,6 +81,7 @@ impl EventHandler for TrackEndHandler {
             let guild_players = self.guild_players.clone();
             let http_client = self.http_client.clone();
             let serenity_ctx = self.serenity_ctx.clone();
+            let config_clone = self.config.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = play_next(
@@ -80,7 +90,9 @@ impl EventHandler for TrackEndHandler {
                     guild_players,
                     http_client,
                     serenity_ctx,
-                    Some(ended),
+                    config_clone,
+                    if retry_current { None } else { Some(ended) },
+                    !retry_current,
                 )
                 .await
                 {
@@ -104,6 +116,7 @@ pub struct TrackErrorHandler {
     >,
     pub http_client: reqwest::Client,
     pub serenity_ctx: serenity::Context,
+    pub config: std::sync::Arc<crate::config::BotConfig>,
 }
 
 #[async_trait]
@@ -116,7 +129,17 @@ impl EventHandler for TrackErrorHandler {
                 drop(player_lock_ref);
                 let mut player = player_lock.write().await;
                 player.consecutive_errors += 1;
-                tracing::warn!(guild_id = %self.guild_id, "Consecutive error count incremented to {}", player.consecutive_errors);
+                tracing::warn!(
+                    guild_id = %self.guild_id,
+                    consecutive_errors = player.consecutive_errors,
+                    "Track errored: consecutive errors count: {}",
+                    player.consecutive_errors
+                );
+                
+                // Invalidate stream cache for the errored track
+                if let Some(np) = &player.now_playing {
+                    crate::audio::source::cache_invalidate_stream(&np.url).await;
+                }
             }
         }
         None
@@ -134,7 +157,9 @@ pub fn play_next(
     >,
     http_client: reqwest::Client,
     serenity_ctx: serenity::Context,
+    config: std::sync::Arc<crate::config::BotConfig>,
     ended_uuid: Option<uuid::Uuid>,
+    advance: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SerenyaError>> + Send + 'static>>
 {
     Box::pin(async move {
@@ -147,6 +172,10 @@ pub fn play_next(
         // Check if the event is from a stale track handle (due to seeking)
         if let Some(ended) = ended_uuid {
             let player = player_lock.read().await;
+            if player.is_seeking {
+                tracing::info!("Ignoring End/Error event because player is seeking");
+                return Ok(());
+            }
             if let Some(ref current_handle) = player.current_track_handle {
                 if current_handle.uuid() != ended {
                     tracing::info!("Ignoring End/Error event from stale track handle");
@@ -184,7 +213,9 @@ pub fn play_next(
         // Advance queue and get the next track to play
         let (track, announce_channel, consecutive_errors) = {
             let mut player = player_lock.write().await;
-            player.advance_queue();
+            if advance {
+                player.advance_queue();
+            }
             (
                 player.now_playing.clone(),
                 player.announce_channel,
@@ -310,6 +341,7 @@ pub fn play_next(
                 let guild_players_clone = std::sync::Arc::clone(&guild_players);
                 let http_client_clone = http_client.clone();
                 let serenity_ctx_clone = serenity_ctx.clone();
+                let config_clone = config.clone();
                 tokio::spawn(async move {
                     if let Err(next_err) = play_next(
                         guild_id,
@@ -317,7 +349,9 @@ pub fn play_next(
                         guild_players_clone,
                         http_client_clone,
                         serenity_ctx_clone,
+                        config_clone,
                         None,
+                        true,
                     )
                     .await
                     {
@@ -362,6 +396,7 @@ pub fn play_next(
                 guild_players: std::sync::Arc::clone(&guild_players),
                 http_client: http_client.clone(),
                 serenity_ctx: serenity_ctx.clone(),
+                config: config.clone(),
             },
         );
         let _ = handle.add_event(
@@ -372,6 +407,7 @@ pub fn play_next(
                 guild_players: std::sync::Arc::clone(&guild_players),
                 http_client: http_client.clone(),
                 serenity_ctx: serenity_ctx.clone(),
+                config: config.clone(),
             },
         );
 
@@ -427,8 +463,9 @@ pub fn play_next(
         if announce_setting {
             if let Some(channel) = announce_channel {
                 let ctx_clone = serenity_ctx.clone();
+                let config_clone = config.clone();
                 tokio::spawn(async move {
-                    let embed = now_playing_announce_embed(&track);
+                    let embed = now_playing_announce_embed(&track, &config_clone);
                     let _ = channel
                         .send_message(
                             &ctx_clone.http,
