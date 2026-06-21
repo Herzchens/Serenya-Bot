@@ -711,6 +711,7 @@ pub async fn resolve_input(
         let apple_provider = AppleMusicProvider;
         let deezer_provider = DeezerProvider;
         let youtube_provider = YouTubeProvider;
+        let soundcloud_provider = SoundCloudProvider;
         let direct_provider = DirectUrlProvider;
 
         // 4. Resolve metadata or play directly
@@ -789,6 +790,23 @@ pub async fn resolve_input(
             } else {
                 Err(SerenyaError::Audio(
                     "Failed to load YouTube track".to_owned(),
+                ))
+            }
+        } else if soundcloud_provider.supports(query_trimmed) {
+            let mut tracks = soundcloud_provider
+                .load(query_trimmed, user_id, http_client)
+                .await?;
+            if let Some(track) = tracks.first_mut() {
+                track.requester_id = serenity::UserId::new(user_id);
+                crate::audio::source::cache_set_url_metadata(
+                    query_trimmed.to_owned(),
+                    track.clone(),
+                )
+                .await;
+                Ok(ResolvedInput::Track(track.clone()))
+            } else {
+                Err(SerenyaError::Audio(
+                    "Failed to load SoundCloud track".to_owned(),
                 ))
             }
         } else if direct_provider.supports(query_trimmed) {

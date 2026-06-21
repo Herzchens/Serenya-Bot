@@ -1392,6 +1392,32 @@ impl MetadataProvider for SoundCloudProvider {
     }
 }
 
+impl SoundCloudProvider {
+    pub async fn load(
+        &self,
+        url: &str,
+        user_id: u64,
+        http_client: &reqwest::Client,
+    ) -> Result<Vec<Track>, SerenyaError> {
+        let (title, thumbnail) =
+            match crate::audio::source::resolve_soundcloud_oembed(url, http_client).await {
+                Ok(res) => res,
+                Err(_) => ("SoundCloud Track".to_owned(), None),
+            };
+        Ok(vec![Track {
+            title,
+            url: url.to_owned(),
+            duration: None,
+            requester_id: serenity::UserId::new(user_id),
+            requester_name: "".to_owned(),
+            source_type: SourceType::Url,
+            resolved_url: None,
+            thumbnail,
+            source_provider: "SoundCloud".to_owned(),
+        }])
+    }
+}
+
 // ----------------------------------------------------
 // Direct URL Provider (Standard Direct Link resolutions)
 // ----------------------------------------------------

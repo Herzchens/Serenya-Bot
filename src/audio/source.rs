@@ -126,6 +126,35 @@ pub async fn resolve_youtube_oembed(
     Ok((title.to_owned(), thumbnail))
 }
 
+pub async fn resolve_soundcloud_oembed(
+    url: &str,
+    http_client: &reqwest::Client,
+) -> Result<(String, Option<String>), SerenyaError> {
+    let oembed_url = format!(
+        "https://soundcloud.com/oembed?url={}&format=json",
+        url_encode(url)
+    );
+    let val = http_client
+        .get(&oembed_url)
+        .send()
+        .await
+        .map_err(|e| SerenyaError::Audio(format!("failed to fetch SoundCloud oEmbed: {}", e)))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| SerenyaError::Audio(format!("failed to parse SoundCloud oEmbed JSON: {}", e)))?;
+
+    let title = val
+        .get("title")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| SerenyaError::Audio("Missing title in SoundCloud oEmbed response".to_owned()))?;
+    let thumbnail = val
+        .get("thumbnail_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
+    Ok((title.to_owned(), thumbnail))
+}
+
 fn is_youtube_url(url: &str) -> bool {
     url.contains("youtube.com/") || url.contains("youtu.be/")
 }
