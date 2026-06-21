@@ -4,7 +4,6 @@
 #![allow(clippy::type_complexity)]
 #![allow(clippy::all)]
 
-
 #[cfg(feature = "performance_analysis")]
 pub extern crate flame;
 #[cfg(feature = "performance_analysis")]
