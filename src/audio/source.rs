@@ -573,7 +573,6 @@ async fn extract_stream_url_inner(track_url: &str) -> Result<String, SerenyaErro
     res
 }
 
-
 fn is_direct_stream_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.contains("googlevideo.com") || lower.contains("googleusercontent.com")
