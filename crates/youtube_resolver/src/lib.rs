@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
