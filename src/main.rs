@@ -254,7 +254,11 @@ fn init_tracing(logging: &crate::config::LoggingSection) {
 
     if logging.webhook_enabled {
         if let Some(ref url) = logging.webhook_url {
-            let http_client = reqwest::Client::new();
+            let http_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("failed to build webhook http client");
             let min_level = match logging.webhook_min_level.to_lowercase().as_str() {
                 "error" => Level::ERROR,
                 "warn" => Level::WARN,
@@ -332,14 +336,19 @@ fn start_empty_room_monitor(
         loop {
             interval.tick().await;
             let now = std::time::Instant::now();
+            // Phase 1: Collect guild IDs without holding the shard-lock across .await
+            let guild_ids: Vec<_> = guild_players.iter().map(|e| *e.key()).collect();
             let mut to_clear = Vec::new();
 
-            for entry in guild_players.iter() {
-                let player = entry.value().read().await;
-                if let Some(empty_since) = player.empty_since {
-                    if now.duration_since(empty_since).as_secs() >= 10800 { // 3 hours
-                        if !player.queue.is_empty() || player.playback_status != crate::core::PlaybackStatus::Idle {
-                            to_clear.push((*entry.key(), player.announce_channel));
+            // Phase 2: Check each guild individually — get() locks only one shard at a time
+            for guild_id in guild_ids {
+                if let Some(player_lock) = guild_players.get(&guild_id) {
+                    let player = player_lock.read().await;
+                    if let Some(empty_since) = player.empty_since {
+                        if now.duration_since(empty_since).as_secs() >= 10800 { // 3 hours
+                            if !player.queue.is_empty() || player.playback_status != crate::core::PlaybackStatus::Idle {
+                                to_clear.push((guild_id, player.announce_channel));
+                            }
                         }
                     }
                 }

@@ -34,6 +34,19 @@ static METADATA_CACHE: LazyLock<Cache<String, TimedCacheEntry<Track>>> =
 static STREAM_CACHE: LazyLock<Cache<String, TimedCacheEntry<String>>> =
     LazyLock::new(|| Cache::builder().max_capacity(4096).build());
 
+/// Shared HTTP client for internal network calls (Invidious, Piped, OEmbed, etc.).
+/// Avoids creating a new TLS session per track resolve — reuses connection pool.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(16)
+        .tcp_keepalive(Duration::from_secs(60))
+        .build()
+        .expect("failed to build shared reqwest client")
+});
+
 pub async fn cache_get_metadata(query: &str) -> Option<Track> {
     let entry = QUERY_CACHE.get(query).await?;
     if entry.is_fresh(crate::audio::runtime::settings().query_cache_ttl_seconds) {
@@ -377,8 +390,7 @@ async fn resolve_youtube_stream_native(track_url: &str) -> Option<String> {
 
     if let Some(video_id) = extract_youtube_video_id(track_url).map(str::to_owned) {
         join_set.spawn(async move {
-            let client = reqwest::Client::new();
-            resolve_via_invidious_or_piped(&video_id, &client).await
+            resolve_via_invidious_or_piped(&video_id, &HTTP_CLIENT).await
         });
     }
 
