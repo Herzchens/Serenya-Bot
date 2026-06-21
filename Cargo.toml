@@ -8,7 +8,7 @@ description = "A multi-guild Discord music bot"
 [dependencies]
 poise = "0.6"
 serenity = { version = "0.12", default-features = false, features = [
-    "client", "gateway", "model", "rustls_backend", "cache"
+    "client", "gateway", "model", "rustls_backend", "cache", "voice"
 ] }
 songbird = { version = "0.6", features = ["builtin-queue"] }
 tokio = { version = "1", features = ["full"] }
