@@ -123,12 +123,12 @@ impl Default for ResolverSection {
 }
 
 /// Loads, expands env vars, parses, and validates a YAML config file.
-pub fn load_config(path: &str) -> Result<BotConfig, SerenyaError> {
-    let raw = match std::fs::read_to_string(path) {
+pub async fn load_config(path: &str) -> Result<BotConfig, SerenyaError> {
+    let raw = match tokio::fs::read_to_string(path).await {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let default_config = include_str!("../../config.example.yml");
-            if let Err(write_err) = std::fs::write(path, default_config) {
+            if let Err(write_err) = tokio::fs::write(path, default_config).await {
                 return Err(SerenyaError::Config(format!(
                     "config.yml not found, and failed to create default config: {}", write_err
                 )));

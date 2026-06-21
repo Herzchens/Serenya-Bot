@@ -1,9 +1,9 @@
 use crate::utils::{Context, Error, SerenyaError};
 
-fn get_memory_usage() -> String {
+async fn get_memory_usage() -> String {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        if let Ok(status) = tokio::fs::read_to_string("/proc/self/status").await {
             for line in status.lines() {
                 if line.starts_with("VmRSS:") {
                     return line.trim_start_matches("VmRSS:").trim().to_string();
@@ -24,7 +24,7 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
     // 1. Bot-wide statistics
     let uptime = ctx.data().start_time.elapsed();
     let uptime_str = crate::discord::embeds::format_duration(uptime);
-    let memory_str = get_memory_usage();
+    let memory_str = get_memory_usage().await;
     let guilds = ctx.cache().guilds().len();
 
     let guild_ids: Vec<_> = ctx.data().guild_players.iter().map(|e| *e.key()).collect();

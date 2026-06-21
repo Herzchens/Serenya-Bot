@@ -1,31 +1,41 @@
 use crate::core::Track;
 use crate::utils::SerenyaError;
+use arc_swap::ArcSwap;
 use moka::future::Cache;
 use serde::Deserialize;
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
-static QUERY_CACHE: LazyLock<Cache<String, Track>> = LazyLock::new(|| {
+fn build_query_cache() -> Cache<String, Track> {
     Cache::builder()
         .max_capacity(2048)
         .time_to_live(Duration::from_secs(crate::audio::runtime::settings().query_cache_ttl_seconds))
         .build()
-});
+}
 
-static METADATA_CACHE: LazyLock<Cache<String, Track>> = LazyLock::new(|| {
+fn build_metadata_cache() -> Cache<String, Track> {
     Cache::builder()
         .max_capacity(4096)
         .time_to_live(Duration::from_secs(crate::audio::runtime::settings().metadata_cache_ttl_seconds))
         .build()
-});
+}
 
-static STREAM_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+fn build_stream_cache() -> Cache<String, String> {
     Cache::builder()
         .max_capacity(4096)
         .time_to_live(Duration::from_secs(crate::audio::runtime::settings().stream_cache_ttl_seconds))
         .build()
-});
+}
+
+static QUERY_CACHE: LazyLock<ArcSwap<Cache<String, Track>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(build_query_cache()));
+
+static METADATA_CACHE: LazyLock<ArcSwap<Cache<String, Track>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(build_metadata_cache()));
+
+static STREAM_CACHE: LazyLock<ArcSwap<Cache<String, String>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(build_stream_cache()));
 
 /// Shared HTTP client for internal network calls (Invidious, Piped, OEmbed, etc.).
 /// Avoids creating a new TLS session per track resolve — reuses connection pool.
@@ -36,12 +46,15 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(16)
         .tcp_keepalive(Duration::from_secs(60))
+        .gzip(true)
+        .brotli(true)
         .build()
         .expect("failed to build shared reqwest client")
 });
 
 pub async fn cache_get_metadata(query: &str) -> Option<Track> {
-    if let Some(track) = QUERY_CACHE.get(query).await {
+    let cache = QUERY_CACHE.load();
+    if let Some(track) = cache.get(query).await {
         tracing::debug!(query, cache = "query", "cache hit");
         return Some(track);
     }
@@ -50,11 +63,12 @@ pub async fn cache_get_metadata(query: &str) -> Option<Track> {
 }
 
 pub async fn cache_set_metadata(query: String, track: Track) {
-    QUERY_CACHE.insert(query, track).await;
+    QUERY_CACHE.load().insert(query, track).await;
 }
 
 pub async fn cache_get_url_metadata(url: &str) -> Option<Track> {
-    if let Some(track) = METADATA_CACHE.get(url).await {
+    let cache = METADATA_CACHE.load();
+    if let Some(track) = cache.get(url).await {
         tracing::debug!(url, cache = "metadata", "cache hit");
         return Some(track);
     }
@@ -63,11 +77,12 @@ pub async fn cache_get_url_metadata(url: &str) -> Option<Track> {
 }
 
 pub async fn cache_set_url_metadata(url: String, track: Track) {
-    METADATA_CACHE.insert(url, track).await;
+    METADATA_CACHE.load().insert(url, track).await;
 }
 
 pub async fn cache_get_stream(url: &str) -> Option<String> {
-    if let Some(stream_url) = STREAM_CACHE.get(url).await {
+    let cache = STREAM_CACHE.load();
+    if let Some(stream_url) = cache.get(url).await {
         tracing::debug!(url, cache = "stream", "cache hit");
         return Some(stream_url);
     }
@@ -76,12 +91,12 @@ pub async fn cache_get_stream(url: &str) -> Option<String> {
 }
 
 pub async fn cache_invalidate_stream(url: &str) {
-    STREAM_CACHE.invalidate(url).await;
+    STREAM_CACHE.load().invalidate(url).await;
     SOUNDCLOUD_STREAM_CACHE.invalidate(url).await;
 }
 
 pub async fn cache_set_stream(url: String, stream_url: String) {
-    STREAM_CACHE.insert(url, stream_url).await;
+    STREAM_CACHE.load().insert(url, stream_url).await;
 }
 
 fn url_encode(s: &str) -> String {
@@ -137,24 +152,6 @@ async fn resolve_via_invidious_or_piped(
     video_id: &str,
     client: &reqwest::Client,
 ) -> Option<String> {
-    // 1. Try Piped API
-    let piped_url = format!("https://pipedapi.kavin.rocks/streams/{}", video_id);
-    if let Ok(Ok(resp)) =
-        tokio::time::timeout(Duration::from_secs(4), client.get(&piped_url).send()).await
-    {
-        if let Ok(val) = resp.json::<serde_json::Value>().await {
-            if let Some(audio_streams) = val.get("audioStreams").and_then(|a| a.as_array()) {
-                if let Some(best) = audio_streams
-                    .first()
-                    .and_then(|s| s.get("url"))
-                    .and_then(|u| u.as_str())
-                {
-                    return Some(best.to_owned());
-                }
-            }
-        }
-    }
-
     #[derive(Deserialize)]
     struct InvidiousFormat {
         #[serde(rename = "type")]
@@ -168,26 +165,46 @@ async fn resolve_via_invidious_or_piped(
         adaptive_formats: Option<Vec<InvidiousFormat>>,
     }
 
-    // 2. Try Invidious API
+    let piped_url = format!("https://pipedapi.kavin.rocks/streams/{}", video_id);
     let invidious_url = format!("https://yewtu.be/api/v1/videos/{}", video_id);
-    if let Ok(Ok(resp)) =
-        tokio::time::timeout(Duration::from_secs(4), client.get(&invidious_url).send()).await
-    {
-        if let Ok(val) = resp.json::<InvidiousResponse>().await {
-            if let Some(adaptive_formats) = val.adaptive_formats {
-                for format in adaptive_formats {
-                    let type_str = format.format_type.unwrap_or_default();
-                    if type_str.starts_with("audio/") {
-                        if let Some(url) = format.url {
-                            return Some(url);
-                        }
-                    }
-                }
-            }
+
+    let piped_fut = async {
+        let resp = tokio::time::timeout(Duration::from_secs(4), client.get(&piped_url).send())
+            .await.ok()?.ok()?;
+        let val = resp.json::<serde_json::Value>().await.ok()?;
+        val.get("audioStreams")?
+            .as_array()?
+            .first()?
+            .get("url")?
+            .as_str()
+            .map(|s| s.to_owned())
+    };
+
+    let invidious_fut = async {
+        let resp = tokio::time::timeout(Duration::from_secs(4), client.get(&invidious_url).send())
+            .await.ok()?.ok()?;
+        let val = resp.json::<InvidiousResponse>().await.ok()?;
+        val.adaptive_formats?.into_iter().find_map(|f| {
+            let t = f.format_type.unwrap_or_default();
+            if t.starts_with("audio/") { f.url } else { None }
+        })
+    };
+
+    // Race both — return whichever resolves first with a valid URL
+    tokio::pin!(piped_fut);
+    tokio::pin!(invidious_fut);
+
+    tokio::select! {
+        biased;
+        result = &mut piped_fut => {
+            if result.is_some() { return result; }
+            invidious_fut.await
+        }
+        result = &mut invidious_fut => {
+            if result.is_some() { return result; }
+            piped_fut.await
         }
     }
-
-    None
 }
 
 pub async fn extract_stream_url_for_guild(
@@ -580,8 +597,12 @@ pub fn create_ffmpeg_stream_input(
         "1".to_owned(),
         "-reconnect_streamed".to_owned(),
         "1".to_owned(),
+        "-reconnect_on_network_error".to_owned(),
+        "1".to_owned(),
         "-reconnect_delay_max".to_owned(),
         "5".to_owned(),
+        "-rw_timeout".to_owned(),
+        "15000000".to_owned(), // 15s timeout for stalled reads/writes (in microseconds)
     ];
 
     if let Some(position) = seek {
@@ -650,12 +671,15 @@ pub fn create_ffmpeg_stream_input(
     Ok(child_container.into())
 }
 
+/// Rebuilds all caches with fresh TTL values from current settings.
+/// Called by /reload to ensure config changes actually take effect.
 pub fn clear_caches() -> (usize, usize) {
-    let q_len = QUERY_CACHE.entry_count() as usize;
-    let m_len = METADATA_CACHE.entry_count() as usize;
-    let s_len = STREAM_CACHE.entry_count() as usize;
-    QUERY_CACHE.invalidate_all();
-    METADATA_CACHE.invalidate_all();
-    STREAM_CACHE.invalidate_all();
+    let q_len = QUERY_CACHE.load().entry_count() as usize;
+    let m_len = METADATA_CACHE.load().entry_count() as usize;
+    let s_len = STREAM_CACHE.load().entry_count() as usize;
+    // Rebuild with current TTL from settings (not the frozen initial values)
+    QUERY_CACHE.store(Arc::new(build_query_cache()));
+    METADATA_CACHE.store(Arc::new(build_metadata_cache()));
+    STREAM_CACHE.store(Arc::new(build_stream_cache()));
     (q_len + m_len, s_len)
 }

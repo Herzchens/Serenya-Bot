@@ -384,9 +384,10 @@ async fn collect_search_results(
     user_id: u64,
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
-    let mut scored = search_trusted_metadata_candidates(query, http_client).await;
-
-    scored.extend(
+    // Run trusted metadata (Deezer/Apple/Spotify) and provider batch (YTM/YT/SC)
+    // in parallel — halves worst-case latency on the most common code path.
+    let (trusted_results, provider_results) = tokio::join!(
+        search_trusted_metadata_candidates(query, http_client),
         run_provider_batch(
             &[
                 SearchProviderKind::YouTubeMusic,
@@ -399,8 +400,10 @@ async fn collect_search_results(
             None,
             http_client,
         )
-        .await?,
     );
+
+    let mut scored = trusted_results;
+    scored.extend(provider_results?);
 
     if crate::audio::runtime::ytdlp_enabled() && !crate::audio::runtime::is_youtube_degraded() {
         let yt = YouTubeProvider;

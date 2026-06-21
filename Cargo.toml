@@ -14,7 +14,7 @@ songbird = { version = "0.6", features = ["builtin-queue"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.27"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -30,3 +30,11 @@ symphonia = { version = "0.5.2", features = ["aac", "isomp4", "mp3", "mkv", "ogg
 moka = { version = "0.12", features = ["future"] }
 rusty_ytdl = "0.7.4"
 uuid = "1"
+strsim = "0.11"
+percent-encoding = "2"
+arc-swap = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

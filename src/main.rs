@@ -48,7 +48,7 @@ async fn run() -> Result<(), utils::Error> {
     installer::ensure_dependencies().await;
     configure_path();
 
-    let config = Arc::new(config::load_config("config.yml")?);
+    let config = Arc::new(config::load_config("config.yml").await?);
 
     // Register secrets for redaction
     crate::logging::register_secret_to_redact(&config.bot.token);
@@ -131,10 +131,19 @@ async fn run() -> Result<(), utils::Error> {
             },
             event_handler: |ctx, event, _framework, data| {
                 Box::pin(async move {
-                    if let serenity::FullEvent::VoiceStateUpdate { old, new } = event {
-                        if let Err(e) = handle_voice_state_update(ctx, old, new, data).await {
-                            error!("Error in voice state update handler: {:?}", e);
+                    match event {
+                        serenity::FullEvent::VoiceStateUpdate { old, new } => {
+                            if let Err(e) = handle_voice_state_update(ctx, old, new, data).await {
+                                error!("Error in voice state update handler: {:?}", e);
+                            }
                         }
+                        serenity::FullEvent::GuildDelete { incomplete, .. } => {
+                            let guild_id = incomplete.id;
+                            crate::audio::runtime::cleanup_guild(guild_id.get());
+                            data.guild_players.remove(&guild_id);
+                            info!(guild_id = %guild_id, "Guild removed — cleaned up runtime state");
+                        }
+                        _ => {}
                     }
                     Ok(())
                 })
@@ -367,6 +376,7 @@ fn start_empty_room_monitor(
                     // It will be re-evaluated next voice update, or we just leave it as Some(now) to prevent re-clearing.
                     player.empty_since = Some(now);
 
+                    crate::audio::runtime::cleanup_guild(guild_id.get());
                     info!(guild_id = %guild_id, "Cleared queue after 3 hours of empty room");
 
                     if let Some(channel) = announce_channel {

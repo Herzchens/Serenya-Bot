@@ -145,7 +145,7 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
 
     ctx.defer().await?;
 
-    let new_config = std::sync::Arc::new(crate::config::load_config("config.yml")?);
+    let new_config = std::sync::Arc::new(crate::config::load_config("config.yml").await?);
     let old_prefix = {
         let current =
             ctx.data().config.read().map_err(|_| {
