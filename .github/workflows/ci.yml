@@ -53,7 +53,7 @@ jobs:
         if: failure()
         run: |
           cargo audit > audit_log.txt || true
-          URL=$(curl -s -F "file=@audit_log.txt" https://file.io | jq -r .link)
+          URL=$(curl --data-binary @audit_log.txt https://paste.rs || echo "upload_failed")
           echo "::error::Cargo Audit failed. Log: $URL"
 
       - name: Check dependency tree duplicates
