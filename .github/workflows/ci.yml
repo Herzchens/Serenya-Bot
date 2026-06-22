@@ -47,12 +47,6 @@ jobs:
       - name: Cargo Audit
         uses: actions-rust-lang/audit@v1
 
-      - name: Retrieve Cargo Audit Log on Failure
-        if: failure()
-        run: |
-          cargo audit > audit_log.txt || true
-          URL=$(curl --data-binary @audit_log.txt https://paste.rs || echo "upload_failed")
-          echo "::error::Cargo Audit failed. Log: $URL"
-
       - name: Check dependency tree duplicates
         run: cargo tree -d || true
+
