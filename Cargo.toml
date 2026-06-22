@@ -13,7 +13,7 @@ serenity = { version = "0.12", default-features = false, features = [
 songbird = { version = "0.6", features = ["builtin-queue"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = "0.0.27"
+serde-saphyr = "0.0.28"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
 thiserror = "2"
 tracing = "0.1"
@@ -35,12 +35,19 @@ percent-encoding = "2"
 arc-swap = "1"
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = true
+
+# Optimize dependencies in dev mode for much faster startup and run times (e.g. boa_engine)
+[profile.dev.package."*"]
+opt-level = 3
 
 [workspace]
 members = [
     "crates/rusty-ytdl", "crates/youtube_resolver",
 ]
+
 
