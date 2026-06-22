@@ -653,33 +653,29 @@ pub fn create_ffmpeg_stream_input(
         || stream_url.contains("googlevideo.com")
         || stream_url.contains("youtu.be");
 
-    args.push("-user_agent".to_owned());
-    if is_youtube {
-        if stream_url.contains("c=ANDROID") || stream_url.contains("c=android") {
-            args.push("com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip".to_owned());
-        } else if stream_url.contains("c=IOS") || stream_url.contains("c=ios") {
-            args.push(
-                "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
-                    .to_owned(),
-            );
-        } else {
-            args.push("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36".to_owned());
-        }
-    } else {
-        args.push("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36".to_owned());
-    }
+    let mut headers = String::new();
 
     if is_youtube {
-        args.push("-headers".to_owned());
-        args.push(
-            "Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n".to_owned(),
-        );
+        let ua = if stream_url.contains("c=ANDROID") || stream_url.contains("c=android") {
+            "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
+        } else if stream_url.contains("c=IOS") || stream_url.contains("c=ios") {
+            "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)"
+        } else if stream_url.contains("c=TVHTML5") || stream_url.contains("c=tvhtml5") {
+            "Mozilla/5.0 (Chromecast; Google TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.225 Safari/537.36"
+        } else {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        };
+        headers.push_str(&format!("User-Agent: {}\r\n", ua));
+        headers.push_str("Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n");
     } else if stream_url.contains("soundcloud") {
-        args.push("-headers".to_owned());
-        args.push(
-            "Referer: https://soundcloud.com/\r\nOrigin: https://soundcloud.com\r\n".to_owned(),
-        );
+        headers.push_str("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n");
+        headers.push_str("Referer: https://soundcloud.com/\r\nOrigin: https://soundcloud.com\r\n");
+    } else {
+        headers.push_str("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n");
     }
+
+    args.push("-headers".to_owned());
+    args.push(headers);
 
     args.extend([
         "-i".to_owned(),
