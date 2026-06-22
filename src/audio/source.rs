@@ -666,7 +666,8 @@ pub fn create_ffmpeg_stream_input(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
         };
         headers.push_str(&format!("User-Agent: {}\r\n", ua));
-        headers.push_str("Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n");
+        headers
+            .push_str("Referer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com\r\n");
     } else if stream_url.contains("soundcloud") {
         headers.push_str("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36\r\n");
         headers.push_str("Referer: https://soundcloud.com/\r\nOrigin: https://soundcloud.com\r\n");
