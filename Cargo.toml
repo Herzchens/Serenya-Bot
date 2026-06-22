@@ -15,8 +15,10 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde-saphyr = "0.0.28"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 thiserror = "2"
 tracing = "0.1"
+
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 dashmap = "6"
 chrono = { version = "0.4", features = ["serde"] }

@@ -4551,6 +4551,7 @@ dependencies = [
  "poise",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "rustls 0.23.40",
  "serde",
  "serde-saphyr",
  "serde_json",

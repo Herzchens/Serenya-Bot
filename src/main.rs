@@ -38,6 +38,7 @@ impl Data {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     if let Err(err) = run().await {
         eprintln!("Fatal error: {err}");
         std::process::exit(1);
