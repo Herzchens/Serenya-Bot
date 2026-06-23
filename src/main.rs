@@ -21,7 +21,7 @@ use crate::database::DatabaseManager;
 
 /// Shared application state accessible from all command handlers.
 pub struct Data {
-    pub config: std::sync::RwLock<Arc<BotConfig>>,
+    pub config: arc_swap::ArcSwap<BotConfig>,
     pub database: Arc<DatabaseManager>,
     pub guild_players: Arc<
         DashMap<serenity::GuildId, std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>>,
@@ -32,7 +32,7 @@ pub struct Data {
 
 impl Data {
     pub fn config(&self) -> Arc<BotConfig> {
-        self.config.read().unwrap().clone()
+        self.config.load().clone()
     }
 }
 
@@ -157,7 +157,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 start_empty_room_monitor(guild_players.clone(), ctx.http.clone());
 
                 Ok(Data {
-                    config: std::sync::RwLock::new(config_clone),
+                    config: arc_swap::ArcSwap::new(config_clone),
                     database: database_clone,
                     guild_players,
                     http_client,
@@ -184,6 +184,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Serenya is ready"
     );
 
+    #[cfg(unix)]
+    let sigterm_future = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap().recv().await;
+    };
+    #[cfg(not(unix))]
+    let sigterm_future = std::future::pending::<()>();
+
     tokio::select! {
         result = client.start() => {
             if let Err(err) = result {
@@ -192,6 +199,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("Shutdown signal received (ctrl+c)");
+        }
+        _ = sigterm_future => {
+            info!("Shutdown signal received (SIGTERM)");
         }
     }
 

@@ -120,10 +120,7 @@ pub async fn help(
 #[poise::command(slash_command, prefix_command)]
 pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
     let owner_id = {
-        let config =
-            ctx.data().config.read().map_err(|_| {
-                crate::utils::SerenyaError::Config("config lock is poisoned".into())
-            })?;
+        let config = ctx.data().config.load();
         config.bot.owner
     };
 
@@ -152,10 +149,7 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
 
     let new_config = std::sync::Arc::new(crate::config::load_config("config.yml").await?);
     let old_prefix = {
-        let current =
-            ctx.data().config.read().map_err(|_| {
-                crate::utils::SerenyaError::Config("config lock is poisoned".into())
-            })?;
+        let current = ctx.data().config.load();
         current.bot.prefix.clone()
     };
     let new_prefix = new_config.bot.prefix.clone();
@@ -179,19 +173,12 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
 
     let resolver_config = new_config.resolver.clone();
     let token_changed = {
-        let current =
-            ctx.data().config.read().map_err(|_| {
-                crate::utils::SerenyaError::Config("config lock is poisoned".into())
-            })?;
+        let current = ctx.data().config.load();
         current.bot.token != new_config.bot.token
     };
 
     {
-        let mut config_write =
-            ctx.data().config.write().map_err(|_| {
-                crate::utils::SerenyaError::Config("config lock is poisoned".into())
-            })?;
-        *config_write = new_config.clone();
+        ctx.data().config.store(new_config.clone());
     }
 
     crate::audio::runtime::configure(&resolver_config, &new_config.spotify);

@@ -75,6 +75,7 @@ pub struct PlaybackSection {
 pub struct ResolverSection {
     pub max_concurrent_ytdlp: usize,
     pub max_concurrent_resolves_per_guild: usize,
+    pub max_concurrent_soundcloud: usize,
     pub global_search_timeout_ms: u64,
     pub deezer_timeout_ms: u64,
     pub apple_music_timeout_ms: u64,
@@ -98,7 +99,8 @@ impl Default for ResolverSection {
     fn default() -> Self {
         Self {
             max_concurrent_ytdlp: 2,
-            max_concurrent_resolves_per_guild: 1,
+            max_concurrent_resolves_per_guild: 2,
+            max_concurrent_soundcloud: 4,
             global_search_timeout_ms: 1800,
             deezer_timeout_ms: 800,
             apple_music_timeout_ms: 800,
