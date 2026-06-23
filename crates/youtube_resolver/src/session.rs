@@ -1,20 +1,17 @@
 use crate::{ResolveError, SessionData};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-static SESSION_CACHE: Mutex<Option<(SessionData, Instant)>> = Mutex::new(None);
+static SESSION_CACHE: LazyLock<Mutex<Option<(SessionData, Instant)>>> = LazyLock::new(|| Mutex::new(None));
 
 pub async fn get_or_fetch_session(
     http_client: &reqwest::Client,
 ) -> Result<SessionData, ResolveError> {
-    {
-        let cache = SESSION_CACHE
-            .lock()
-            .map_err(|_| ResolveError::Unknown("session cache lock poisoned".to_owned()))?;
-        if let Some((ref data, fetched_at)) = *cache {
-            if fetched_at.elapsed() < Duration::from_secs(6 * 3600) {
-                return Ok(data.clone());
-            }
+    let mut cache = SESSION_CACHE.lock().await;
+    if let Some((ref data, fetched_at)) = *cache {
+        if fetched_at.elapsed() < Duration::from_secs(6 * 3600) {
+            return Ok(data.clone());
         }
     }
 
@@ -42,9 +39,6 @@ pub async fn get_or_fetch_session(
         player_url,
     };
 
-    let mut cache = SESSION_CACHE
-        .lock()
-        .map_err(|_| ResolveError::Unknown("session cache lock poisoned".to_owned()))?;
     *cache = Some((data.clone(), Instant::now()));
     Ok(data)
 }
