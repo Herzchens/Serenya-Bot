@@ -679,17 +679,17 @@ async fn resolve_youtube_stream_native(
     None
 }
 
-pub fn create_stream_input(
+pub async fn create_stream_input(
     original_url: Option<String>,
-    stream: youtube_resolver::ResolvedStream,
+    stream: &youtube_resolver::ResolvedStream,
     eight_d_enabled: bool,
 ) -> Result<songbird::input::Input, SerenyaError> {
     // Always use ffmpeg for robust playback — handles reconnection, headers,
     // and various URL types better than songbird's built-in HttpRequest
-    create_ffmpeg_stream_input(original_url, &stream, None, eight_d_enabled)
+    create_ffmpeg_stream_input(original_url, stream, None, eight_d_enabled).await
 }
 
-pub fn create_ffmpeg_stream_input(
+pub async fn create_ffmpeg_stream_input(
     original_url: Option<String>,
     stream: &youtube_resolver::ResolvedStream,
     seek: Option<Duration>,
@@ -774,12 +774,16 @@ pub fn create_ffmpeg_stream_input(
         "pipe:1".to_owned(),
     ]);
 
-    let mut child = Command::new("ffmpeg")
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| SerenyaError::Audio(format!("Failed to spawn ffmpeg: {e}")))?;
+    let mut child = tokio::task::spawn_blocking(move || {
+        Command::new("ffmpeg")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .await
+    .map_err(|e| SerenyaError::Audio(format!("Failed to spawn ffmpeg blocking task: {e}")))?
+    .map_err(|e| SerenyaError::Audio(format!("Failed to spawn ffmpeg: {e}")))?;
 
     // Log ffmpeg stderr in background for diagnostics and detect 403 Forbidden
     if let Some(stderr) = child.stderr.take() {
