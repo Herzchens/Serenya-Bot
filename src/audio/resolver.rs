@@ -37,6 +37,26 @@ impl ResolvedInput {
     }
 }
 
+pub(crate) fn extract_artist_string(artists: Option<&Vec<serde_json::Value>>) -> String {
+    let mut artists_vec = Vec::new();
+    if let Some(artists) = artists {
+        for a in artists {
+            if let Some(a_name) = a.get("name").or_else(|| a.pointer("/profile/name")).and_then(|v| v.as_str()) {
+                artists_vec.push(a_name.to_owned());
+            } else if a.get("uri").and_then(|v| v.as_str()).is_some() {
+                 if let Some(c_name) = a.get("name").and_then(|v| v.as_str()) {
+                     artists_vec.push(c_name.to_owned());
+                 }
+            }
+        }
+    }
+    if artists_vec.is_empty() {
+        "".to_owned()
+    } else {
+        artists_vec.join(", ")
+    }
+}
+
 #[cfg(test)]
 const TRUSTED_METADATA_PICK_THRESHOLD: f64 = 0.68;
 
@@ -400,7 +420,7 @@ async fn collect_search_results(
             url: candidate.url,
             duration: candidate.duration,
             requester_id: serenity::UserId::new(user_id),
-            requester_name: "".to_owned(),
+            requester_name: None,
             source_type: SourceType::Search,
             resolved_url: None,
             thumbnail: candidate.thumbnail,
@@ -594,7 +614,7 @@ pub async fn resolve_input(
                     url: t.url,
                     duration: t.duration_secs.map(Duration::from_secs),
                     requester_id: serenity::UserId::new(user_id),
-                    requester_name: "".to_owned(),
+                    requester_name: None,
                     source_type: SourceType::Playlist,
                     resolved_url: None,
                     thumbnail: None,
@@ -949,7 +969,7 @@ fn evaluate_confidence_and_respond(
                 url: cand.url,
                 duration: cand.duration,
                 requester_id: serenity::UserId::new(user_id),
-                requester_name: "".to_owned(),
+                requester_name: None,
                 source_type: SourceType::Search,
                 resolved_url: None,
                 thumbnail: forced_thumbnail.clone().or(cand.thumbnail),
@@ -994,7 +1014,7 @@ fn evaluate_confidence_and_respond(
             url: top_cand.url.clone(),
             duration: forced_duration.or(top_cand.duration),
             requester_id: serenity::UserId::new(user_id),
-            requester_name: "".to_owned(),
+            requester_name: None,
             source_type: SourceType::Search,
             resolved_url: None,
             thumbnail: forced_thumbnail.or_else(|| top_cand.thumbnail.clone()),
@@ -1182,7 +1202,7 @@ async fn resolve_spotify_embed_fallback(
                 url: track_url,
                 duration: embed_track.duration.map(Duration::from_millis),
                 requester_id: serenity::UserId::new(user_id),
-                requester_name: "".to_owned(),
+                requester_name: None,
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: entity_thumbnail.clone().map(std::sync::Arc::from),
@@ -1254,7 +1274,7 @@ async fn resolve_spotify_playlist_api(
     tracing::info!("Spotify client token info retrieved successfully.");
 
     let sp_dc = crate::audio::runtime::spotify_settings()
-        .and_then(|config| config.sp_dc)
+        .and_then(|config| config.sp_dc.clone())
         .filter(|cookie| !cookie.trim().is_empty())
         .ok_or_else(|| SerenyaError::Audio("Spotify sp_dc cookie is not configured.".to_owned()))?;
 
@@ -1427,32 +1447,7 @@ async fn resolve_spotify_playlist_api(
                 })
                 .unwrap_or(0);
 
-            let mut artists_vec = Vec::new();
-            if let Some(artists) = track_val
-                .pointer("/artists/items")
-                .and_then(|v| v.as_array())
-            {
-                for a in artists {
-                    if let Some(a_name) = a.pointer("/profile/name").and_then(|v| v.as_str()) {
-                        artists_vec.push(a_name.to_owned());
-                    }
-                }
-            } else if let Some(contributors) = track_val
-                .pointer("/identityTrait/contributors/items")
-                .and_then(|v| v.as_array())
-            {
-                for c in contributors {
-                    if let Some(c_name) = c.get("name").and_then(|v| v.as_str()) {
-                        artists_vec.push(c_name.to_owned());
-                    }
-                }
-            }
-
-            let artist_str = if artists_vec.is_empty() {
-                "".to_owned()
-            } else {
-                artists_vec.join(", ")
-            };
+            let artist_str = extract_artist_string(track_val.pointer("/artists/items").or_else(|| track_val.pointer("/identityTrait/contributors/items")).and_then(|v| v.as_array()));
 
             let thumbnail = track_val
                 .pointer("/albumOfTrack/coverArt/sources")
@@ -1477,7 +1472,7 @@ async fn resolve_spotify_playlist_api(
                 url: track_url,
                 duration: Some(Duration::from_millis(duration_ms)),
                 requester_id: serenity::UserId::new(user_id),
-                requester_name: "".to_owned(),
+                requester_name: None,
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: thumbnail.map(std::sync::Arc::from),
@@ -1645,19 +1640,7 @@ async fn resolve_spotify_album_api(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        let mut artists_vec = Vec::new();
-        if let Some(artists) = item.get("artists").and_then(|v| v.as_array()) {
-            for a in artists {
-                if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
-                    artists_vec.push(a_name.to_owned());
-                }
-            }
-        }
-        let artist_str = if artists_vec.is_empty() {
-            "".to_owned()
-        } else {
-            artists_vec.join(", ")
-        };
+        let artist_str = extract_artist_string(item.get("artists").and_then(|v| v.as_array()));
 
         let search_query = if artist_str.is_empty() {
             name.to_owned()
@@ -1671,7 +1654,7 @@ async fn resolve_spotify_album_api(
             url: track_url,
             duration: Some(Duration::from_millis(duration_ms)),
             requester_id: serenity::UserId::new(user_id),
-            requester_name: "".to_owned(),
+            requester_name: None,
             source_type: SourceType::Url,
             resolved_url: None,
             thumbnail: thumbnail.clone().map(std::sync::Arc::from),
@@ -1752,19 +1735,7 @@ async fn resolve_spotify_album_api(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
 
-            let mut artists_vec = Vec::new();
-            if let Some(artists) = item.get("artists").and_then(|v| v.as_array()) {
-                for a in artists {
-                    if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
-                        artists_vec.push(a_name.to_owned());
-                    }
-                }
-            }
-            let artist_str = if artists_vec.is_empty() {
-                "".to_owned()
-            } else {
-                artists_vec.join(", ")
-            };
+            let artist_str = extract_artist_string(item.get("artists").and_then(|v| v.as_array()));
 
             let search_query = if artist_str.is_empty() {
                 name.to_owned()
@@ -1778,7 +1749,7 @@ async fn resolve_spotify_album_api(
                 url: track_url,
                 duration: Some(Duration::from_millis(duration_ms)),
                 requester_id: serenity::UserId::new(user_id),
-                requester_name: "".to_owned(),
+                requester_name: None,
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: thumbnail.clone().map(std::sync::Arc::from),
@@ -1954,19 +1925,7 @@ async fn resolve_spotify_artist_top_tracks_api(
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
-        let mut artists_vec = Vec::new();
-        if let Some(artists) = track_val.get("artists").and_then(|v| v.as_array()) {
-            for a in artists {
-                if let Some(a_name) = a.get("name").and_then(|v| v.as_str()) {
-                    artists_vec.push(a_name.to_owned());
-                }
-            }
-        }
-        let artist_str = if artists_vec.is_empty() {
-            "".to_owned()
-        } else {
-            artists_vec.join(", ")
-        };
+        let artist_str = extract_artist_string(track_val.get("artists").and_then(|v| v.as_array()));
 
         let thumbnail = track_val
             .get("album")
@@ -1989,7 +1948,7 @@ async fn resolve_spotify_artist_top_tracks_api(
             url: track_url,
             duration: Some(Duration::from_millis(duration_ms)),
             requester_id: serenity::UserId::new(user_id),
-            requester_name: "".to_owned(),
+            requester_name: None,
             source_type: SourceType::Url,
             resolved_url: None,
             thumbnail: thumbnail.map(std::sync::Arc::from),
