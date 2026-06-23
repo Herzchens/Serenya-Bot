@@ -65,7 +65,7 @@ pub async fn play(
             enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, tracks).await?;
         }
         ResolvedInput::Track(track) => {
-            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, vec![track])
+            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, vec![*track])
                 .await?;
         }
         ResolvedInput::SearchResults(mut candidates) => {
@@ -315,6 +315,7 @@ pub(crate) async fn enqueue_and_play_resolved(
                 player.eight_d_enabled
             };
             let source = match crate::audio::source::create_stream_input(
+                Some(current_track.url.clone()),
                 resolved_url.clone(),
                 eight_d_enabled,
             ) {

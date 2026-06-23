@@ -8,7 +8,7 @@ pub struct Track {
     pub requester_id: serenity::UserId,
     pub requester_name: String,
     pub source_type: SourceType,
-    pub resolved_url: Option<String>,
+    pub resolved_url: Option<youtube_resolver::ResolvedStream>,
     pub thumbnail: Option<std::sync::Arc<str>>,
     pub source_provider: String,
 }

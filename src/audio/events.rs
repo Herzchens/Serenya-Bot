@@ -376,7 +376,11 @@ pub fn play_next(
             let player = player_lock.read().await;
             player.eight_d_enabled
         };
-        let source = crate::audio::source::create_stream_input(resolved.clone(), eight_d_enabled)?;
+        let source = crate::audio::source::create_stream_input(
+            Some(track.url.clone()),
+            resolved.clone(),
+            eight_d_enabled,
+        )?;
 
         let handle = {
             let mut call = call_lock.lock().await;

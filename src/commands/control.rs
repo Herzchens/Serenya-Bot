@@ -24,8 +24,8 @@ pub(crate) async fn seek_by_restart(
         (track.url.clone(), track.resolved_url.clone())
     };
 
-    let stream_url = match resolved_url {
-        Some(url) => url,
+    let stream = match resolved_url {
+        Some(stream) => stream,
         None => crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?,
     };
 
@@ -34,7 +34,8 @@ pub(crate) async fn seek_by_restart(
         player.eight_d_enabled
     };
     let source = crate::audio::source::create_ffmpeg_stream_input(
-        &stream_url,
+        Some(url.clone()),
+        &stream,
         Some(target_position),
         eight_d_enabled,
     )?;
