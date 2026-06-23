@@ -30,11 +30,13 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
     let guild_ids: Vec<_> = ctx.data().guild_players.iter().map(|e| *e.key()).collect();
     let mut active_vcs = 0;
     for gid in guild_ids {
-        if let Some(player_lock) = ctx.data().guild_players.get(&gid) {
-            let player = player_lock.read().await;
-            if player.voice_channel.is_some() {
-                active_vcs += 1;
-            }
+        let player_lock = match ctx.data().guild_players.get(&gid) {
+            Some(p) => p.value().clone(),
+            None => continue,
+        };
+        let player = player_lock.read().await;
+        if player.voice_channel.is_some() {
+            active_vcs += 1;
         }
     }
 
@@ -50,7 +52,12 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
     let mut queue_size = 0;
     let mut listeners = 0;
 
-    if let Some(player_lock) = ctx.data().guild_players.get(&guild_id) {
+    let player_lock_opt = match ctx.data().guild_players.get(&guild_id) {
+        Some(p) => Some(p.value().clone()),
+        None => None,
+    };
+
+    if let Some(player_lock) = player_lock_opt {
         let player = player_lock.read().await;
         queue_size = player.queue.len();
 
