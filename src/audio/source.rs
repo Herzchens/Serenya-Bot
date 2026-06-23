@@ -25,7 +25,7 @@ fn build_metadata_cache() -> Cache<String, Track> {
         .build()
 }
 
-fn build_stream_cache() -> Cache<String, String> {
+fn build_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
         .max_capacity(4096)
         .time_to_live(Duration::from_secs(
@@ -40,7 +40,7 @@ static QUERY_CACHE: LazyLock<ArcSwap<Cache<String, Track>>> =
 static METADATA_CACHE: LazyLock<ArcSwap<Cache<String, Track>>> =
     LazyLock::new(|| ArcSwap::from_pointee(build_metadata_cache()));
 
-static STREAM_CACHE: LazyLock<ArcSwap<Cache<String, String>>> =
+static STREAM_CACHE: LazyLock<ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>> =
     LazyLock::new(|| ArcSwap::from_pointee(build_stream_cache()));
 
 /// Shared HTTP client for internal network calls (Invidious, Piped, OEmbed, etc.).
@@ -94,11 +94,9 @@ pub async fn cache_set_url_metadata(url: String, track: Track) {
 
 pub async fn cache_get_stream(url: &str) -> Option<youtube_resolver::ResolvedStream> {
     let cache = STREAM_CACHE.load();
-    if let Some(stream_json) = cache.get(url).await
-        && let Ok(stream) = serde_json::from_str::<youtube_resolver::ResolvedStream>(&stream_json)
-    {
+    if let Some(stream) = cache.get(url).await {
         tracing::debug!(url, cache = "stream", "cache hit");
-        return Some(stream);
+        return Some((*stream).clone());
     }
     tracing::debug!(url, cache = "stream", "cache miss/expired");
     None
@@ -106,13 +104,11 @@ pub async fn cache_get_stream(url: &str) -> Option<youtube_resolver::ResolvedStr
 
 pub async fn cache_invalidate_stream(url: &str) {
     STREAM_CACHE.load().invalidate(url).await;
-    SOUNDCLOUD_STREAM_CACHE.invalidate(url).await;
+    SOUNDCLOUD_STREAM_CACHE.load().invalidate(url).await;
 }
 
 pub async fn cache_set_stream(url: String, stream: &youtube_resolver::ResolvedStream) {
-    if let Ok(json) = serde_json::to_string(stream) {
-        STREAM_CACHE.load().insert(url, json).await;
-    }
+    STREAM_CACHE.load().insert(url, Arc::new(stream.clone())).await;
 }
 
 fn url_encode(s: &str) -> String {
@@ -157,6 +153,18 @@ fn extract_youtube_video_id(url: &str) -> Option<&str> {
     } else if let Some(pos) = url.find("youtu.be/") {
         let rest = &url[pos + 9..];
         let end = rest.find('?').unwrap_or(rest.len());
+        Some(&rest[..end])
+    } else if let Some(pos) = url.find("/shorts/") {
+        let rest = &url[pos + 8..];
+        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
+        Some(&rest[..end])
+    } else if let Some(pos) = url.find("/live/") {
+        let rest = &url[pos + 6..];
+        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
+        Some(&rest[..end])
+    } else if let Some(pos) = url.find("/embed/") {
+        let rest = &url[pos + 7..];
+        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
         Some(&rest[..end])
     } else {
         None
@@ -319,11 +327,15 @@ async fn run_ytdlp_stream_resolution(
     })
 }
 
-static SOUNDCLOUD_STREAM_CACHE: LazyLock<Cache<String, String>> = LazyLock::new(|| {
+fn build_soundcloud_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
         .max_capacity(4096)
         .time_to_live(Duration::from_secs(300)) // 5 minutes
         .build()
+}
+
+static SOUNDCLOUD_STREAM_CACHE: LazyLock<ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>> = LazyLock::new(|| {
+    ArcSwap::from_pointee(build_soundcloud_stream_cache())
 });
 
 static SOUNDCLOUD_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
@@ -333,11 +345,9 @@ async fn resolve_soundcloud_stream_url(
     track_url: &str,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     // 1. Check cache
-    if let Some(stream_json) = SOUNDCLOUD_STREAM_CACHE.get(track_url).await
-        && let Ok(stream) = serde_json::from_str::<youtube_resolver::ResolvedStream>(&stream_json)
-    {
+    if let Some(stream) = SOUNDCLOUD_STREAM_CACHE.load().get(track_url).await {
         tracing::debug!(track_url, "SoundCloud stream cache hit");
-        return Ok(stream);
+        return Ok((*stream).clone());
     }
 
     // 2. Concurrency control via Semaphore
@@ -377,11 +387,10 @@ async fn resolve_soundcloud_stream_url(
     };
 
     // 6. Cache the result for 5 minutes (SoundCloud signed URLs expire quickly)
-    if let Ok(json) = serde_json::to_string(&stream) {
-        SOUNDCLOUD_STREAM_CACHE
-            .insert(track_url.to_owned(), json)
-            .await;
-    }
+    SOUNDCLOUD_STREAM_CACHE
+        .load()
+        .insert(track_url.to_owned(), Arc::new(stream.clone()))
+        .await;
 
     Ok(stream)
 }
@@ -622,15 +631,15 @@ async fn extract_stream_url_inner(
 }
 
 fn is_direct_stream_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    lower.contains("googlevideo.com") || lower.contains("googleusercontent.com")
+    url.contains("googlevideo.com") || url.contains("googleusercontent.com")
 }
 
 async fn resolve_youtube_stream_native(
     track_url: &str,
 ) -> Option<youtube_resolver::ResolvedStream> {
+    let video_id_opt = extract_youtube_video_id(track_url);
     // 1. Try our custom youtube_resolver (direct Google stream via ANDROID/IOS mobile clients)
-    if let Some(video_id) = extract_youtube_video_id(track_url) {
+    if let Some(video_id) = video_id_opt {
         let ctx = youtube_resolver::ResolveContext::default();
         let resolver_future = youtube_resolver::resolve_best_audio_stream(video_id, &ctx);
         if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(5), resolver_future).await
@@ -649,7 +658,7 @@ async fn resolve_youtube_stream_native(
     }
 
     // 2. Fallback to Invidious/Piped Proxy
-    if let Some(video_id) = extract_youtube_video_id(track_url)
+    if let Some(video_id) = video_id_opt
         && let Some(url) = resolve_via_invidious_or_piped(video_id, &HTTP_CLIENT).await
     {
         if is_direct_stream_url(&url) {
@@ -776,7 +785,7 @@ pub fn create_ffmpeg_stream_input(
     if let Some(stderr) = child.stderr.take() {
         let pid = child.id();
         let rt_handle = tokio::runtime::Handle::current();
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
             let mut buf = String::new();
             let mut reader = std::io::BufReader::new(stderr);
@@ -828,5 +837,6 @@ pub fn clear_caches() -> (usize, usize) {
     QUERY_CACHE.store(Arc::new(build_query_cache()));
     METADATA_CACHE.store(Arc::new(build_metadata_cache()));
     STREAM_CACHE.store(Arc::new(build_stream_cache()));
+    SOUNDCLOUD_STREAM_CACHE.store(Arc::new(build_soundcloud_stream_cache()));
     (q_len + m_len, s_len)
 }
