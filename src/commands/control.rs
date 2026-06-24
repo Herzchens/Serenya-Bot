@@ -68,7 +68,7 @@ pub(crate) async fn seek_by_restart(
     };
 
     // 4. Register event handlers
-    let end_handler = crate::audio::events::TrackEndHandler {
+    let playback_ctx = crate::audio::events::PlaybackContext {
         guild_id,
         database: std::sync::Arc::clone(&ctx.data().database),
         guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
@@ -76,18 +76,17 @@ pub(crate) async fn seek_by_restart(
         serenity_ctx: ctx.serenity_context().clone(),
         config: ctx.data().config(),
     };
+
+    let end_handler = crate::audio::events::TrackEndHandler {
+        ctx: playback_ctx.clone(),
+    };
     let _ = handle.add_event(
         songbird::Event::Track(songbird::TrackEvent::End),
         end_handler,
     );
 
     let error_handler = crate::audio::events::TrackErrorHandler {
-        guild_id,
-        database: std::sync::Arc::clone(&ctx.data().database),
-        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-        http_client: ctx.data().http_client.clone(),
-        serenity_ctx: ctx.serenity_context().clone(),
-        config: ctx.data().config(),
+        ctx: playback_ctx,
     };
     let _ = handle.add_event(
         songbird::Event::Track(songbird::TrackEvent::Error),

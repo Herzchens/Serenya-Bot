@@ -332,26 +332,25 @@ pub(crate) async fn enqueue_and_play_resolved(
             let handle = call.play_input(source);
 
             // 4. Register event handlers
+            let playback_ctx = crate::audio::events::PlaybackContext {
+                guild_id,
+                database: database_clone.clone(),
+                guild_players: guild_players_clone.clone(),
+                http_client: http_client_clone.clone(),
+                serenity_ctx: serenity_ctx_clone.clone(),
+                config: config_clone.clone(),
+            };
+
             let _ = handle.add_event(
                 songbird::Event::Track(songbird::TrackEvent::End),
                 TrackEndHandler {
-                    guild_id,
-                    database: database_clone.clone(),
-                    guild_players: guild_players_clone.clone(),
-                    http_client: http_client_clone.clone(),
-                    serenity_ctx: serenity_ctx_clone.clone(),
-                    config: config_clone.clone(),
+                    ctx: playback_ctx.clone(),
                 },
             );
             let _ = handle.add_event(
                 songbird::Event::Track(songbird::TrackEvent::Error),
                 TrackErrorHandler {
-                    guild_id,
-                    database: database_clone.clone(),
-                    guild_players: guild_players_clone.clone(),
-                    http_client: http_client_clone.clone(),
-                    serenity_ctx: serenity_ctx_clone.clone(),
-                    config: config_clone.clone(),
+                    ctx: playback_ctx,
                 },
             );
 

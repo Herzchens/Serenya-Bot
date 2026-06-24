@@ -2,23 +2,29 @@ use async_trait::async_trait;
 use poise::serenity_prelude as serenity;
 use songbird::{Event, EventContext, EventHandler};
 use std::time::Duration;
+use std::sync::Arc;
 
 use crate::database::DatabaseManager;
 use crate::discord::embeds::now_playing_announce_embed;
 use crate::utils::SerenyaError;
 
-pub struct TrackEndHandler {
+#[derive(Clone)]
+pub struct PlaybackContext {
     pub guild_id: serenity::GuildId,
-    pub database: std::sync::Arc<DatabaseManager>,
-    pub guild_players: std::sync::Arc<
+    pub database: Arc<DatabaseManager>,
+    pub guild_players: Arc<
         dashmap::DashMap<
             serenity::GuildId,
-            std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+            Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
         >,
     >,
     pub http_client: reqwest::Client,
     pub serenity_ctx: serenity::Context,
-    pub config: std::sync::Arc<crate::config::BotConfig>,
+    pub config: Arc<crate::config::BotConfig>,
+}
+
+pub struct TrackEndHandler {
+    pub ctx: PlaybackContext,
 }
 
 #[async_trait]
@@ -28,7 +34,7 @@ impl EventHandler for TrackEndHandler {
             if let Some((state, handle)) = track_events.first() {
                 (
                     Some(handle.uuid()),
-                    if let Some(player_lock_ref) = self.guild_players.get(&self.guild_id) {
+                    if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
                         let player_lock = player_lock_ref.value().clone();
                         drop(player_lock_ref);
                         player_lock.read().await.skip_forced
@@ -51,11 +57,11 @@ impl EventHandler for TrackEndHandler {
             // that Songbird/Symphonia treats as normal EOF instead of decode error.
             if play_time < Duration::from_secs(2) && !was_skipped {
                 tracing::warn!(
-                    guild_id = %self.guild_id,
+                    guild_id = %self.ctx.guild_id,
                     ?play_time,
                     "Track ended too quickly without being skipped, incrementing consecutive errors"
                 );
-                if let Some(player_lock_ref) = self.guild_players.get(&self.guild_id) {
+                if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
                     let player_lock = player_lock_ref.value().clone();
                     drop(player_lock_ref);
                     let mut player = player_lock.write().await;
@@ -68,7 +74,7 @@ impl EventHandler for TrackEndHandler {
                     }
 
                     tracing::warn!(
-                        guild_id = %self.guild_id,
+                        guild_id = %self.ctx.guild_id,
                         consecutive_errors = player.consecutive_errors,
                         "Consecutive errors count: {}",
                         player.consecutive_errors
@@ -76,21 +82,10 @@ impl EventHandler for TrackEndHandler {
                 }
             }
 
-            let guild_id = self.guild_id;
-            let database = self.database.clone();
-            let guild_players = self.guild_players.clone();
-            let http_client = self.http_client.clone();
-            let serenity_ctx = self.serenity_ctx.clone();
-            let config_clone = self.config.clone();
-
+            let ctx_clone = self.ctx.clone();
             tokio::spawn(async move {
                 if let Err(e) = play_next(
-                    guild_id,
-                    database,
-                    guild_players,
-                    http_client,
-                    serenity_ctx,
-                    config_clone,
+                    ctx_clone,
                     if retry_current { None } else { Some(ended) },
                     !retry_current,
                 )
@@ -104,33 +99,22 @@ impl EventHandler for TrackEndHandler {
     }
 }
 
-#[allow(dead_code)]
 pub struct TrackErrorHandler {
-    pub guild_id: serenity::GuildId,
-    pub database: std::sync::Arc<DatabaseManager>,
-    pub guild_players: std::sync::Arc<
-        dashmap::DashMap<
-            serenity::GuildId,
-            std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
-        >,
-    >,
-    pub http_client: reqwest::Client,
-    pub serenity_ctx: serenity::Context,
-    pub config: std::sync::Arc<crate::config::BotConfig>,
+    pub ctx: PlaybackContext,
 }
 
 #[async_trait]
 impl EventHandler for TrackErrorHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::Track(_) = ctx {
-            tracing::error!(guild_id = %self.guild_id, "Track errored (End handler will advance queue)");
-            if let Some(player_lock_ref) = self.guild_players.get(&self.guild_id) {
+            tracing::error!(guild_id = %self.ctx.guild_id, "Track errored (End handler will advance queue)");
+            if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
                 let player_lock = player_lock_ref.value().clone();
                 drop(player_lock_ref);
                 let mut player = player_lock.write().await;
                 player.consecutive_errors += 1;
                 tracing::warn!(
-                    guild_id = %self.guild_id,
+                    guild_id = %self.ctx.guild_id,
                     consecutive_errors = player.consecutive_errors,
                     "Track errored: consecutive errors count: {}",
                     player.consecutive_errors
@@ -146,27 +130,104 @@ impl EventHandler for TrackErrorHandler {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn fail_and_maybe_advance(
+    ctx: &PlaybackContext,
+    player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    call_lock: &Arc<tokio::sync::Mutex<songbird::Call>>,
+    track_url: &str,
+    track_title: &str,
+    announce_channel: Option<serenity::ChannelId>,
+) -> Result<(), SerenyaError> {
+    let consecutive_errors = {
+        let mut player = player_lock.write().await;
+        player.consecutive_errors += 1;
+
+        // Invalidate stream cache for the failed track
+        crate::audio::source::cache_invalidate_stream(track_url).await;
+
+        if player
+            .now_playing
+            .as_ref()
+            .map(|current| current.url.as_str())
+            == Some(track_url)
+        {
+            player.now_playing = None;
+            player.current_track_handle = None;
+            player.playback_status = crate::core::PlaybackStatus::Idle;
+        }
+        player.consecutive_errors
+    };
+
+    if consecutive_errors >= 3 {
+        tracing::error!(
+            "Aborting play_next: too many consecutive errors ({})",
+            consecutive_errors
+        );
+        let mut call = call_lock.lock().await;
+        call.stop();
+        {
+            let mut player = player_lock.write().await;
+            player.reset();
+        }
+        if let Some(channel) = announce_channel {
+            let ctx_clone = ctx.serenity_ctx.clone();
+            tokio::spawn(async move {
+                let embed = crate::discord::embeds::error_embed(
+                    "Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.",
+                );
+                let _ = channel
+                    .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
+                    .await;
+            });
+        }
+        return Ok(());
+    }
+
+    if let Some(channel) = announce_channel {
+        let ctx_clone = ctx.serenity_ctx.clone();
+        let title_clone = track_title.to_owned();
+        tokio::spawn(async move {
+            let embed = crate::discord::embeds::playback_status_embed(
+                "⚠️ Warning",
+                &format!(
+                    "Could not resolve **{}**. Trying the next track.",
+                    title_clone
+                ),
+                0xFEE75C,
+            );
+            let _ = channel
+                .send_message(
+                    &ctx_clone.http,
+                    serenity::CreateMessage::new().embed(embed),
+                )
+                .await;
+        });
+    }
+
+    // Call play_next again to try the next track!
+    let ctx_clone = ctx.clone();
+    tokio::spawn(async move {
+        if let Err(next_err) = play_next(ctx_clone, None, true).await {
+            tracing::error!(
+                guild_id = %ctx.guild_id,
+                "Failed to continue in play_next after stream resolution error: {:?}",
+                next_err
+            );
+        }
+    });
+
+    Ok(())
+}
+
 pub fn play_next(
-    guild_id: serenity::GuildId,
-    database: std::sync::Arc<DatabaseManager>,
-    guild_players: std::sync::Arc<
-        dashmap::DashMap<
-            serenity::GuildId,
-            std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
-        >,
-    >,
-    http_client: reqwest::Client,
-    serenity_ctx: serenity::Context,
-    config: std::sync::Arc<crate::config::BotConfig>,
+    ctx: PlaybackContext,
     ended_uuid: Option<uuid::Uuid>,
     advance: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SerenyaError>> + Send + 'static>>
-{
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SerenyaError>> + Send + 'static>> {
     Box::pin(async move {
         // 1. Get the guild player lock
-        let player_lock = guild_players
-            .get(&guild_id)
+        let player_lock = ctx.guild_players
+            .get(&ctx.guild_id)
             .map(|r| r.value().clone())
             .ok_or_else(|| SerenyaError::NotFound("Guild player not found".into()))?;
 
@@ -186,13 +247,13 @@ pub fn play_next(
         }
 
         // 2. Get songbird call manager
-        let songbird_manager = songbird::get(&serenity_ctx)
+        let songbird_manager = songbird::get(&ctx.serenity_ctx)
             .await
             .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized".into()))?
             .clone();
 
         let call_lock = songbird_manager
-            .get(guild_id)
+            .get(ctx.guild_id)
             .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel".into()))?;
 
         let finished_track = {
@@ -200,15 +261,16 @@ pub fn play_next(
             player.now_playing.clone()
         };
 
+        // Cache the settings once at the beginning
+        let guild_settings = ctx.database.get_guild_settings(ctx.guild_id.get()).await;
+
         if let Some(track) = finished_track {
-            database.increment_songs_played(guild_id.get()).await;
-            if let Some(dur) = track.duration {
-                let mut settings = database.get_guild_settings(guild_id.get()).await;
-                settings.total_listening_seconds += dur.as_secs();
-                database
-                    .update_guild_settings(guild_id.get(), settings)
-                    .await;
-            }
+            ctx.database.update_guild_settings_mut(ctx.guild_id.get(), |settings| {
+                settings.total_songs_played += 1;
+                if let Some(dur) = track.duration {
+                    settings.total_listening_seconds += dur.as_secs();
+                }
+            }).await;
         }
 
         // Advance queue and get the next track to play
@@ -236,7 +298,7 @@ pub fn play_next(
                 player.reset();
             }
             if let Some(channel) = announce_channel {
-                let ctx_clone = serenity_ctx.clone();
+                let ctx_clone = ctx.serenity_ctx.clone();
                 tokio::spawn(async move {
                     let embed = crate::discord::embeds::error_embed(
                         "Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.",
@@ -260,13 +322,10 @@ pub fn play_next(
             }
 
             // Announce track finished if enabled
-            let announce_setting = database
-                .get_guild_settings(guild_id.get())
-                .await
-                .announce_track;
+            let announce_setting = guild_settings.announce_track;
 
             if announce_setting && let Some(channel) = announce_channel {
-                let ctx_clone = serenity_ctx.clone();
+                let ctx_clone = ctx.serenity_ctx.clone();
                 tokio::spawn(async move {
                     let embed = crate::discord::embeds::queue_finished_embed();
                     let _ = channel
@@ -280,9 +339,18 @@ pub fn play_next(
         // Resolve ytsearch1: outside of the write lock!
         if track.url.starts_with("ytsearch1:") {
             if let Err(e) =
-                crate::audio::resolver::resolve_ytsearch_track(&mut track, &http_client).await
+                crate::audio::resolver::resolve_ytsearch_track(&mut track, &ctx.http_client).await
             {
                 tracing::error!("Failed to resolve Spotify track search: {:?}", e);
+                return fail_and_maybe_advance(
+                    &ctx,
+                    &player_lock,
+                    &call_lock,
+                    &track.url,
+                    &track.title,
+                    announce_channel,
+                )
+                .await;
             } else {
                 // Update player's now_playing field with the resolved track
                 let mut player = player_lock.write().await;
@@ -294,93 +362,41 @@ pub fn play_next(
             }
         }
 
+        // Pass http_client reference to extract_stream_url_for_guild
         let resolved_res = match track.resolved_url.clone() {
             Some(url) => Ok(url),
-            None => crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &track.url)
-                .await
-                .map(std::sync::Arc::new),
+            None => crate::audio::source::extract_stream_url_for_guild(
+                ctx.guild_id.get(),
+                &track.url,
+                &ctx.http_client,
+            )
+            .await
+            .map(Arc::new),
         };
 
         let resolved = match resolved_res {
             Ok(url) => url,
             Err(e) => {
                 tracing::warn!(
-                    guild_id = %guild_id,
+                    guild_id = %ctx.guild_id,
                     track = %track.title,
                     "Failed to resolve stream URL in play_next: {:?}",
                     e
                 );
-
-                // Increment consecutive errors
-                {
-                    let mut player = player_lock.write().await;
-                    player.consecutive_errors += 1;
-                    if player
-                        .now_playing
-                        .as_ref()
-                        .map(|current| current.url.as_str())
-                        == Some(track.url.as_str())
-                    {
-                        player.now_playing = None;
-                        player.current_track_handle = None;
-                        player.playback_status = crate::core::PlaybackStatus::Idle;
-                    }
-                }
-
-                if let Some(channel) = announce_channel {
-                    let ctx_clone = serenity_ctx.clone();
-                    let title_clone = track.title.clone();
-                    tokio::spawn(async move {
-                        let embed = crate::discord::embeds::playback_status_embed(
-                            "⚠️ Warning",
-                            &format!(
-                                "Could not resolve **{}**. Trying the next track.",
-                                title_clone
-                            ),
-                            0xFEE75C,
-                        );
-                        let _ = channel
-                            .send_message(
-                                &ctx_clone.http,
-                                serenity::CreateMessage::new().embed(embed),
-                            )
-                            .await;
-                    });
-                }
-
-                // Call play_next again to try the next track!
-                let database_clone = std::sync::Arc::clone(&database);
-                let guild_players_clone = std::sync::Arc::clone(&guild_players);
-                let http_client_clone = http_client.clone();
-                let serenity_ctx_clone = serenity_ctx.clone();
-                let config_clone = config.clone();
-                tokio::spawn(async move {
-                    if let Err(next_err) = play_next(
-                        guild_id,
-                        database_clone,
-                        guild_players_clone,
-                        http_client_clone,
-                        serenity_ctx_clone,
-                        config_clone,
-                        None,
-                        true,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            guild_id = %guild_id,
-                            "Failed to continue in play_next after stream resolution error: {:?}",
-                            next_err
-                        );
-                    }
-                });
-
-                return Ok(());
+                return fail_and_maybe_advance(
+                    &ctx,
+                    &player_lock,
+                    &call_lock,
+                    &track.url,
+                    &track.title,
+                    announce_channel,
+                )
+                .await;
             }
         };
 
         tracing::info!(
-            guild_id = %guild_id,
+            guild_id = %ctx.guild_id,
             track = %track.title,
             "Playing resolved stream URL"
         );
@@ -389,12 +405,32 @@ pub fn play_next(
             let player = player_lock.read().await;
             player.eight_d_enabled
         };
-        let source = crate::audio::source::create_stream_input(
+
+        let source = match crate::audio::source::create_stream_input(
             Some(track.url.clone()),
             &resolved,
             eight_d_enabled,
         )
-        .await?;
+        .await {
+            Ok(src) => src,
+            Err(e) => {
+                tracing::warn!(
+                    guild_id = %ctx.guild_id,
+                    track = %track.title,
+                    "Failed to create stream input in play_next: {:?}",
+                    e
+                );
+                return fail_and_maybe_advance(
+                    &ctx,
+                    &player_lock,
+                    &call_lock,
+                    &track.url,
+                    &track.title,
+                    announce_channel,
+                )
+                .await;
+            }
+        };
 
         let handle = {
             let mut call = call_lock.lock().await;
@@ -405,23 +441,13 @@ pub fn play_next(
         let _ = handle.add_event(
             songbird::Event::Track(songbird::TrackEvent::End),
             TrackEndHandler {
-                guild_id,
-                database: std::sync::Arc::clone(&database),
-                guild_players: std::sync::Arc::clone(&guild_players),
-                http_client: http_client.clone(),
-                serenity_ctx: serenity_ctx.clone(),
-                config: config.clone(),
+                ctx: ctx.clone(),
             },
         );
         let _ = handle.add_event(
             songbird::Event::Track(songbird::TrackEvent::Error),
             TrackErrorHandler {
-                guild_id,
-                database: std::sync::Arc::clone(&database),
-                guild_players: std::sync::Arc::clone(&guild_players),
-                http_client: http_client.clone(),
-                serenity_ctx: serenity_ctx.clone(),
-                config: config.clone(),
+                ctx: ctx.clone(),
             },
         );
 
@@ -462,24 +488,21 @@ pub fn play_next(
 
         // Schedule prefetching for the next track in the queue (pass http_client!)
         schedule_prefetch(
-            guild_id,
-            std::sync::Arc::clone(&guild_players),
+            ctx.guild_id,
+            Arc::clone(&ctx.guild_players),
             track.duration,
-            http_client.clone(),
+            ctx.http_client.clone(),
         );
 
         // Announce track if enabled in database
-        let announce_setting = database
-            .get_guild_settings(guild_id.get())
-            .await
-            .announce_track;
+        let announce_setting = guild_settings.announce_track;
 
         if advance
             && announce_setting
             && let Some(channel) = announce_channel
         {
-            let ctx_clone = serenity_ctx.clone();
-            let config_clone = config.clone();
+            let ctx_clone = ctx.serenity_ctx.clone();
+            let config_clone = ctx.config.clone();
             tokio::spawn(async move {
                 let embed = now_playing_announce_embed(&track, &config_clone);
                 let _ = channel
@@ -499,10 +522,10 @@ pub fn play_next(
 
 pub async fn trigger_prefetch(
     guild_id: serenity::GuildId,
-    guild_players: std::sync::Arc<
+    guild_players: Arc<
         dashmap::DashMap<
             serenity::GuildId,
-            std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+            Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
         >,
     >,
     http_client: reqwest::Client,
@@ -565,14 +588,14 @@ pub async fn trigger_prefetch(
 
     tracing::debug!(guild_id = %guild_id, "Prefetching stream URL for: {}", url_to_resolve);
 
-    match crate::audio::source::prefetch_stream_url_for_guild(guild_id.get(), &url_to_resolve).await
+    match crate::audio::source::prefetch_stream_url_for_guild(guild_id.get(), &url_to_resolve, &http_client).await
     {
         Ok(Some(resolved_url)) => {
             let mut player = player_lock.write().await;
             if let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
             {
-                track.resolved_url = Some(std::sync::Arc::new(resolved_url));
+                track.resolved_url = Some(Arc::new(resolved_url));
                 tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
             }
         }
@@ -585,10 +608,10 @@ pub async fn trigger_prefetch(
 
 pub fn schedule_prefetch(
     guild_id: serenity::GuildId,
-    guild_players: std::sync::Arc<
+    guild_players: Arc<
         dashmap::DashMap<
             serenity::GuildId,
-            std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+            Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
         >,
     >,
     duration: Option<Duration>,
