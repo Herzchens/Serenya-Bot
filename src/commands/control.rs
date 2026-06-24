@@ -26,7 +26,9 @@ pub(crate) async fn seek_by_restart(
 
     let stream = match resolved_url {
         Some(stream) => stream,
-        None => std::sync::Arc::new(crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?),
+        None => std::sync::Arc::new(
+            crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?,
+        ),
     };
 
     let eight_d_enabled = {
@@ -38,7 +40,8 @@ pub(crate) async fn seek_by_restart(
         &stream,
         Some(target_position),
         eight_d_enabled,
-    ).await?;
+    )
+    .await?;
 
     // 3. Stop the current track and play the new input
     let manager = songbird::get(ctx.serenity_context())
@@ -135,7 +138,12 @@ pub async fn seek(
         .clone();
 
     seek_by_restart(ctx, guild_id, player_lock, duration).await?;
-    ctx.say(format!("⏩ Seeked to **{time}**.")).await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏩ Seek",
+        &format!("Seeked to **{time}**."),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
@@ -181,12 +189,16 @@ pub async fn forward(
 
     seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
     let new_pos_fmt = format_seek_time(new_pos);
-    ctx.say(format!(
-        "⏩ Forwarded by **{}s** → `{}`",
-        duration.as_secs(),
-        new_pos_fmt
-    ))
-    .await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏩ Forward",
+        &format!(
+            "Forwarded by **{}s** → `{}`",
+            duration.as_secs(),
+            new_pos_fmt
+        ),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
@@ -235,12 +247,12 @@ pub async fn rewind(
 
     seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
     let new_pos_fmt = format_seek_time(new_pos);
-    ctx.say(format!(
-        "⏪ Rewound by **{}s** → `{}`",
-        duration.as_secs(),
-        new_pos_fmt
-    ))
-    .await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏪ Rewind",
+        &format!("Rewound by **{}s** → `{}`", duration.as_secs(), new_pos_fmt),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
@@ -264,11 +276,19 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
 
     if let Some(handle) = &player.current_track_handle {
         let _ = handle.seek(Duration::from_secs(0));
-        ctx.say("🔄 Replaying current track from the beginning.")
-            .await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "🔄 Replay",
+            "Replaying current track from the beginning.",
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     } else if let Some(prev) = player.previous_track.take() {
-        ctx.say(format!("🔄 Replaying previous track: **{}**", prev.title))
-            .await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "🔄 Replay",
+            &format!("Replaying previous track: **{}**", prev.title),
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         player.queue.push_front(prev);
         drop(player);
         crate::audio::events::play_next(
@@ -283,8 +303,12 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
         )
         .await?;
     } else {
-        ctx.say("❌ Nothing is playing, and there is no previous track.")
-            .await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "Nothing is playing, and there is no previous track.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
     Ok(())
 }
@@ -313,8 +337,12 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
         .take()
         .ok_or_else(|| SerenyaError::NotFound("No previous track found.".into()))?;
 
-    ctx.say(format!("⏮️ Playing previous track: **{}**", prev.title))
-        .await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏮️ Previous",
+        &format!("Playing previous track: **{}**", prev.title),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
 
     if let Some(mut curr) = player.now_playing.take() {
         curr.resolved_url = None;
@@ -397,11 +425,15 @@ pub async fn jump(
     };
 
     let skipped = player.queue.jump(index)?;
-    ctx.say(format!(
-        "⏭️ Jumped to track #{position}. Skipped {} tracks.",
-        skipped.len()
-    ))
-    .await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏭️ Jump",
+        &format!(
+            "Jumped to track #{position}. Skipped {} tracks.",
+            skipped.len()
+        ),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
 
     player.skip_forced = true;
     if let Some(handle) = &player.current_track_handle {
@@ -467,7 +499,11 @@ pub async fn r#move(
     };
 
     player.queue.move_item(from_idx, to_idx)?;
-    ctx.say(format!("↕️ Moved track from #{from} to #{to}."))
-        .await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "↕️ Move",
+        &format!("Moved track from #{from} to #{to}."),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }

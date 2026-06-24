@@ -1,5 +1,5 @@
-use std::sync::{Mutex, OnceLock};
 use aho_corasick::AhoCorasick;
+use std::sync::{Mutex, OnceLock};
 
 static SECRETS_TO_REDACT: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static REDACTOR: OnceLock<Mutex<Option<AhoCorasick>>> = OnceLock::new();

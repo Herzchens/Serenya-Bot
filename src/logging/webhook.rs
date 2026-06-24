@@ -122,9 +122,20 @@ async fn send_batch(
         for entry in entries {
             // Truncate entry message to avoid exceeding limits
             let msg_truncated = crate::utils::truncate_chars(&entry.message, 300);
+            let target_clean = entry
+                .target
+                .strip_prefix("serenya::")
+                .unwrap_or(&entry.target);
+            let emoji = match entry.level {
+                Level::ERROR => "🔴",
+                Level::WARN => "🟡",
+                Level::INFO => "🔵",
+                Level::DEBUG => "⚙️",
+                Level::TRACE => "🧬",
+            };
             let log_line = format!(
-                "**[{}] {}:** {}\n",
-                entry.level, entry.target, msg_truncated
+                "{} **[{}]** `{}`: {}\n",
+                emoji, entry.level, target_clean, msg_truncated
             );
 
             // Redact secrets in the log line!
@@ -151,7 +162,11 @@ async fn send_batch(
                 Level::INFO => 0x3498DB,  // blue
                 _ => 0x979C9F,            // grey
             };
-            let title = format!("{} — {}", entry.level, entry.target);
+            let target_clean = entry
+                .target
+                .strip_prefix("serenya::")
+                .unwrap_or(&entry.target);
+            let title = format!("{} — {}", entry.level, target_clean);
             let description = crate::utils::truncate_chars(&entry.message, 1997);
             // Redact secrets in the description!
             let description_redacted = crate::logging::redact_secrets(&description);

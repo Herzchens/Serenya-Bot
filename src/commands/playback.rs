@@ -318,7 +318,9 @@ pub(crate) async fn enqueue_and_play_resolved(
                 Some(current_track.url.clone()),
                 &resolved_url,
                 eight_d_enabled,
-            ).await {
+            )
+            .await
+            {
                 Ok(source) => source,
                 Err(err) => {
                     tracing::error!(guild_id = %guild_id, %err, "Failed to create audio input");
@@ -523,7 +525,12 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
 
     let mut player = player_lock.write().await;
     if player.playback_status != PlaybackStatus::Playing {
-        ctx.say("Playback is not currently active.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "Playback is not currently active.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         return Ok(());
     }
 
@@ -532,9 +539,16 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
             .pause()
             .map_err(|e| SerenyaError::Audio(format!("Failed to pause track: {}", e)))?;
         player.playback_status = PlaybackStatus::Paused;
-        ctx.say("⏸️ Paused playback.").await?;
+        let embed =
+            crate::discord::embeds::playback_status_embed("⏸️ Pause", "Paused playback.", 0x5865F2);
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     } else {
-        ctx.say("No track is currently playing.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "No track is currently playing.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
 
     Ok(())
@@ -559,7 +573,12 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
 
     let mut player = player_lock.write().await;
     if player.playback_status != PlaybackStatus::Paused {
-        ctx.say("Playback is not currently paused.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "Playback is not currently paused.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         return Ok(());
     }
 
@@ -568,9 +587,19 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
             .play()
             .map_err(|e| SerenyaError::Audio(format!("Failed to resume track: {}", e)))?;
         player.playback_status = PlaybackStatus::Playing;
-        ctx.say("▶️ Resumed playback.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "▶️ Resume",
+            "Resumed playback.",
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     } else {
-        ctx.say("No track is currently paused.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "No track is currently paused.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
 
     Ok(())
@@ -605,8 +634,8 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
     player.announce_channel = ac;
     player.playback_status = PlaybackStatus::Stopped;
 
-    ctx.say("⏹️ Stopped playback and cleared the queue.")
-        .await?;
+    let embed = crate::discord::embeds::queue_stopped_embed();
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }
 
@@ -641,11 +670,15 @@ async fn process_vote_skip(
     if current_votes >= required_votes {
         Ok(true)
     } else {
-        ctx.say(format!(
-            "📥 Vote skip recorded! ({} / {} votes needed)",
-            current_votes, required_votes
-        ))
-        .await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "📥 Vote Skip",
+            &format!(
+                "Vote skip recorded! ({} / {} votes needed)",
+                current_votes, required_votes
+            ),
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         Ok(false)
     }
 }
@@ -673,19 +706,25 @@ async fn check_requester_absence(
                 Ok(true)
             } else {
                 let remaining = 60 - timer.elapsed().as_secs();
-                ctx.say(format!(
-                    "The original requester is not in the VC. Skip will unlock for everyone in {}s.",
-                    remaining
-                ))
-                .await?;
+                let embed = crate::discord::embeds::playback_status_embed(
+                    "⏳ Skip Timer",
+                    &format!(
+                        "The original requester is not in the VC. Skip will unlock for everyone in {}s.",
+                        remaining
+                    ),
+                    0xFEE75C,
+                );
+                ctx.send(poise::CreateReply::default().embed(embed)).await?;
                 Ok(false)
             }
         } else {
             player.requester_absence_timer = Some(std::time::Instant::now());
-            ctx.say(
+            let embed = crate::discord::embeds::playback_status_embed(
+                "⏳ Skip Timer",
                 "The original requester is not in the VC. A 60-second skip timer has been started.",
-            )
-            .await?;
+                0xFEE75C,
+            );
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
             Ok(false)
         }
     } else {
@@ -713,7 +752,12 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 
     let mut player = player_lock.write().await;
     if player.now_playing.is_none() {
-        ctx.say("Nothing is currently playing.").await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "Nothing is currently playing.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         return Ok(());
     }
 
@@ -733,7 +777,9 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
     };
 
     if approved {
-        ctx.say("⏭️ Skipping track...").await?;
+        let embed =
+            crate::discord::embeds::playback_status_embed("⏭️ Skip", "Skipping track...", 0x5865F2);
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
         player.skip_forced = true;
         if let Some(ref handle) = player.current_track_handle {
             let _ = handle.stop();

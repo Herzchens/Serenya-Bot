@@ -166,6 +166,16 @@ const VARIANTS: &[VariantRule] = &[
         penalty: 0.40,
         hard_reject_with_duration: false,
     },
+    VariantRule {
+        term: "official video",
+        penalty: 0.15,
+        hard_reject_with_duration: false,
+    },
+    VariantRule {
+        term: "music video",
+        penalty: 0.15,
+        hard_reject_with_duration: false,
+    },
 ];
 
 fn variant_requested(query_lower: &str, term: &str) -> bool {

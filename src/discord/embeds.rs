@@ -99,7 +99,11 @@ pub fn now_playing_embed(
         } else {
             format!("{} **{}**", provider_emoji, track.title)
         })
-        .field("Requested By", track.requester_name.as_deref().unwrap_or("Unknown"), true)
+        .field(
+            "Requested By",
+            track.requester_name.as_deref().unwrap_or("Unknown"),
+            true,
+        )
         .field("Duration", duration_str, true)
         .field("Source", track.clean_source(), true);
 
@@ -164,7 +168,11 @@ pub fn track_added_embed(
         } else {
             format!("{} **{}**", provider_emoji, track.title)
         })
-        .field("Requested By", track.requester_name.as_deref().unwrap_or("Unknown"), true)
+        .field(
+            "Requested By",
+            track.requester_name.as_deref().unwrap_or("Unknown"),
+            true,
+        )
         .field("Duration", duration_str, true)
         .field("Queue Position", format!("#{}", queue_pos), true)
         .field("Source", track.clean_source(), true)
@@ -272,4 +280,20 @@ pub fn error_embed(message: &str) -> serenity::CreateEmbed {
         .title("❌ Error")
         .description(message)
         .color(0xED4245)
+}
+
+/// Creates a queue stopped embed.
+pub fn queue_stopped_embed() -> serenity::CreateEmbed {
+    serenity::CreateEmbed::new()
+        .title("⏹️ Queue Stopped")
+        .description("Playback has been stopped and the queue has been cleared.")
+        .color(0xED4245)
+}
+
+/// Creates a generic playback status embed.
+pub fn playback_status_embed(title: &str, description: &str, color: u32) -> serenity::CreateEmbed {
+    serenity::CreateEmbed::new()
+        .title(title)
+        .description(description)
+        .color(color)
 }

@@ -105,7 +105,8 @@ async fn enqueue_selected_track(
             Some(selected_track.url.clone()),
             &resolved_url,
             eight_d_enabled,
-        ).await?;
+        )
+        .await?;
         let handle = call.play_input(source);
 
         let _ = handle.add_event(

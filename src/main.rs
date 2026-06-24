@@ -140,6 +140,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             data.guild_players.remove(&guild_id);
                             info!(guild_id = %guild_id, "Guild removed — cleaned up runtime state");
                         }
+                        serenity::FullEvent::Message { new_message } => {
+                            if !new_message.author.bot {
+                                let content = &new_message.content;
+                                let db = std::sync::Arc::clone(&data.database);
+                                let prefix = if let Some(guild_id) = new_message.guild_id {
+                                    db.get_guild_settings(guild_id.get()).await.prefix
+                                } else {
+                                    None
+                                }.unwrap_or_else(|| data.config().bot.prefix.clone());
+
+                                if content.starts_with(&prefix) {
+                                    let content_lower = content.to_lowercase();
+                                    let has_music_link = content_lower.contains("spotify.com")
+                                        || content_lower.contains("youtube.com")
+                                        || content_lower.contains("youtu.be")
+                                        || content_lower.contains("soundcloud.com")
+                                        || content_lower.contains("music.apple.com");
+
+                                    if has_music_link {
+                                        let http = ctx.http.clone();
+                                        let msg_id = new_message.id;
+                                        let channel_id = new_message.channel_id;
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                            let mut flags = serenity::MessageFlags::empty();
+                                            flags.insert(serenity::MessageFlags::SUPPRESS_EMBEDS);
+                                            let builder = serenity::EditMessage::new().flags(flags);
+                                            if let Err(e) = channel_id.edit_message(&http, msg_id, builder).await {
+                                                tracing::debug!("Failed to suppress embeds on user message: {:?}", e);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     Ok(())
@@ -186,7 +221,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     let sigterm_future = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap().recv().await;
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .unwrap()
+            .recv()
+            .await;
     };
     #[cfg(not(unix))]
     let sigterm_future = std::future::pending::<()>();
@@ -436,7 +474,9 @@ async fn handle_voice_state_update(
         Some(c) => c,
         None => {
             // If the bot has left the voice channel and queue is empty, remove player memory
-            if player.queue.is_empty() && player.playback_status == crate::core::PlaybackStatus::Idle {
+            if player.queue.is_empty()
+                && player.playback_status == crate::core::PlaybackStatus::Idle
+            {
                 drop(player);
                 data.guild_players.remove(&guild_id);
                 crate::audio::runtime::cleanup_guild(guild_id.get());

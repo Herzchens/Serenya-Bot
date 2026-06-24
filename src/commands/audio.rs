@@ -66,18 +66,31 @@ pub async fn eight_d(
                 .await
         {
             tracing::error!("Failed to apply 8D effect immediately via restart: {:?}", e);
-            ctx.say(format!(
-                "8D audio is now **{state}**, but failed to apply immediately. It will apply from the next track.",
-            ))
-            .await?;
+            let embed = crate::discord::embeds::playback_status_embed(
+                "🎧 8D Audio",
+                &format!(
+                    "8D audio is now **{state}**, but failed to apply immediately. It will apply from the next track."
+                ),
+                0xFEE75C,
+            );
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
         } else {
-            ctx.say(format!(
-                "8D audio is now **{state}** and has been applied to the current session."
-            ))
-            .await?;
+            let embed = crate::discord::embeds::playback_status_embed(
+                "🎧 8D Audio",
+                &format!(
+                    "8D audio is now **{state}** and has been applied to the current session."
+                ),
+                0x5865F2,
+            );
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
         }
     } else {
-        ctx.say(format!("8D audio is now **{state}**.")).await?;
+        let embed = crate::discord::embeds::playback_status_embed(
+            "🎧 8D Audio",
+            &format!("8D audio is now **{state}**."),
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
     }
     Ok(())
 }

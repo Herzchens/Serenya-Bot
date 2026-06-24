@@ -5,7 +5,12 @@ pub async fn solve_signature(decipher_js: &str, encrypted_sig: &str) -> Result<S
     if decipher_js.is_empty() {
         return Ok(encrypted_sig.to_string());
     }
-    run_js_function(decipher_js.to_string(), encrypted_sig.to_string(), "decipher".to_string()).await
+    run_js_function(
+        decipher_js.to_string(),
+        encrypted_sig.to_string(),
+        "decipher".to_string(),
+    )
+    .await
 }
 
 pub async fn solve_n_throttle(
@@ -27,7 +32,8 @@ pub async fn solve_n_throttle(
         return Ok(n_input.to_string());
     }
 
-    let n_output = run_js_function(ncode_js.clone(), n_input.to_string(), "ncode".to_string()).await?;
+    let n_output =
+        run_js_function(ncode_js.clone(), n_input.to_string(), "ncode".to_string()).await?;
     N_CACHE.insert(cache_key, n_output.clone()).await;
     Ok(n_output)
 }
@@ -109,7 +115,11 @@ async fn decode_signature_cipher(
     Ok(parsed_url.to_string())
 }
 
-async fn run_js_function(js_source: String, input: String, label: String) -> Result<String, String> {
+async fn run_js_function(
+    js_source: String,
+    input: String,
+    label: String,
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         use std::cell::RefCell;
         thread_local! {
@@ -131,7 +141,9 @@ async fn run_js_function(js_source: String, input: String, label: String) -> Res
                 .and_then(|js_str| js_str.to_std_string().ok())
                 .ok_or_else(|| format!("{label} function returned non-string value"))
         })
-    }).await.map_err(|e| format!("Task join error: {e}"))?
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
 }
 
 fn js_function_name(js_source: &str) -> Option<&str> {

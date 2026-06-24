@@ -178,7 +178,10 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
         .field("Title", title_val, false)
         .field(
             "Requested By",
-            format!("👤 **{}**", track.requester_name.as_deref().unwrap_or("Unknown")),
+            format!(
+                "👤 **{}**",
+                track.requester_name.as_deref().unwrap_or("Unknown")
+            ),
             true,
         )
         .field(

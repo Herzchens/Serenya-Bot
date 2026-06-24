@@ -31,8 +31,12 @@ pub async fn loop_cmd(
             "track" | "song" | "one" => LoopMode::Track,
             "queue" | "all" => LoopMode::Queue,
             _ => {
-                ctx.say("Invalid loop mode. Use 'off', 'track', or 'queue'.")
-                    .await?;
+                let embed = crate::discord::embeds::playback_status_embed(
+                    "❌ Error",
+                    "Invalid loop mode. Use 'off', 'track', or 'queue'.",
+                    0xED4245,
+                );
+                ctx.send(poise::CreateReply::default().embed(embed)).await?;
                 return Ok(());
             }
         }
@@ -46,12 +50,19 @@ pub async fn loop_cmd(
 
     player.loop_mode = next_mode;
 
-    let response = match player.loop_mode {
-        LoopMode::Off => "🔁 Loop mode is now **Off**.",
-        LoopMode::Track => "🔂 Loop mode is now **Track** (repeating current song).",
-        LoopMode::Queue => "🔁 Loop mode is now **Queue** (repeating entire queue).",
+    let (title, response) = match player.loop_mode {
+        LoopMode::Off => ("🔁 Loop Mode", "Loop mode is now **Off**."),
+        LoopMode::Track => (
+            "🔂 Loop Mode",
+            "Loop mode is now **Track** (repeating current song).",
+        ),
+        LoopMode::Queue => (
+            "🔁 Loop Mode",
+            "Loop mode is now **Queue** (repeating entire queue).",
+        ),
     };
 
-    ctx.say(response).await?;
+    let embed = crate::discord::embeds::playback_status_embed(title, response, 0x5865F2);
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
 }

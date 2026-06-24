@@ -238,7 +238,12 @@ pub fn play_next(
             if let Some(channel) = announce_channel {
                 let ctx_clone = serenity_ctx.clone();
                 tokio::spawn(async move {
-                    let _ = channel.say(&ctx_clone.http, "❌ Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.").await;
+                    let embed = crate::discord::embeds::error_embed(
+                        "Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.",
+                    );
+                    let _ = channel
+                        .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
+                        .await;
                 });
             }
             return Ok(());
@@ -263,7 +268,10 @@ pub fn play_next(
             if announce_setting && let Some(channel) = announce_channel {
                 let ctx_clone = serenity_ctx.clone();
                 tokio::spawn(async move {
-                    let _ = channel.say(&ctx_clone.http, "Queue finished. ⏹️").await;
+                    let embed = crate::discord::embeds::queue_finished_embed();
+                    let _ = channel
+                        .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
+                        .await;
                 });
             }
             return Ok(());
@@ -288,11 +296,9 @@ pub fn play_next(
 
         let resolved_res = match track.resolved_url.clone() {
             Some(url) => Ok(url),
-            None => {
-                crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &track.url)
-                    .await
-                    .map(std::sync::Arc::new)
-            }
+            None => crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &track.url)
+                .await
+                .map(std::sync::Arc::new),
         };
 
         let resolved = match resolved_res {
@@ -325,13 +331,18 @@ pub fn play_next(
                     let ctx_clone = serenity_ctx.clone();
                     let title_clone = track.title.clone();
                     tokio::spawn(async move {
+                        let embed = crate::discord::embeds::playback_status_embed(
+                            "⚠️ Warning",
+                            &format!(
+                                "Could not resolve **{}**. Trying the next track.",
+                                title_clone
+                            ),
+                            0xFEE75C,
+                        );
                         let _ = channel
-                            .say(
+                            .send_message(
                                 &ctx_clone.http,
-                                format!(
-                                    "⚠️ Could not resolve **{}**. Trying the next track.",
-                                    title_clone
-                                ),
+                                serenity::CreateMessage::new().embed(embed),
                             )
                             .await;
                     });
@@ -382,7 +393,8 @@ pub fn play_next(
             Some(track.url.clone()),
             &resolved,
             eight_d_enabled,
-        ).await?;
+        )
+        .await?;
 
         let handle = {
             let mut call = call_lock.lock().await;
@@ -437,7 +449,7 @@ pub fn play_next(
                         && current_handle.uuid() == track_uuid
                     {
                         player.consecutive_errors = 0;
-                        tracing::info!(
+                        tracing::debug!(
                             "Reset consecutive errors to 0 after 5 seconds of successful playback"
                         );
                     }
@@ -551,7 +563,7 @@ pub async fn trigger_prefetch(
         None => return,
     };
 
-    tracing::info!(guild_id = %guild_id, "Prefetching stream URL for: {}", url_to_resolve);
+    tracing::debug!(guild_id = %guild_id, "Prefetching stream URL for: {}", url_to_resolve);
 
     match crate::audio::source::prefetch_stream_url_for_guild(guild_id.get(), &url_to_resolve).await
     {
@@ -561,7 +573,7 @@ pub async fn trigger_prefetch(
                 && track.url == url_to_resolve
             {
                 track.resolved_url = Some(std::sync::Arc::new(resolved_url));
-                tracing::info!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+                tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
             }
         }
         Ok(None) => {}
@@ -588,7 +600,7 @@ pub fn schedule_prefetch(
             let settings = crate::audio::runtime::settings();
             let limit = Duration::from_secs(settings.prefetch_when_remaining_seconds).min(dur / 10);
             let delay = dur.saturating_sub(limit);
-            tracing::info!(guild_id = %guild_id, "Scheduling fallback prefetch in {:?}", delay);
+            tracing::debug!(guild_id = %guild_id, "Scheduling fallback prefetch in {:?}", delay);
             tokio::time::sleep(delay).await;
         } else {
             // If duration is unknown, wait 5 seconds and prefetch

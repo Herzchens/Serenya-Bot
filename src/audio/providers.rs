@@ -1476,36 +1476,36 @@ pub async fn get_or_fetch_client_id(http_client: &reqwest::Client) -> Result<Str
         }
     }
 
-        tracing::info!("SoundCloud client_id is expired or None, fetching fresh one...");
-        let url = "https://soundcloud.com";
-        let res = http_client.get(url)
+    tracing::info!("SoundCloud client_id is expired or None, fetching fresh one...");
+    let url = "https://soundcloud.com";
+    let res = http_client.get(url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
             .send()
             .await
             .map_err(|e| SerenyaError::Audio(format!("Failed to fetch SoundCloud homepage for client_id: {}", e)))?;
 
-        let html = res.text().await.map_err(|e| {
-            SerenyaError::Audio(format!("Failed to read SoundCloud homepage body: {}", e))
-        })?;
+    let html = res.text().await.map_err(|e| {
+        SerenyaError::Audio(format!("Failed to read SoundCloud homepage body: {}", e))
+    })?;
 
-        let client_id = if let Some(cap) = regex_extract_client_id(&html) {
-            cap
-        } else {
-            return Err(SerenyaError::Audio(
-                "Failed to extract client_id from SoundCloud hydration data".to_owned(),
-            ));
-        };
+    let client_id = if let Some(cap) = regex_extract_client_id(&html) {
+        cap
+    } else {
+        return Err(SerenyaError::Audio(
+            "Failed to extract client_id from SoundCloud hydration data".to_owned(),
+        ));
+    };
 
-        tracing::info!(
-            "Successfully extracted new SoundCloud client_id: {}",
-            client_id
-        );
-        let mut write_guard = SOUNDCLOUD_STATE.write().await;
-        *write_guard = Some(ClientIdState {
-            client_id: client_id.clone(),
-            obtained_at: Instant::now(),
-        });
-        Ok(client_id)
+    tracing::info!(
+        "Successfully extracted new SoundCloud client_id: {}",
+        client_id
+    );
+    let mut write_guard = SOUNDCLOUD_STATE.write().await;
+    *write_guard = Some(ClientIdState {
+        client_id: client_id.clone(),
+        obtained_at: Instant::now(),
+    });
+    Ok(client_id)
 }
 
 fn regex_extract_client_id(html: &str) -> Option<String> {

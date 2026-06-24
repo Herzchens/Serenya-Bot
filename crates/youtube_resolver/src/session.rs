@@ -1,9 +1,10 @@
 use crate::{ResolveError, SessionData};
-use tokio::sync::Mutex;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
-static SESSION_CACHE: LazyLock<Mutex<Option<(SessionData, Instant)>>> = LazyLock::new(|| Mutex::new(None));
+static SESSION_CACHE: LazyLock<Mutex<Option<(SessionData, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 pub async fn get_or_fetch_session(
     http_client: &reqwest::Client,

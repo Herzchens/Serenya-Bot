@@ -1,7 +1,7 @@
+use arc_swap::{ArcSwap, ArcSwapOption};
 use std::process::Output;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
-use arc_swap::{ArcSwap, ArcSwapOption};
 
 use dashmap::DashMap;
 use moka::future::Cache;
@@ -32,7 +32,9 @@ impl ResolverRuntime {
         let settings = ResolverSection::default();
         Self {
             ytdlp_semaphore: RwLock::new(Arc::new(Semaphore::new(settings.max_concurrent_ytdlp))),
-            soundcloud_semaphore: RwLock::new(Arc::new(Semaphore::new(settings.max_concurrent_soundcloud))),
+            soundcloud_semaphore: RwLock::new(Arc::new(Semaphore::new(
+                settings.max_concurrent_soundcloud,
+            ))),
             guild_resolve_semaphores: DashMap::new(),
             negative_cache: Cache::builder()
                 .max_capacity(4096)
@@ -49,7 +51,9 @@ static RESOLVER_RUNTIME: LazyLock<ResolverRuntime> = LazyLock::new(ResolverRunti
 
 pub fn configure(settings: &ResolverSection, spotify: &crate::config::SpotifySection) {
     RESOLVER_RUNTIME.settings.store(Arc::new(settings.clone()));
-    RESOLVER_RUNTIME.spotify_settings.store(Some(Arc::new(spotify.clone())));
+    RESOLVER_RUNTIME
+        .spotify_settings
+        .store(Some(Arc::new(spotify.clone())));
     if let Ok(mut semaphore) = RESOLVER_RUNTIME.ytdlp_semaphore.write() {
         *semaphore = Arc::new(Semaphore::new(settings.max_concurrent_ytdlp));
     }
@@ -79,8 +83,6 @@ pub fn yt_dlp_timeout() -> Duration {
     Duration::from_secs(settings().yt_dlp_timeout_seconds.max(1))
 }
 
-
-
 pub fn prefetch_timeout() -> Duration {
     Duration::from_secs(settings().prefetch_timeout_seconds.max(1))
 }
@@ -100,7 +102,11 @@ fn guild_resolve_semaphore(guild_id: u64) -> Arc<Semaphore> {
     RESOLVER_RUNTIME
         .guild_resolve_semaphores
         .entry(guild_id)
-        .or_insert_with(|| Arc::new(Semaphore::new(settings().max_concurrent_resolves_per_guild.max(1))))
+        .or_insert_with(|| {
+            Arc::new(Semaphore::new(
+                settings().max_concurrent_resolves_per_guild.max(1),
+            ))
+        })
         .clone()
 }
 
@@ -252,9 +258,7 @@ fn clear_youtube_degraded_if_expired() {
 }
 
 pub async fn remember_negative(key: String, reason: String) {
-    let entry = NegativeCacheEntry {
-        reason,
-    };
+    let entry = NegativeCacheEntry { reason };
     RESOLVER_RUNTIME.negative_cache.insert(key, entry).await;
 }
 
