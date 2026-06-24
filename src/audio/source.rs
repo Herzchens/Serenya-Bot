@@ -108,7 +108,10 @@ pub async fn cache_invalidate_stream(url: &str) {
 }
 
 pub async fn cache_set_stream(url: String, stream: &youtube_resolver::ResolvedStream) {
-    STREAM_CACHE.load().insert(url, Arc::new(stream.clone())).await;
+    STREAM_CACHE
+        .load()
+        .insert(url, Arc::new(stream.clone()))
+        .await;
 }
 
 fn url_encode(s: &str) -> String {
@@ -156,15 +159,24 @@ fn extract_youtube_video_id(url: &str) -> Option<&str> {
         Some(&rest[..end])
     } else if let Some(pos) = url.find("/shorts/") {
         let rest = &url[pos + 8..];
-        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
+        let end = rest
+            .find('?')
+            .or_else(|| rest.find('/'))
+            .unwrap_or(rest.len());
         Some(&rest[..end])
     } else if let Some(pos) = url.find("/live/") {
         let rest = &url[pos + 6..];
-        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
+        let end = rest
+            .find('?')
+            .or_else(|| rest.find('/'))
+            .unwrap_or(rest.len());
         Some(&rest[..end])
     } else if let Some(pos) = url.find("/embed/") {
         let rest = &url[pos + 7..];
-        let end = rest.find('?').or_else(|| rest.find('/')).unwrap_or(rest.len());
+        let end = rest
+            .find('?')
+            .or_else(|| rest.find('/'))
+            .unwrap_or(rest.len());
         Some(&rest[..end])
     } else {
         None
@@ -334,11 +346,9 @@ fn build_soundcloud_stream_cache() -> Cache<String, Arc<youtube_resolver::Resolv
         .build()
 }
 
-static SOUNDCLOUD_STREAM_CACHE: LazyLock<ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>> = LazyLock::new(|| {
-    ArcSwap::from_pointee(build_soundcloud_stream_cache())
-});
-
-
+static SOUNDCLOUD_STREAM_CACHE: LazyLock<
+    ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>,
+> = LazyLock::new(|| ArcSwap::from_pointee(build_soundcloud_stream_cache()));
 
 async fn resolve_soundcloud_stream_url(
     track_url: &str,
@@ -638,10 +648,11 @@ async fn resolve_youtube_stream_native(
         let ctx = youtube_resolver::ResolveContext::default();
         let resolver_future = youtube_resolver::resolve_best_audio_stream(video_id, &ctx);
         let timeout_duration = crate::audio::runtime::duration_from_millis(
-            crate::audio::runtime::settings().youtube_timeout_ms,
+            crate::audio::runtime::settings()
+                .youtube_timeout_ms
+                .max(10000),
         );
-        if let Ok(Ok(stream)) = tokio::time::timeout(timeout_duration, resolver_future).await
-        {
+        if let Ok(Ok(stream)) = tokio::time::timeout(timeout_duration, resolver_future).await {
             if is_direct_stream_url(&stream.url) {
                 tracing::debug!(track_url, stream_url = %stream.url, "youtube_resolver resolved direct stream");
                 return Some(stream);

@@ -27,7 +27,7 @@ pub async fn resolve_best_audio_stream_via_api(
     context: &ResolveContext,
 ) -> Result<ResolvedStream, ResolveError> {
     let http_client = &context.http_client;
-    let player_url = get_or_fetch_session(&http_client).await?.player_url;
+    let player_url = get_or_fetch_session(http_client).await?.player_url;
     let clients = vec![
         create_android_vr_client(),
         create_web_safari_client(),
@@ -44,7 +44,7 @@ pub async fn resolve_best_audio_stream_via_api(
             video_id,
             "Attempting to resolve stream with client"
         );
-        match try_client(&http_client, &player_url, &client, video_id, context).await {
+        match try_client(http_client, &player_url, &client, video_id, context).await {
             Ok(stream) => return Ok(stream),
             Err(err) => last_err = err,
         }

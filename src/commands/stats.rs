@@ -52,10 +52,11 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
     let mut queue_size = 0;
     let mut listeners = 0;
 
-    let player_lock_opt = match ctx.data().guild_players.get(&guild_id) {
-        Some(p) => Some(p.value().clone()),
-        None => None,
-    };
+    let player_lock_opt = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|p| p.value().clone());
 
     if let Some(player_lock) = player_lock_opt {
         let player = player_lock.read().await;

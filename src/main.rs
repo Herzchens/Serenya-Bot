@@ -140,38 +140,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             data.guild_players.remove(&guild_id);
                             info!(guild_id = %guild_id, "Guild removed — cleaned up runtime state");
                         }
-                        serenity::FullEvent::Message { new_message } => {
-                            if !new_message.author.bot {
-                                let content = &new_message.content;
-                                let db = std::sync::Arc::clone(&data.database);
-                                let prefix = if let Some(guild_id) = new_message.guild_id {
-                                    db.get_guild_settings(guild_id.get()).await.prefix
-                                } else {
-                                    None
-                                }.unwrap_or_else(|| data.config().bot.prefix.clone());
+                        serenity::FullEvent::Message { new_message } if !new_message.author.bot => {
+                            let content = &new_message.content;
+                            let db = std::sync::Arc::clone(&data.database);
+                            let prefix = if let Some(guild_id) = new_message.guild_id {
+                                db.get_guild_settings(guild_id.get()).await.prefix
+                            } else {
+                                None
+                            }
+                            .unwrap_or_else(|| data.config().bot.prefix.clone());
 
-                                if content.starts_with(&prefix) {
-                                    let content_lower = content.to_lowercase();
-                                    let has_music_link = content_lower.contains("spotify.com")
-                                        || content_lower.contains("youtube.com")
-                                        || content_lower.contains("youtu.be")
-                                        || content_lower.contains("soundcloud.com")
-                                        || content_lower.contains("music.apple.com");
+                            if content.starts_with(&prefix) {
+                                let content_lower = content.to_lowercase();
+                                let has_music_link = content_lower.contains("spotify.com")
+                                    || content_lower.contains("youtube.com")
+                                    || content_lower.contains("youtu.be")
+                                    || content_lower.contains("soundcloud.com")
+                                    || content_lower.contains("music.apple.com");
 
-                                    if has_music_link {
-                                        let http = ctx.http.clone();
-                                        let msg_id = new_message.id;
-                                        let channel_id = new_message.channel_id;
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                            let mut flags = serenity::MessageFlags::empty();
-                                            flags.insert(serenity::MessageFlags::SUPPRESS_EMBEDS);
-                                            let builder = serenity::EditMessage::new().flags(flags);
-                                            if let Err(e) = channel_id.edit_message(&http, msg_id, builder).await {
-                                                tracing::debug!("Failed to suppress embeds on user message: {:?}", e);
-                                            }
-                                        });
-                                    }
+                                if has_music_link {
+                                    let http = ctx.http.clone();
+                                    let msg_id = new_message.id;
+                                    let channel_id = new_message.channel_id;
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        let mut flags = serenity::MessageFlags::empty();
+                                        flags.insert(serenity::MessageFlags::SUPPRESS_EMBEDS);
+                                        let builder = serenity::EditMessage::new().flags(flags);
+                                        if let Err(e) =
+                                            channel_id.edit_message(&http, msg_id, builder).await
+                                        {
+                                            tracing::debug!(
+                                                "Failed to suppress embeds on user message: {:?}",
+                                                e
+                                            );
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -534,15 +538,13 @@ async fn handle_voice_state_update(
             let announce_channel = player.announce_channel;
             drop(player); // Release the write lock before sending HTTP request
 
-            if should_announce {
-                if let Some(ch) = announce_channel {
-                    let embed = serenity::CreateEmbed::new()
-                            .description("Không có ai trong room nên âm nhạc sẽ tạm dừng `s.resume` để tiếp tục từ chỗ đã stop")
-                            .color(0x5865F2);
-                    let _ = ch
-                        .send_message(&ctx.http, serenity::CreateMessage::new().embed(embed))
-                        .await;
-                }
+            if should_announce && let Some(ch) = announce_channel {
+                let embed = serenity::CreateEmbed::new()
+                    .description("Không có ai trong room nên âm nhạc sẽ tạm dừng `s.resume` để tiếp tục từ chỗ đã stop")
+                    .color(0x5865F2);
+                let _ = ch
+                    .send_message(&ctx.http, serenity::CreateMessage::new().embed(embed))
+                    .await;
             }
         }
     } else {

@@ -23,12 +23,11 @@ pub fn register_secret_to_redact(secret: &str) {
 }
 
 pub fn redact_secrets(input: &str) -> String {
-    if let Some(redactor_mutex) = REDACTOR.get() {
-        if let Ok(guard) = redactor_mutex.lock() {
-            if let Some(ac) = guard.as_ref() {
-                return ac.replace_all(input, &vec!["[REDACTED]"; ac.patterns_len()]);
-            }
-        }
+    if let Some(redactor_mutex) = REDACTOR.get()
+        && let Ok(guard) = redactor_mutex.lock()
+        && let Some(ac) = guard.as_ref()
+    {
+        return ac.replace_all(input, &vec!["[REDACTED]"; ac.patterns_len()]);
     }
     input.to_owned()
 }
