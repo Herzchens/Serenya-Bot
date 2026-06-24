@@ -340,27 +340,15 @@ The Spotify integration test needs stable network access and valid Spotify confi
 - Disable providers you do not need on weak networks or small VPS instances.
 - Check DNS and outbound HTTPS connectivity.
 
-## Development Notes
-
-- Do not commit `config.yml`, `database.yml`, `document/`, or `rule.md`.
-- Do not log secrets.
-- Prefer small modules with clear ownership.
-- Do not block the Tokio runtime.
-- Do not use `unwrap`, `expect`, or `panic` in production paths.
-- Use Conventional Commits, for example `feat(youtube): add stream probe`.
-
 ## Thanks And References
 
-Serenya builds on ideas and libraries from the Rust, Discord, and audio communities:
+Serenya builds on ideas, algorithms, and libraries from the Rust, Discord, and audio communities:
 
-- Thanks to the child/fork repository [Herzchens/rusty_ytdl](https://github.com/Herzchens/rusty_ytdl). The workspace crate `crates/rusty-ytdl` is an important foundation for YouTube parsing and Rust-side resolver work.
-- Thanks to [yt-dlp](https://github.com/yt-dlp/yt-dlp) for public research into YouTube extraction, signature deciphering, and edge cases.
-- Thanks to `serenity`, `poise`, `songbird`, `tokio`, `reqwest`, `boa_engine`, `moka`, `tracing`, and the Rust community.
-- Thanks to the public provider documentation and behavior that helped validate metadata flows for Spotify, Deezer, Apple Music, SoundCloud, YouTube, and YouTube Music.
-
-## Citations
-- Aho-Corasick Algorithm for O(N) multi-pattern matching used in log redaction: [aho-corasick](https://crates.io/crates/aho-corasick).
-- ArcSwap pattern used for atomic fast RCU (Read-Copy-Update) on global settings: [arc-swap](https://crates.io/crates/arc-swap).
+- **rusty-ytdl**: Special thanks to the child/fork repository [Herzchens/rusty_ytdl](https://github.com/Herzchens/rusty_ytdl). The workspace crate `crates/rusty-ytdl` is an important foundation for YouTube parsing.
+- **yt-dlp**: Thanks to the [yt-dlp](https://github.com/yt-dlp/yt-dlp) project for public research into YouTube stream extraction, signature deciphering, and player cipher edge cases.
+- **Aho-Corasick**: The [aho-corasick](https://crates.io/crates/aho-corasick) algorithm is used for optimal \(O(N)\) multi-pattern log redaction.
+- **ArcSwap**: The [arc-swap](https://crates.io/crates/arc-swap) utility is used for lock-free fast RCU (Read-Copy-Update) configuration updates.
+- Thanks to the developers of `serenity`, `poise`, `songbird`, `tokio`, `reqwest`, `boa_engine`, `moka`, and `tracing`.
 
 ## License
 
