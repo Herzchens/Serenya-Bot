@@ -226,7 +226,7 @@ pub(crate) async fn enqueue_and_play_resolved(
 
             // 1. Resolve stream URL in background
             let stream_res =
-                crate::audio::extract_stream_url_for_guild(guild_id.get(), &current_track.url)
+                crate::audio::extract_stream_url_for_guild(guild_id.get(), &current_track.url, &http_client_clone)
                     .await;
 
             // 2. Race condition check: check if player was reset/stopped/skipped while resolving
@@ -289,12 +289,14 @@ pub(crate) async fn enqueue_and_play_resolved(
                     }
 
                     if let Err(next_err) = crate::audio::events::play_next(
-                        guild_id,
-                        std::sync::Arc::clone(&database_clone),
-                        std::sync::Arc::clone(&guild_players_clone),
-                        http_client_clone.clone(),
-                        serenity_ctx_clone.clone(),
-                        config_clone.clone(),
+                        crate::audio::events::PlaybackContext {
+                            guild_id,
+                            database: std::sync::Arc::clone(&database_clone),
+                            guild_players: std::sync::Arc::clone(&guild_players_clone),
+                            http_client: http_client_clone.clone(),
+                            serenity_ctx: serenity_ctx_clone.clone(),
+                            config: config_clone.clone(),
+                        },
                         None,
                         true,
                     )
@@ -785,12 +787,14 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
         } else {
             drop(player);
             crate::audio::events::play_next(
-                guild_id,
-                std::sync::Arc::clone(&ctx.data().database),
-                std::sync::Arc::clone(&ctx.data().guild_players),
-                ctx.data().http_client.clone(),
-                ctx.serenity_context().clone(),
-                ctx.data().config(),
+                crate::audio::events::PlaybackContext {
+                    guild_id,
+                    database: std::sync::Arc::clone(&ctx.data().database),
+                    guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                    http_client: ctx.data().http_client.clone(),
+                    serenity_ctx: ctx.serenity_context().clone(),
+                    config: ctx.data().config(),
+                },
                 None,
                 true,
             )

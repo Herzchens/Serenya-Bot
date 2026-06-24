@@ -27,7 +27,7 @@ pub(crate) async fn seek_by_restart(
     let stream = match resolved_url {
         Some(stream) => stream,
         None => std::sync::Arc::new(
-            crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url).await?,
+            crate::audio::source::extract_stream_url_for_guild(guild_id.get(), &url, &ctx.data().http_client).await?,
         ),
     };
 
@@ -291,12 +291,14 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
         player.queue.push_front(prev);
         drop(player);
         crate::audio::events::play_next(
-            guild_id,
-            std::sync::Arc::clone(&ctx.data().database),
-            std::sync::Arc::clone(&ctx.data().guild_players),
-            ctx.data().http_client.clone(),
-            ctx.serenity_context().clone(),
-            ctx.data().config(),
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
             None,
             true,
         )
@@ -357,12 +359,14 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
     } else {
         drop(player);
         crate::audio::events::play_next(
-            guild_id,
-            std::sync::Arc::clone(&ctx.data().database),
-            std::sync::Arc::clone(&ctx.data().guild_players),
-            ctx.data().http_client.clone(),
-            ctx.serenity_context().clone(),
-            ctx.data().config(),
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
             None,
             true,
         )
@@ -440,12 +444,14 @@ pub async fn jump(
     } else {
         drop(player);
         crate::audio::events::play_next(
-            guild_id,
-            std::sync::Arc::clone(&ctx.data().database),
-            std::sync::Arc::clone(&ctx.data().guild_players),
-            ctx.data().http_client.clone(),
-            ctx.serenity_context().clone(),
-            ctx.data().config(),
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
             None,
             true,
         )

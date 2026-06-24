@@ -98,7 +98,7 @@ async fn enqueue_selected_track(
             .get(guild_id)
             .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel.".into()))?;
         let resolved_url =
-            crate::audio::extract_stream_url_for_guild(guild_id.get(), &selected_track.url).await?;
+            crate::audio::extract_stream_url_for_guild(guild_id.get(), &selected_track.url, &ctx.data().http_client).await?;
         let eight_d_enabled = player.eight_d_enabled;
         let mut call = call_lock.lock().await;
         let source = crate::audio::source::create_stream_input(

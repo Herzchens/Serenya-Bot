@@ -204,12 +204,11 @@ async fn fail_and_maybe_advance(
         });
     }
 
-    // Call play_next again to try the next track!
     let ctx_clone = ctx.clone();
     tokio::spawn(async move {
-        if let Err(next_err) = play_next(ctx_clone, None, true).await {
+        if let Err(next_err) = play_next(ctx_clone.clone(), None, true).await {
             tracing::error!(
-                guild_id = %ctx.guild_id,
+                guild_id = %ctx_clone.guild_id,
                 "Failed to continue in play_next after stream resolution error: {:?}",
                 next_err
             );

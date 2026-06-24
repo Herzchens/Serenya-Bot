@@ -43,26 +43,7 @@ static METADATA_CACHE: LazyLock<ArcSwap<Cache<String, Track>>> =
 static STREAM_CACHE: LazyLock<ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>> =
     LazyLock::new(|| ArcSwap::from_pointee(build_stream_cache()));
 
-/// Shared HTTP client for internal network calls (Invidious, Piped, OEmbed, etc.).
-/// Avoids creating a new TLS session per track resolve — reuses connection pool.
-static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    match reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(15))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(16)
-        .tcp_keepalive(Duration::from_secs(60))
-        .gzip(true)
-        .brotli(true)
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            tracing::error!(%err, "failed to build shared reqwest client; using default client");
-            reqwest::Client::new()
-        }
-    }
-});
+
 
 pub async fn cache_get_metadata(query: &str) -> Option<Track> {
     let cache = QUERY_CACHE.load();
@@ -249,14 +230,16 @@ async fn resolve_via_invidious_or_piped(
 pub async fn extract_stream_url_for_guild(
     guild_id: u64,
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     let _guild_permit = crate::audio::runtime::acquire_guild_resolve(guild_id).await?;
-    extract_stream_url_inner(track_url).await
+    extract_stream_url_inner(track_url, http_client).await
 }
 
 pub async fn prefetch_stream_url_for_guild(
     guild_id: u64,
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Result<Option<youtube_resolver::ResolvedStream>, SerenyaError> {
     if is_youtube_url(track_url) && crate::audio::runtime::is_youtube_degraded() {
         tracing::info!(
@@ -275,7 +258,7 @@ pub async fn prefetch_stream_url_for_guild(
     };
 
     let timeout = crate::audio::runtime::prefetch_timeout();
-    match tokio::time::timeout(timeout, extract_stream_url_inner(track_url)).await {
+    match tokio::time::timeout(timeout, extract_stream_url_inner(track_url, http_client)).await {
         Ok(result) => result.map(Some),
         Err(_) => Err(SerenyaError::Audio(format!(
             "prefetch stream resolution timed out after {timeout:?}"
@@ -352,6 +335,7 @@ static SOUNDCLOUD_STREAM_CACHE: LazyLock<
 
 async fn resolve_soundcloud_stream_url(
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     // 1. Check cache
     if let Some(stream) = SOUNDCLOUD_STREAM_CACHE.load().get(track_url).await {
@@ -364,7 +348,7 @@ async fn resolve_soundcloud_stream_url(
     tracing::info!(track_url, "Resolving SoundCloud stream URL natively...");
 
     // 3. Resolve URL to track metadata with retry and exponential backoff
-    let metadata = fetch_track_metadata_with_backoff(track_url).await?;
+    let metadata = fetch_track_metadata_with_backoff(track_url, http_client).await?;
 
     // 4. Select the best transcoding
     let media = metadata.media.ok_or_else(|| {
@@ -379,7 +363,7 @@ async fn resolve_soundcloud_stream_url(
     tracing::debug!(transcoding_url, "Selected SoundCloud transcoding");
 
     // 5. Query transcoding URL to get direct playable URL
-    let stream_url = fetch_stream_url_with_backoff(&transcoding_url).await?;
+    let stream_url = fetch_stream_url_with_backoff(&transcoding_url, http_client).await?;
 
     let stream = youtube_resolver::ResolvedStream {
         url: stream_url,
@@ -445,10 +429,11 @@ fn select_best_transcoding(
 
 async fn fetch_track_metadata_with_backoff(
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Result<crate::audio::providers::SoundCloudTrackMetadata, SerenyaError> {
     let mut final_url = track_url.to_owned();
     if track_url.contains("on.soundcloud.com/")
-        && let Ok(res) = HTTP_CLIENT.head(track_url)
+        && let Ok(res) = http_client.head(track_url)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36")
             .send()
             .await
@@ -462,7 +447,7 @@ async fn fetch_track_metadata_with_backoff(
     let url_enc = crate::audio::providers::url_encode(&final_url);
 
     loop {
-        let res = crate::audio::providers::send_soundcloud_request(&HTTP_CLIENT, |cid| {
+        let res = crate::audio::providers::send_soundcloud_request(http_client, |cid| {
             format!(
                 "https://api-v2.soundcloud.com/resolve?url={}&client_id={}",
                 url_enc, cid
@@ -511,12 +496,15 @@ async fn fetch_track_metadata_with_backoff(
     }
 }
 
-async fn fetch_stream_url_with_backoff(transcoding_url: &str) -> Result<String, SerenyaError> {
+async fn fetch_stream_url_with_backoff(
+    transcoding_url: &str,
+    http_client: &reqwest::Client,
+) -> Result<String, SerenyaError> {
     let mut attempt = 0;
     let max_attempts = 3;
 
     loop {
-        let res = crate::audio::providers::send_soundcloud_request(&HTTP_CLIENT, |cid| {
+        let res = crate::audio::providers::send_soundcloud_request(http_client, |cid| {
             format!("{}?client_id={}", transcoding_url, cid)
         })
         .await;
@@ -576,6 +564,7 @@ fn calculate_backoff(attempt: u32) -> Duration {
 
 async fn extract_stream_url_inner(
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     if let Some(stream) = cache_get_stream(track_url).await {
         tracing::debug!(track_url, stream_url = %stream.url, "stream cache hit");
@@ -594,7 +583,7 @@ async fn extract_stream_url_inner(
     let youtube_url = is_youtube_url(track_url);
 
     if youtube_url {
-        if let Some(stream) = resolve_youtube_stream_native(track_url).await {
+        if let Some(stream) = resolve_youtube_stream_native(track_url, http_client).await {
             tracing::info!(track_url, stream_url = %stream.url, "native stream resolution succeeded");
             cache_set_stream(track_url.to_owned(), &stream).await;
             return Ok(stream);
@@ -610,7 +599,7 @@ async fn extract_stream_url_inner(
     }
 
     if track_url.contains("soundcloud.com/") {
-        match resolve_soundcloud_stream_url(track_url).await {
+        match resolve_soundcloud_stream_url(track_url, http_client).await {
             Ok(stream) => {
                 cache_set_stream(track_url.to_owned(), &stream).await;
                 return Ok(stream);
@@ -641,11 +630,15 @@ fn is_direct_stream_url(url: &str) -> bool {
 
 async fn resolve_youtube_stream_native(
     track_url: &str,
+    http_client: &reqwest::Client,
 ) -> Option<youtube_resolver::ResolvedStream> {
     let video_id_opt = extract_youtube_video_id(track_url);
     // 1. Try our custom youtube_resolver (direct Google stream via ANDROID/IOS mobile clients)
     if let Some(video_id) = video_id_opt {
-        let ctx = youtube_resolver::ResolveContext::default();
+        let ctx = youtube_resolver::ResolveContext {
+            http_client: http_client.clone(),
+            ..Default::default()
+        };
         let resolver_future = youtube_resolver::resolve_best_audio_stream(video_id, &ctx);
         let timeout_duration = crate::audio::runtime::duration_from_millis(
             crate::audio::runtime::settings()
@@ -668,7 +661,7 @@ async fn resolve_youtube_stream_native(
 
     // 2. Fallback to Invidious/Piped Proxy
     if let Some(video_id) = video_id_opt
-        && let Some(url) = resolve_via_invidious_or_piped(video_id, &HTTP_CLIENT).await
+        && let Some(url) = resolve_via_invidious_or_piped(video_id, http_client).await
     {
         if is_direct_stream_url(&url) {
             tracing::debug!(track_url, stream_url = %url, "invidious/piped resolved direct stream");

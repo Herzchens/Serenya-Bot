@@ -139,14 +139,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         serenity::FullEvent::Message { new_message } if !new_message.author.bot => {
                             let content = &new_message.content;
-                            let default_prefix = data.config().bot.prefix.as_str();
+                            let config = data.config();
+                            let default_prefix = config.bot.prefix.as_str();
                             let prefix = if let Some(guild_id) = new_message.guild_id {
                                 data.database.get_guild_prefix(guild_id.get(), default_prefix)
                             } else {
                                 std::sync::Arc::from(default_prefix)
                             };
 
-                            if content.starts_with(&prefix) {
+                            if content.starts_with(prefix.as_ref()) {
                                 let content_lower = content.to_lowercase();
                                 let has_music_link = content_lower.contains("spotify.com")
                                     || content_lower.contains("youtube.com")

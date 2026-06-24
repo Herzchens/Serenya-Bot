@@ -2263,7 +2263,7 @@ mod tests {
             );
 
             let stream =
-                crate::audio::source::extract_stream_url_for_guild(9_001, &track.url).await?;
+                crate::audio::source::extract_stream_url_for_guild(9_001, &track.url, &http_client).await?;
             assert!(
                 stream.url.contains("googlevideo.com")
                     || stream.url.contains("googleusercontent.com"),
