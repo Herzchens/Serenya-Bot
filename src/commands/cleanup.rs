@@ -29,8 +29,9 @@ async fn check_cleanup_permissions(ctx: Context<'_>) -> Result<bool, Error> {
 #[poise::command(slash_command, prefix_command, rename = "cleanup", aliases("clean"))]
 pub async fn cleanup(
     ctx: Context<'_>,
-    #[description = "Number of messages to scan (default: scan all up to 2000)"]
+    #[description = "Number of messages to scan (default: 100)"]
     #[min = 1]
+    #[max = 2000]
     amount: Option<u32>,
 ) -> Result<(), Error> {
     check_cleanup_permissions(ctx).await?;
@@ -44,7 +45,7 @@ pub async fn cleanup(
         let mut messages = Vec::new();
         let mut before_id = None;
 
-        let limit_to_scan = amount.unwrap_or(2000);
+        let limit_to_scan = amount.unwrap_or(100);
         let mut remaining = limit_to_scan;
 
         while remaining > 0 {
