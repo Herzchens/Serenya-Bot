@@ -6,11 +6,11 @@ pub struct Track {
     pub url: String,
     pub duration: Option<std::time::Duration>,
     pub requester_id: serenity::UserId,
-    pub requester_name: Option<String>,
+    pub requester_name: Option<std::sync::Arc<str>>,
     pub source_type: SourceType,
     pub resolved_url: Option<std::sync::Arc<youtube_resolver::ResolvedStream>>,
     pub thumbnail: Option<std::sync::Arc<str>>,
-    pub source_provider: String,
+    pub source_provider: std::sync::Arc<str>,
 }
 
 impl Track {

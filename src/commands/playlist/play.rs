@@ -40,6 +40,8 @@ pub async fn play(
         return Ok(());
     }
 
+    let req_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
+    let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Playlist");
     let mut tracks = Vec::new();
     for t in playlist.tracks {
         tracks.push(Track {
@@ -47,11 +49,11 @@ pub async fn play(
             url: t.url,
             duration: t.duration_secs.map(std::time::Duration::from_secs),
             requester_id: ctx.author().id,
-            requester_name: Some(ctx.author().name.clone()),
+            requester_name: Some(req_name.clone()),
             source_type: crate::core::SourceType::Playlist,
             resolved_url: None,
             thumbnail: None,
-            source_provider: "Playlist".to_owned(),
+            source_provider: source_prov.clone(),
         });
     }
 

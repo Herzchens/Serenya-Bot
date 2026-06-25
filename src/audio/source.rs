@@ -9,7 +9,7 @@ use std::time::Duration;
 
 fn build_query_cache() -> Cache<String, Track> {
     Cache::builder()
-        .max_capacity(2048)
+        .max_capacity(crate::audio::runtime::settings().query_cache_max_capacity as u64)
         .time_to_live(Duration::from_secs(
             crate::audio::runtime::settings().query_cache_ttl_seconds,
         ))
@@ -18,7 +18,7 @@ fn build_query_cache() -> Cache<String, Track> {
 
 fn build_metadata_cache() -> Cache<String, Track> {
     Cache::builder()
-        .max_capacity(4096)
+        .max_capacity(crate::audio::runtime::settings().metadata_cache_max_capacity as u64)
         .time_to_live(Duration::from_secs(
             crate::audio::runtime::settings().metadata_cache_ttl_seconds,
         ))
@@ -27,7 +27,7 @@ fn build_metadata_cache() -> Cache<String, Track> {
 
 fn build_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
-        .max_capacity(4096)
+        .max_capacity(crate::audio::runtime::settings().stream_cache_max_capacity as u64)
         .time_to_live(Duration::from_secs(
             crate::audio::runtime::settings().stream_cache_ttl_seconds,
         ))
@@ -322,7 +322,7 @@ async fn run_ytdlp_stream_resolution(
 
 fn build_soundcloud_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
-        .max_capacity(4096)
+        .max_capacity(crate::audio::runtime::settings().stream_cache_max_capacity as u64)
         .time_to_live(Duration::from_secs(300))
         .build()
 }

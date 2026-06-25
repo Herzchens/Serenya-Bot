@@ -47,6 +47,10 @@ resolver:
   yt_dlp_timeout_seconds: 10
   prefetch_timeout_seconds: 8
   prefetch_when_remaining_seconds: 10
+  query_cache_max_capacity: 1024
+  metadata_cache_max_capacity: 1024
+  stream_cache_max_capacity: 1024
+  negative_cache_max_capacity: 1024
   query_cache_ttl_seconds: 3600
   metadata_cache_ttl_seconds: 86400
   stream_cache_ttl_seconds: 3600

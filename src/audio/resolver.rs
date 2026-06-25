@@ -420,7 +420,11 @@ async fn collect_search_results(
             source_type: SourceType::Search,
             resolved_url: None,
             thumbnail: candidate.thumbnail,
-            source_provider: format!("{} • {:.0}%", candidate.source, score * 100.0),
+            source_provider: std::sync::Arc::from(format!(
+                "{} • {:.0}%",
+                candidate.source,
+                score * 100.0
+            )),
         })
         .collect();
 
@@ -615,6 +619,7 @@ pub async fn resolve_input(
     let res = async move {
         if let Some(playlist) = db.get_user_playlist(user_id, query_trimmed).await {
             let mut tracks = Vec::new();
+            let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Playlist");
             for t in playlist.tracks {
                 tracks.push(Track {
                     title: t.title,
@@ -625,7 +630,7 @@ pub async fn resolve_input(
                     source_type: SourceType::Playlist,
                     resolved_url: None,
                     thumbnail: None,
-                    source_provider: "Playlist".to_owned(),
+                    source_provider: source_prov.clone(),
                 });
             }
             return Ok(ResolvedInput::Playlist(tracks));
@@ -1021,7 +1026,11 @@ fn evaluate_confidence_and_respond(
                 source_type: SourceType::Search,
                 resolved_url: None,
                 thumbnail: forced_thumbnail.clone().or(cand.thumbnail),
-                source_provider: format!("{} • {:.0}%", cand.source, score * 100.0),
+                source_provider: std::sync::Arc::from(format!(
+                    "{} • {:.0}%",
+                    cand.source,
+                    score * 100.0
+                )),
             });
         }
         Ok(ResolvedInput::SearchResults(tracks))
@@ -1062,7 +1071,7 @@ fn evaluate_confidence_and_respond(
             source_type: SourceType::Search,
             resolved_url: None,
             thumbnail: forced_thumbnail.or_else(|| top_cand.thumbnail.clone()),
-            source_provider: selected_provider,
+            source_provider: std::sync::Arc::from(selected_provider),
         };
 
         // Cache the high-confidence search result asynchronously to keep it non-blocking
@@ -1249,7 +1258,7 @@ async fn resolve_spotify_embed_fallback(
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: entity_thumbnail.clone().map(std::sync::Arc::from),
-                source_provider: "Spotify".to_owned(),
+                source_provider: std::sync::Arc::from("Spotify"),
             });
         }
     }
@@ -1400,6 +1409,7 @@ async fn resolve_spotify_playlist_api(
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
     let mut tracks = Vec::with_capacity(limit);
+    let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Spotify");
     let mut offset = 0;
     let mut total_count = None;
 
@@ -1525,7 +1535,7 @@ async fn resolve_spotify_playlist_api(
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail,
-                source_provider: "Spotify".to_owned(),
+                source_provider: source_prov.clone(),
             });
 
             if tracks.len() >= limit {
@@ -1634,6 +1644,7 @@ async fn resolve_spotify_album_api(
     http_client: &reqwest::Client,
 ) -> Result<Vec<Track>, SerenyaError> {
     let mut tracks = Vec::with_capacity(limit);
+    let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Spotify");
     let mut offset = 0;
     let mut total_count = None;
 
@@ -1747,7 +1758,7 @@ async fn resolve_spotify_album_api(
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: thumbnail.clone(),
-                source_provider: "Spotify".to_owned(),
+                source_provider: source_prov.clone(),
             });
 
             if tracks.len() >= limit {
@@ -1900,6 +1911,7 @@ async fn resolve_spotify_artist_top_tracks_api(
         items.len()
     );
     let mut tracks = Vec::with_capacity(limit.min(items.len()));
+    let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Spotify");
     for item in items.iter().take(limit) {
         let track_val = item.get("track").unwrap_or(item);
         let Some(name) = track_val.get("name").and_then(|v| v.as_str()) else {
@@ -1945,7 +1957,7 @@ async fn resolve_spotify_artist_top_tracks_api(
             source_type: SourceType::Url,
             resolved_url: None,
             thumbnail,
-            source_provider: "Spotify".to_owned(),
+            source_provider: source_prov.clone(),
         });
     }
 
@@ -2246,7 +2258,7 @@ fn recursive_find_tracks(
                     source_type: SourceType::Playlist,
                     resolved_url: None,
                     thumbnail: None,
-                    source_provider: provider_name.to_owned(),
+                    source_provider: std::sync::Arc::from(provider_name),
                 });
             }
         } else if let Some(video) = obj.get("playlistVideoRenderer") {
@@ -2287,7 +2299,7 @@ fn recursive_find_tracks(
                         .and_then(|arr| arr.first())
                         .and_then(|t| t["url"].as_str())
                         .map(std::sync::Arc::from),
-                    source_provider: provider_name.to_owned(),
+                    source_provider: std::sync::Arc::from(provider_name),
                 });
             }
         } else {
@@ -2316,10 +2328,10 @@ async fn resolve_youtube_playlist(
     let playlist_url = rusty_ytdl::search::Playlist::get_playlist_url(&normalized_url)
         .ok_or_else(|| SerenyaError::Audio("Invalid YouTube playlist URL".into()))?;
 
-    let provider_name = if url.contains("music.youtube.com") {
-        "YouTube Music".to_owned()
+    let provider_name: std::sync::Arc<str> = if url.contains("music.youtube.com") {
+        std::sync::Arc::from("YouTube Music")
     } else {
-        "YouTube".to_owned()
+        std::sync::Arc::from("YouTube")
     };
 
     let mut tracks = Vec::new();
@@ -2496,12 +2508,12 @@ mod tests {
         assert_eq!(tracks[0].title, "Test Lockup Title");
         assert_eq!(tracks[0].url, "https://www.youtube.com/watch?v=video_id_1");
         assert_eq!(tracks[0].duration, None);
-        assert_eq!(tracks[0].source_provider, "YouTube");
+        assert_eq!(&*tracks[0].source_provider, "YouTube");
 
         assert_eq!(tracks[1].title, "Test Playlist Title");
         assert_eq!(tracks[1].url, "https://www.youtube.com/watch?v=video_id_2");
         assert_eq!(tracks[1].duration, Some(Duration::from_secs(225))); // 3 * 60 + 45 = 225
-        assert_eq!(tracks[1].source_provider, "YouTube");
+        assert_eq!(&*tracks[1].source_provider, "YouTube");
     }
 
     #[tokio::test]
@@ -2521,7 +2533,7 @@ mod tests {
             tracks[0].title
         );
         assert_eq!(tracks[0].url, "https://www.youtube.com/watch?v=ns878yW7N2c");
-        assert_eq!(tracks[0].source_provider, "YouTube Music");
+        assert_eq!(&*tracks[0].source_provider, "YouTube Music");
     }
 
     fn metadata_candidate(

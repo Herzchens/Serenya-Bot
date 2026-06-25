@@ -86,6 +86,7 @@ impl Queue {
 
     pub fn clear(&mut self) {
         self.tracks.clear();
+        self.tracks.shrink_to_fit();
     }
 
     pub fn jump(&mut self, index: usize) -> Result<Vec<Track>, SerenyaError> {

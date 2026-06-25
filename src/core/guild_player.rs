@@ -59,6 +59,7 @@ impl GuildPlayer {
 
     pub fn clear_skip_votes(&mut self) {
         self.skip_votes.clear();
+        self.skip_votes.shrink_to_fit();
         self.requester_absence_timer = None;
     }
 

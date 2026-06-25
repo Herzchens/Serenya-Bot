@@ -180,7 +180,7 @@ pub(crate) async fn enqueue_and_play_resolved(
 
     if player.playback_status == PlaybackStatus::Idle && player.now_playing.is_none() {
         let mut first_track = tracks.remove(0);
-        let requester_name = ctx.author().name.clone();
+        let requester_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
         first_track.requester_name = Some(requester_name.clone());
 
         // Fix: set requester_name for all remaining tracks before queuing
@@ -435,7 +435,7 @@ pub(crate) async fn enqueue_and_play_resolved(
         let track_count = tracks.len();
         let first_title = tracks.first().map(|t| t.title.clone()).unwrap_or_default();
 
-        let requester_name = ctx.author().name.clone();
+        let requester_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
         for t in &mut tracks {
             t.requester_name = Some(requester_name.clone());
             tracing::info!("Queueing track: {:?}", t.title);

@@ -26,13 +26,20 @@ fn check_ytdlp_available() -> bool {
         || std::path::Path::new("yt-dlp").exists()
 }
 
+fn build_negative_cache(settings: &ResolverSection) -> Cache<String, NegativeCacheEntry> {
+    Cache::builder()
+        .max_capacity(settings.negative_cache_max_capacity as u64)
+        .time_to_live(Duration::from_secs(settings.negative_cache_ttl_seconds))
+        .build()
+}
+
 struct ResolverRuntime {
     settings: ArcSwap<ResolverSection>,
     spotify_settings: ArcSwapOption<crate::config::SpotifySection>,
     ytdlp_semaphore: RwLock<Arc<Semaphore>>,
     soundcloud_semaphore: RwLock<Arc<Semaphore>>,
     guild_resolve_semaphores: DashMap<u64, Arc<Semaphore>>,
-    negative_cache: Cache<String, NegativeCacheEntry>,
+    negative_cache: ArcSwap<Cache<String, NegativeCacheEntry>>,
     youtube_degraded_until: RwLock<Option<Instant>>,
     max_playlist_import: std::sync::atomic::AtomicUsize,
     ytdlp_fallback_active: std::sync::atomic::AtomicBool,
@@ -50,10 +57,7 @@ impl ResolverRuntime {
                 settings.max_concurrent_soundcloud,
             ))),
             guild_resolve_semaphores: DashMap::new(),
-            negative_cache: Cache::builder()
-                .max_capacity(4096)
-                .time_to_live(Duration::from_secs(settings.negative_cache_ttl_seconds))
-                .build(),
+            negative_cache: ArcSwap::from_pointee(build_negative_cache(&settings)),
             settings: ArcSwap::from_pointee(settings),
             spotify_settings: ArcSwapOption::const_empty(),
             youtube_degraded_until: RwLock::new(None),
@@ -96,6 +100,9 @@ pub fn configure(
         *semaphore = Arc::new(Semaphore::new(settings.max_concurrent_soundcloud));
     }
     RESOLVER_RUNTIME.guild_resolve_semaphores.clear();
+    RESOLVER_RUNTIME
+        .negative_cache
+        .store(Arc::new(build_negative_cache(settings)));
 }
 
 pub fn cleanup_guild(guild_id: u64) {
@@ -312,11 +319,15 @@ fn clear_youtube_degraded_if_expired() {
 
 pub async fn remember_negative(key: String, reason: String) {
     let entry = NegativeCacheEntry { reason };
-    RESOLVER_RUNTIME.negative_cache.insert(key, entry).await;
+    RESOLVER_RUNTIME
+        .negative_cache
+        .load()
+        .insert(key, entry)
+        .await;
 }
 
 pub async fn negative_cache_get(key: &str) -> Option<NegativeCacheEntry> {
-    RESOLVER_RUNTIME.negative_cache.get(key).await
+    RESOLVER_RUNTIME.negative_cache.load().get(key).await
 }
 
 pub fn negative_cache_key(namespace: &str, id: &str) -> String {

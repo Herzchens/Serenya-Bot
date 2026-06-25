@@ -1108,7 +1108,7 @@ impl YouTubeProvider {
             source_type: SourceType::Url,
             resolved_url: None,
             thumbnail: thumbnail.map(std::sync::Arc::from),
-            source_provider: "YouTube".to_owned(),
+            source_provider: std::sync::Arc::from("YouTube"),
         }])
     }
     async fn search_scrape(
@@ -1705,7 +1705,7 @@ impl SoundCloudProvider {
                         source_type: SourceType::Playlist,
                         resolved_url: None,
                         thumbnail: meta.artwork_url.map(std::sync::Arc::from),
-                        source_provider: "SoundCloud".to_owned(),
+                        source_provider: std::sync::Arc::from("SoundCloud"),
                     });
                 }
             }
@@ -1726,7 +1726,7 @@ impl SoundCloudProvider {
                 source_type: SourceType::Url,
                 resolved_url: None,
                 thumbnail: meta.artwork_url.map(std::sync::Arc::from),
-                source_provider: "SoundCloud".to_owned(),
+                source_provider: std::sync::Arc::from("SoundCloud"),
             }])
         }
     }
@@ -1750,7 +1750,7 @@ impl DirectUrlProvider {
             source_type: SourceType::Url,
             resolved_url: None,
             thumbnail: None,
-            source_provider: "Direct Link".to_owned(),
+            source_provider: std::sync::Arc::from("Direct Link"),
         }])
     }
 }
