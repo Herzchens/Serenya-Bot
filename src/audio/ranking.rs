@@ -563,17 +563,18 @@ pub fn score_candidates(
             && let Some(candidate_dur) = candidate.duration
         {
             let diff = (expected.as_secs_f64() - candidate_dur.as_secs_f64()).abs();
+            let candidate_title_norm = normalize_string(&candidate_title_lower);
             let is_relaxed = ["live", "mix", "extended", "dj", "concert"]
                 .iter()
                 .any(|term| {
                     contains_word(&query_lower, term) || contains_word(&expected_title_lower, term)
                 })
-                || candidate_title_lower.contains("official video")
-                || candidate_title_lower.contains("music video")
-                || candidate_title_lower.contains("official music video")
-                || candidate_title_lower.contains(" mv ")
-                || candidate_title_lower.ends_with(" mv")
-                || candidate_title_lower.starts_with("mv ");
+                || contains_word(&candidate_title_norm, "mv")
+                || contains_word(&candidate_title_norm, "m/v")
+                || candidate_title_norm.contains("official video")
+                || candidate_title_norm.contains("music video")
+                || candidate_title_norm.contains("video ca nhac")
+                || candidate_title_norm.contains("phim ca nhac");
 
             let tolerance = if is_relaxed {
                 (expected.as_secs_f64() * 0.25).max(60.0)
@@ -1297,5 +1298,34 @@ mod tests {
         let s1 = "東京 Hot";
         let s2 = "东京 Hot";
         assert!(jaro_winkler_similarity(s1, s2) > 0.85);
+    }
+
+    #[test]
+    fn test_music_video_relaxation() {
+        let candidates = vec![
+            TrackCandidate {
+                source: "YouTube".to_owned(),
+                title: "SON TUNG M-TP x TYGA | COME MY WAY | OFFICIAL MUSIC VIDEO".to_owned(),
+                artist: "Sơn Tùng M-TP x Tyga".to_owned(),
+                url: "https://youtube/come_my_way".to_owned(),
+                duration: Some(Duration::from_secs(235)),
+                popularity: Some(100000),
+                is_official: true,
+                is_topic_channel: false,
+                thumbnail: None,
+            },
+        ];
+
+        let scored = score_candidates(
+            candidates,
+            "Son Tung M-TP - Come My Way",
+            "Come My Way",
+            Some("Son Tung M-TP"),
+            Some(Duration::from_secs(192)),
+            MetadataConfidence::Trusted,
+        );
+
+        assert!(!scored.is_empty());
+        assert_eq!(scored[0].0.url, "https://youtube/come_my_way");
     }
 }
