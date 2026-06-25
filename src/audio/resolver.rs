@@ -1564,9 +1564,8 @@ async fn resolve_spotify_playlist(
         playlist_id,
         limit
     );
-    let settings = crate::audio::runtime::settings();
     if playlist_id.starts_with("37i9dQZF") {
-        if !settings.enable_spotify_embed_fallback {
+        if !crate::audio::runtime::is_spotify_embed_fallback_active() {
             return Err(SerenyaError::Audio(
                 "Spotify embed fallback is disabled (required for Spotify-curated playlist)".into(),
             ));
@@ -1596,7 +1595,7 @@ async fn resolve_spotify_playlist(
                     return Ok(tracks);
                 }
                 Err(err) => {
-                    if !settings.enable_spotify_embed_fallback {
+                    if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                         return Err(err);
                     }
                     tracing::warn!(
@@ -1606,7 +1605,7 @@ async fn resolve_spotify_playlist(
                 }
             }
         } else {
-            if !settings.enable_spotify_embed_fallback {
+            if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                 return Err(SerenyaError::Audio(
                     "Spotify sp_dc cookie missing in config and embed fallback is disabled".into(),
                 ));
@@ -1616,7 +1615,7 @@ async fn resolve_spotify_playlist(
             );
         }
     } else {
-        if !settings.enable_spotify_embed_fallback {
+        if !crate::audio::runtime::is_spotify_embed_fallback_active() {
             return Err(SerenyaError::Audio(
                 "Spotify settings missing in config and embed fallback is disabled".into(),
             ));
@@ -1782,7 +1781,6 @@ async fn resolve_spotify_album(
         album_id,
         limit
     );
-    let settings = crate::audio::runtime::settings();
     if let Some(config) = crate::audio::runtime::spotify_settings() {
         if config
             .sp_dc
@@ -1802,7 +1800,7 @@ async fn resolve_spotify_album(
                     return Ok(tracks);
                 }
                 Err(err) => {
-                    if !settings.enable_spotify_embed_fallback {
+                    if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                         return Err(err);
                     }
                     tracing::warn!(
@@ -1812,7 +1810,7 @@ async fn resolve_spotify_album(
                 }
             }
         } else {
-            if !settings.enable_spotify_embed_fallback {
+            if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                 return Err(SerenyaError::Audio(
                     "Spotify sp_dc cookie missing in config and embed fallback is disabled".into(),
                 ));
@@ -1822,7 +1820,7 @@ async fn resolve_spotify_album(
             );
         }
     } else {
-        if !settings.enable_spotify_embed_fallback {
+        if !crate::audio::runtime::is_spotify_embed_fallback_active() {
             return Err(SerenyaError::Audio(
                 "Spotify settings missing in config and embed fallback is disabled".into(),
             ));
@@ -1969,7 +1967,6 @@ async fn resolve_spotify_artist_top_tracks(
         artist_id,
         limit
     );
-    let settings = crate::audio::runtime::settings();
     if let Some(config) = crate::audio::runtime::spotify_settings() {
         if config
             .sp_dc
@@ -1991,7 +1988,7 @@ async fn resolve_spotify_artist_top_tracks(
                     return Ok(tracks);
                 }
                 Err(err) => {
-                    if !settings.enable_spotify_embed_fallback {
+                    if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                         return Err(err);
                     }
                     tracing::warn!(
@@ -2001,7 +1998,7 @@ async fn resolve_spotify_artist_top_tracks(
                 }
             }
         } else {
-            if !settings.enable_spotify_embed_fallback {
+            if !crate::audio::runtime::is_spotify_embed_fallback_active() {
                 return Err(SerenyaError::Audio(
                     "Spotify sp_dc cookie missing in config and embed fallback is disabled".into(),
                 ));
@@ -2011,7 +2008,7 @@ async fn resolve_spotify_artist_top_tracks(
             );
         }
     } else {
-        if !settings.enable_spotify_embed_fallback {
+        if !crate::audio::runtime::is_spotify_embed_fallback_active() {
             return Err(SerenyaError::Audio(
                 "Spotify settings missing in config and embed fallback is disabled".into(),
             ));

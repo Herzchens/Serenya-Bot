@@ -17,6 +17,15 @@ pub struct NegativeCacheEntry {
     pub reason: String,
 }
 
+fn check_ytdlp_available() -> bool {
+    std::process::Command::new("yt-dlp")
+        .arg("--version")
+        .output()
+        .is_ok()
+        || std::path::Path::new("yt-dlp.exe").exists()
+        || std::path::Path::new("yt-dlp").exists()
+}
+
 struct ResolverRuntime {
     settings: ArcSwap<ResolverSection>,
     spotify_settings: ArcSwapOption<crate::config::SpotifySection>,
@@ -26,11 +35,15 @@ struct ResolverRuntime {
     negative_cache: Cache<String, NegativeCacheEntry>,
     youtube_degraded_until: RwLock<Option<Instant>>,
     max_playlist_import: std::sync::atomic::AtomicUsize,
+    ytdlp_fallback_active: std::sync::atomic::AtomicBool,
+    spotify_embed_fallback_active: std::sync::atomic::AtomicBool,
 }
 
 impl ResolverRuntime {
     fn new() -> Self {
         let settings = ResolverSection::default();
+        let ytdlp_active = settings.enable_ytdlp_youtube_fallback && check_ytdlp_available();
+        let spotify_active = settings.enable_spotify_embed_fallback;
         Self {
             ytdlp_semaphore: RwLock::new(Arc::new(Semaphore::new(settings.max_concurrent_ytdlp))),
             soundcloud_semaphore: RwLock::new(Arc::new(Semaphore::new(
@@ -45,6 +58,8 @@ impl ResolverRuntime {
             spotify_settings: ArcSwapOption::const_empty(),
             youtube_degraded_until: RwLock::new(None),
             max_playlist_import: std::sync::atomic::AtomicUsize::new(100),
+            ytdlp_fallback_active: std::sync::atomic::AtomicBool::new(ytdlp_active),
+            spotify_embed_fallback_active: std::sync::atomic::AtomicBool::new(spotify_active),
         }
     }
 }
@@ -63,6 +78,17 @@ pub fn configure(
     RESOLVER_RUNTIME
         .max_playlist_import
         .store(max_playlist_import, std::sync::atomic::Ordering::Relaxed);
+
+    let ytdlp_active = settings.enable_ytdlp_youtube_fallback && check_ytdlp_available();
+    RESOLVER_RUNTIME
+        .ytdlp_fallback_active
+        .store(ytdlp_active, std::sync::atomic::Ordering::Relaxed);
+
+    let spotify_active = settings.enable_spotify_embed_fallback;
+    RESOLVER_RUNTIME
+        .spotify_embed_fallback_active
+        .store(spotify_active, std::sync::atomic::Ordering::Relaxed);
+
     if let Ok(mut semaphore) = RESOLVER_RUNTIME.ytdlp_semaphore.write() {
         *semaphore = Arc::new(Semaphore::new(settings.max_concurrent_ytdlp));
     }
@@ -82,6 +108,18 @@ pub fn settings() -> Arc<ResolverSection> {
 
 pub fn spotify_settings() -> Option<Arc<crate::config::SpotifySection>> {
     RESOLVER_RUNTIME.spotify_settings.load().clone()
+}
+
+pub fn is_ytdlp_fallback_active() -> bool {
+    RESOLVER_RUNTIME
+        .ytdlp_fallback_active
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn is_spotify_embed_fallback_active() -> bool {
+    RESOLVER_RUNTIME
+        .spotify_embed_fallback_active
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn max_playlist_import() -> usize {

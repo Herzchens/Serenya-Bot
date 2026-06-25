@@ -152,6 +152,31 @@ const VARIANTS: &[VariantRule] = &[
         hard_reject_with_duration: true,
     },
     VariantRule {
+        term: "behind the scenes",
+        penalty: 0.50,
+        hard_reject_with_duration: true,
+    },
+    VariantRule {
+        term: "behind the scene",
+        penalty: 0.50,
+        hard_reject_with_duration: true,
+    },
+    VariantRule {
+        term: "behind scene",
+        penalty: 0.50,
+        hard_reject_with_duration: true,
+    },
+    VariantRule {
+        term: "making of",
+        penalty: 0.50,
+        hard_reject_with_duration: true,
+    },
+    VariantRule {
+        term: "making video",
+        penalty: 0.50,
+        hard_reject_with_duration: true,
+    },
+    VariantRule {
         term: "reaction",
         penalty: 0.35,
         hard_reject_with_duration: false,
@@ -508,6 +533,11 @@ pub fn has_critical_risks(
         "fragmovie",
         "teaser",
         "preview",
+        "behind the scenes",
+        "behind the scene",
+        "behind scene",
+        "making of",
+        "making video",
     ]
     .iter()
     .any(|term| {
@@ -824,6 +854,11 @@ pub fn score_candidates(
             "fragmovie",
             "teaser",
             "preview",
+            "behind the scenes",
+            "behind the scene",
+            "behind scene",
+            "making of",
+            "making video",
         ]
         .iter()
         .any(|term| {
@@ -1302,19 +1337,17 @@ mod tests {
 
     #[test]
     fn test_music_video_relaxation() {
-        let candidates = vec![
-            TrackCandidate {
-                source: "YouTube".to_owned(),
-                title: "SON TUNG M-TP x TYGA | COME MY WAY | OFFICIAL MUSIC VIDEO".to_owned(),
-                artist: "Sơn Tùng M-TP x Tyga".to_owned(),
-                url: "https://youtube/come_my_way".to_owned(),
-                duration: Some(Duration::from_secs(235)),
-                popularity: Some(100000),
-                is_official: true,
-                is_topic_channel: false,
-                thumbnail: None,
-            },
-        ];
+        let candidates = vec![TrackCandidate {
+            source: "YouTube".to_owned(),
+            title: "SON TUNG M-TP x TYGA | COME MY WAY | OFFICIAL MUSIC VIDEO".to_owned(),
+            artist: "Sơn Tùng M-TP x Tyga".to_owned(),
+            url: "https://youtube/come_my_way".to_owned(),
+            duration: Some(Duration::from_secs(235)),
+            popularity: Some(100000),
+            is_official: true,
+            is_topic_channel: false,
+            thumbnail: None,
+        }];
 
         let scored = score_candidates(
             candidates,

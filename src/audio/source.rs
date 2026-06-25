@@ -269,7 +269,7 @@ async fn run_ytdlp_stream_resolution(
     youtube_url: bool,
     negative_key: &str,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
-    if youtube_url && !crate::audio::runtime::settings().enable_ytdlp_youtube_fallback {
+    if youtube_url && !crate::audio::runtime::is_ytdlp_fallback_active() {
         return Err(SerenyaError::Audio(
             "Python yt-dlp stream fallback is disabled for YouTube".to_owned(),
         ));
@@ -579,8 +579,11 @@ async fn extract_stream_url_inner(
             cache_set_stream(track_url.to_owned(), &stream).await;
             return Ok(stream);
         }
-        if crate::audio::runtime::settings().enable_ytdlp_youtube_fallback {
-            tracing::warn!(track_url, "native YouTube stream resolution failed, falling back to yt-dlp");
+        if crate::audio::runtime::is_ytdlp_fallback_active() {
+            tracing::warn!(
+                track_url,
+                "native YouTube stream resolution failed, falling back to yt-dlp"
+            );
             match run_ytdlp_stream_resolution(track_url, youtube_url, &negative_key).await {
                 Ok(stream) => {
                     cache_set_stream(track_url.to_owned(), &stream).await;

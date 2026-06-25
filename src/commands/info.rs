@@ -71,4 +71,3 @@ pub fn build_search_menu(ctx_id: u64, tracks: &[Track]) -> serenity::CreateSelec
     )
     .placeholder("Select a track to play...")
 }
-
