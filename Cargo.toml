@@ -45,6 +45,7 @@ sha1 = { workspace = true }
 symphonia = { version = "0.5.2", features = ["aac", "isomp4", "mp3", "mkv", "ogg", "vorbis", "wav"] }
 moka = { workspace = true }
 youtube_resolver = { path = "crates/youtube_resolver" }
+rusty_ytdl = { path = "crates/rusty-ytdl", default-features = false, features = ["rustls", "search"] }
 uuid = "1"
 strsim = "0.11"
 percent-encoding = "2"
@@ -70,6 +71,12 @@ strip = true
 # Optimize dependencies in dev mode for much faster startup and run times (e.g. boa_engine)
 [profile.dev.package."*"]
 opt-level = 3
+
+[profile.dev]
+debug = 0 # Tắt debug info để link và build siêu nhanh (tạm thời)
+
+[profile.test]
+debug = 0 # Tắt debug info cho lệnh cargo test
 
 [workspace]
 members = [

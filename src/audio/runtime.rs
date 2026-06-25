@@ -25,6 +25,7 @@ struct ResolverRuntime {
     guild_resolve_semaphores: DashMap<u64, Arc<Semaphore>>,
     negative_cache: Cache<String, NegativeCacheEntry>,
     youtube_degraded_until: RwLock<Option<Instant>>,
+    max_playlist_import: std::sync::atomic::AtomicUsize,
 }
 
 impl ResolverRuntime {
@@ -43,17 +44,25 @@ impl ResolverRuntime {
             settings: ArcSwap::from_pointee(settings),
             spotify_settings: ArcSwapOption::const_empty(),
             youtube_degraded_until: RwLock::new(None),
+            max_playlist_import: std::sync::atomic::AtomicUsize::new(100),
         }
     }
 }
 
 static RESOLVER_RUNTIME: LazyLock<ResolverRuntime> = LazyLock::new(ResolverRuntime::new);
 
-pub fn configure(settings: &ResolverSection, spotify: &crate::config::SpotifySection) {
+pub fn configure(
+    settings: &ResolverSection,
+    spotify: &crate::config::SpotifySection,
+    max_playlist_import: usize,
+) {
     RESOLVER_RUNTIME.settings.store(Arc::new(settings.clone()));
     RESOLVER_RUNTIME
         .spotify_settings
         .store(Some(Arc::new(spotify.clone())));
+    RESOLVER_RUNTIME
+        .max_playlist_import
+        .store(max_playlist_import, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut semaphore) = RESOLVER_RUNTIME.ytdlp_semaphore.write() {
         *semaphore = Arc::new(Semaphore::new(settings.max_concurrent_ytdlp));
     }
@@ -73,6 +82,10 @@ pub fn settings() -> Arc<ResolverSection> {
 
 pub fn spotify_settings() -> Option<Arc<crate::config::SpotifySection>> {
     RESOLVER_RUNTIME.spotify_settings.load().clone()
+}
+
+pub fn max_playlist_import() -> usize {
+    RESOLVER_RUNTIME.max_playlist_import.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn duration_from_millis(ms: u64) -> Duration {

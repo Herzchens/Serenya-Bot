@@ -181,7 +181,7 @@ pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
         ctx.data().config.store(new_config.clone());
     }
 
-    crate::audio::runtime::configure(&resolver_config, &new_config.spotify);
+    crate::audio::runtime::configure(&resolver_config, &new_config.spotify, new_config.playback.max_playlist_import);
     let (metadata_len, stream_len) = crate::audio::source::clear_caches();
 
     let restart_note = if token_changed {

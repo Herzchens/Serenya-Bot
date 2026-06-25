@@ -4553,6 +4553,7 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.13.4",
  "rustls 0.23.41",
+ "rusty_ytdl",
  "serde",
  "serde-saphyr",
  "serde_json",

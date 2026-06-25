@@ -60,7 +60,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         crate::logging::register_secret_to_redact(url);
     }
 
-    audio::runtime::configure(&config.resolver, &config.spotify);
+    audio::runtime::configure(&config.resolver, &config.spotify, config.playback.max_playlist_import);
     init_tracing(&config.logging);
     info!(target: "start", "Starting Serenya...");
     info!(target: "start", instance_id = %config.bot.instance_id, "Configuration loaded");
