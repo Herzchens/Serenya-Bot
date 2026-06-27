@@ -5,9 +5,21 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+const WEBHOOK_CHANNEL_CAPACITY: usize = 512;
+const WEBHOOK_BATCH_SIZE: usize = 10;
+const WEBHOOK_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const WEBHOOK_SHUTDOWN_DRAIN_LIMIT: usize = 512;
+
+static DROPPED_WEBHOOK_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn dropped_webhook_logs() -> u64 {
+    DROPPED_WEBHOOK_LOGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A tracing layer that forwards log entries above a minimum level to a Discord webhook.
 pub struct WebhookLayer {
-    sender: mpsc::UnboundedSender<LogEntry>,
+    sender: mpsc::Sender<LogEntry>,
+    min_level: Level,
 }
 
 struct LogEntry {
@@ -77,7 +89,7 @@ impl WebhookLayer {
         min_level: Level,
         plain_text: bool,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(WEBHOOK_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         if let Ok(mut guard) = SHUTDOWN_TX.lock() {
@@ -92,7 +104,10 @@ impl WebhookLayer {
             min_level,
             plain_text,
         ));
-        Self { sender: tx }
+        Self {
+            sender: tx,
+            min_level,
+        }
     }
 }
 
@@ -100,6 +115,11 @@ impl<S: Subscriber> Layer<S> for WebhookLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
         let level = *meta.level();
+
+        if level > self.min_level {
+            return;
+        }
+
         let target = meta.target();
 
         let mut visitor = MessageVisitor {
@@ -112,13 +132,16 @@ impl<S: Subscriber> Layer<S> for WebhookLayer {
             message: visitor.message,
             target: target.to_owned(),
         };
-        let _ = self.sender.send(entry);
+
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.sender.try_send(entry) {
+            DROPPED_WEBHOOK_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
 /// Background task that batches log entries and sends them to Discord.
 async fn flush_loop(
-    mut rx: mpsc::UnboundedReceiver<LogEntry>,
+    mut rx: mpsc::Receiver<LogEntry>,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<tokio::sync::oneshot::Sender<()>>,
     webhook_url: String,
     http_client: reqwest::Client,
@@ -128,7 +151,7 @@ async fn flush_loop(
     let mut buffer: Vec<LogEntry> = Vec::new();
 
     loop {
-        let sleep_fut = tokio::time::sleep(std::time::Duration::from_secs(2));
+        let sleep_fut = tokio::time::sleep(WEBHOOK_FLUSH_INTERVAL);
         tokio::pin!(sleep_fut);
 
         tokio::select! {
@@ -137,7 +160,7 @@ async fn flush_loop(
                     Some(entry) => {
                         if entry.level <= min_level {
                             buffer.push(entry);
-                            if buffer.len() >= 10 {
+                            if buffer.len() >= WEBHOOK_BATCH_SIZE {
                                 send_batch(&http_client, &webhook_url, &buffer, plain_text).await;
                                 buffer.clear();
                             }
@@ -154,9 +177,15 @@ async fn flush_loop(
             ack_sender_res = &mut shutdown_rx => {
                 if let Ok(ack_sender) = ack_sender_res {
                     rx.close();
-                    while let Some(entry) = rx.recv().await {
-                        if entry.level <= min_level {
-                            buffer.push(entry);
+                    let mut drained = 0;
+                    while drained < WEBHOOK_SHUTDOWN_DRAIN_LIMIT {
+                        if let Some(entry) = rx.recv().await {
+                            drained += 1;
+                            if entry.level <= min_level {
+                                buffer.push(entry);
+                            }
+                        } else {
+                            break;
                         }
                     }
                     if !buffer.is_empty() {
@@ -240,5 +269,19 @@ async fn send_batch(
                 eprintln!("Failed to send webhook log: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_level_ordering() {
+        assert!(Level::DEBUG > Level::INFO);
+        assert!(Level::TRACE > Level::INFO);
+        assert!(!(Level::ERROR > Level::INFO));
+        assert!(!(Level::WARN > Level::INFO));
+        assert!(!(Level::INFO > Level::INFO));
     }
 }

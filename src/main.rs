@@ -1,3 +1,8 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -38,6 +43,9 @@ impl Data {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     configure_path();
     let _ = rustls::crypto::ring::default_provider().install_default();
     tokio::runtime::Runtime::new()?.block_on(run())
@@ -199,7 +207,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let guild_players = Arc::new(DashMap::new());
 
-                start_empty_room_monitor(guild_players.clone(), ctx.http.clone());
+                start_empty_room_monitor(
+                    guild_players.clone(),
+                    ctx.http.clone(),
+                    config_clone.clone(),
+                    ctx.clone(),
+                );
 
                 Ok(Data {
                     config: arc_swap::ArcSwap::new(config_clone),
@@ -212,15 +225,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
-    let intents = serenity::GatewayIntents::non_privileged()
-        | serenity::GatewayIntents::MESSAGE_CONTENT
-        | serenity::GatewayIntents::GUILD_VOICE_STATES;
+    let intents = serenity::GatewayIntents::GUILDS
+        | serenity::GatewayIntents::GUILD_VOICE_STATES
+        | serenity::GatewayIntents::GUILD_MESSAGES
+        | serenity::GatewayIntents::MESSAGE_CONTENT;
 
     let songbird_config = songbird::Config::default()
         .use_softclip(false)
         .preallocated_tracks(2);
+    let mut cache_settings = serenity::cache::Settings::default();
+    cache_settings.max_messages = 0;
     let mut client = serenity::ClientBuilder::new(&config.bot.token, intents)
         .framework(framework)
+        .cache_settings(cache_settings)
         .register_songbird_from_config(songbird_config)
         .await?;
 
@@ -399,6 +416,8 @@ async fn on_error(error: poise::FrameworkError<'_, Data, utils::Error>) {
 fn start_empty_room_monitor(
     guild_players: Arc<DashMap<serenity::GuildId, Arc<tokio::sync::RwLock<core::GuildPlayer>>>>,
     http: Arc<serenity::Http>,
+    config: Arc<BotConfig>,
+    serenity_ctx: serenity::Context,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -426,17 +445,45 @@ fn start_empty_room_monitor(
             }
 
             for (guild_id, announce_channel) in to_clear {
-                if let Some(player_lock) = guild_players.get(&guild_id) {
-                    let mut player = player_lock.write().await;
-                    player.reset();
-                    player.empty_since = Some(now);
+                let player_lock_opt = guild_players.get(&guild_id).map(|p| p.value().clone());
+                if let Some(player_lock) = player_lock_opt {
+                    let stay = config.playback.stay_in_voice;
 
-                    audio::runtime::cleanup_guild(guild_id.get());
-                    info!(guild_id = %guild_id, "Cleared queue after 3 hours of empty room");
+                    {
+                        let mut player = player_lock.write().await;
+                        player.reset();
+                        if !stay {
+                            player.voice_channel = None;
+                            player.announce_channel = None;
+                        } else {
+                            // Keep voice_channel/announce_channel but mark empty_since
+                            // so we don't re-trigger until someone joins again
+                            player.empty_since = Some(now);
+                        }
+                    }
+
+                    if stay {
+                        // stay_in_voice = true: only clear queue, keep the voice connection
+                        audio::runtime::cleanup_guild(guild_id.get());
+                        info!(guild_id = %guild_id, "Cleared queue after 3 hours of empty room (staying in voice)");
+                    } else {
+                        // stay_in_voice = false: fully disconnect
+                        guild_players.remove(&guild_id);
+                        if let Some(manager) = songbird::get(&serenity_ctx).await {
+                            let _ = manager.remove(guild_id).await;
+                        }
+                        audio::runtime::cleanup_guild(guild_id.get());
+                        info!(guild_id = %guild_id, "Disconnected after 3 hours of empty room");
+                    }
 
                     if let Some(channel) = announce_channel {
+                        let description = if stay {
+                            "Đã 3 tiếng không có ai trong phòng, hàng chờ (queue) đã tự động được dọn dẹp để tiết kiệm tài nguyên."
+                        } else {
+                            "Đã 3 tiếng không có ai trong phòng, bot đã tự động rời kênh thoại để tiết kiệm tài nguyên."
+                        };
                         let embed = serenity::CreateEmbed::new()
-                            .description("Đã 3 tiếng không có ai trong phòng, hàng chờ (queue) đã tự động được dọn dẹp để tiết kiệm tài nguyên.")
+                            .description(description)
                             .color(0xED4245);
                         let _ = channel
                             .send_message(&http, serenity::CreateMessage::new().embed(embed))

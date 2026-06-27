@@ -2,6 +2,7 @@ use poise::serenity_prelude as serenity;
 use songbird::tracks::TrackHandle;
 use std::collections::HashSet;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::core::loop_mode::LoopMode;
 use crate::core::queue::Queue;
@@ -33,6 +34,8 @@ pub struct GuildPlayer {
     pub skip_forced: bool,
     pub eight_d_enabled: bool,
     pub consecutive_errors: usize,
+    pub prefetch_cancel: Option<CancellationToken>,
+    pub prefetch_generation: u64,
 }
 
 impl GuildPlayer {
@@ -54,7 +57,23 @@ impl GuildPlayer {
             skip_forced: false,
             eight_d_enabled: false,
             consecutive_errors: 0,
+            prefetch_cancel: None,
+            prefetch_generation: 0,
         }
+    }
+
+    pub fn cancel_prefetch(&mut self) {
+        if let Some(cancel) = self.prefetch_cancel.take() {
+            cancel.cancel();
+        }
+        self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
+    }
+
+    pub fn start_prefetch(&mut self) -> (CancellationToken, u64) {
+        self.cancel_prefetch();
+        let token = CancellationToken::new();
+        self.prefetch_cancel = Some(token.clone());
+        (token, self.prefetch_generation)
     }
 
     pub fn clear_skip_votes(&mut self) {
@@ -64,6 +83,7 @@ impl GuildPlayer {
     }
 
     pub fn reset(&mut self) {
+        self.cancel_prefetch();
         self.queue.clear();
         self.now_playing = None;
         self.previous_track = None;
@@ -82,6 +102,7 @@ impl GuildPlayer {
     }
 
     pub fn advance_queue(&mut self) {
+        self.cancel_prefetch();
         self.clear_skip_votes();
         self.seek_offset = std::time::Duration::from_secs(0);
         self.is_seeking = false;

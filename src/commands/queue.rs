@@ -17,6 +17,7 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         .data()
         .guild_players
         .get(&guild_id)
+        .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
     let player = player_lock.read().await;
@@ -31,6 +32,12 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
 
     paginate_queue(ctx, &tracks, "🎶 Current Queue").await?;
     Ok(())
+}
+
+enum RemoveOutcome {
+    Removed(Box<str>),
+    CannotRemoveCurrent,
+    OutOfBounds { requested: usize, queue_size: usize },
 }
 
 /// Remove a song from the queue.
@@ -57,51 +64,83 @@ pub async fn remove(
         .data()
         .guild_players
         .get(&guild_id)
+        .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
-    let mut player = player_lock.write().await;
-    let queue_len = player.queue.len();
+    let outcome = {
+        let mut player = player_lock.write().await;
+        let queue_len = player.queue.len();
 
-    let index = if player.now_playing.is_some() {
-        if position == 1 {
-            ctx.say("❌ Cannot remove the currently playing track. Use `/skip` to skip it.")
-                .await?;
-            return Ok(());
+        if player.now_playing.is_some() {
+            if position == 1 {
+                RemoveOutcome::CannotRemoveCurrent
+            } else {
+                let idx = position - 2;
+                if idx >= queue_len {
+                    RemoveOutcome::OutOfBounds {
+                        requested: position,
+                        queue_size: queue_len + 1,
+                    }
+                } else {
+                    player.cancel_prefetch();
+                    match player.queue.remove(idx) {
+                        Ok(track) => RemoveOutcome::Removed(track.title.clone()),
+                        Err(e) => {
+                            return Err(SerenyaError::Queue(format!(
+                                "Failed to remove track: {}",
+                                e
+                            ))
+                            .into());
+                        }
+                    }
+                }
+            }
+        } else {
+            let idx = position - 1;
+            if idx >= queue_len {
+                RemoveOutcome::OutOfBounds {
+                    requested: position,
+                    queue_size: queue_len,
+                }
+            } else {
+                player.cancel_prefetch();
+                match player.queue.remove(idx) {
+                    Ok(track) => RemoveOutcome::Removed(track.title.clone()),
+                    Err(e) => {
+                        return Err(
+                            SerenyaError::Queue(format!("Failed to remove track: {}", e)).into(),
+                        );
+                    }
+                }
+            }
         }
-        let idx = position - 2;
-        if idx >= queue_len {
-            ctx.say(format!(
-                "❌ Position {} is out of bounds (queue size is {}).",
-                position,
-                queue_len + 1
-            ))
-            .await?;
-            return Ok(());
-        }
-        idx
-    } else {
-        let idx = position - 1;
-        if idx >= queue_len {
-            ctx.say(format!(
-                "❌ Position {} is out of bounds (queue size is {}).",
-                position, queue_len
-            ))
-            .await?;
-            return Ok(());
-        }
-        idx
     };
 
-    let removed_track = player
-        .queue
-        .remove(index)
-        .map_err(|e| SerenyaError::Queue(format!("Failed to remove track: {}", e)))?;
-
-    ctx.say(format!(
-        "❌ Removed **{}** from the queue.",
-        removed_track.title
-    ))
-    .await?;
+    match outcome {
+        RemoveOutcome::CannotRemoveCurrent => {
+            ctx.say("❌ Cannot remove the currently playing track. Use `/skip` to skip it.")
+                .await?;
+        }
+        RemoveOutcome::OutOfBounds {
+            requested,
+            queue_size,
+        } => {
+            ctx.say(format!(
+                "❌ Position {} is out of bounds (queue size is {}).",
+                requested, queue_size
+            ))
+            .await?;
+        }
+        RemoveOutcome::Removed(title) => {
+            let gp_clone = ctx.data().guild_players.clone();
+            let http_client_clone = ctx.data().http_client.clone();
+            tokio::spawn(async move {
+                crate::audio::events::trigger_prefetch(guild_id, gp_clone, http_client_clone).await;
+            });
+            ctx.say(format!("❌ Removed **{}** from the queue.", title))
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -120,17 +159,23 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
         .data()
         .guild_players
         .get(&guild_id)
+        .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
-    let mut player = player_lock.write().await;
-    player.queue.clear();
-    if let Some(ref handle) = player.current_track_handle {
+    let handle_opt = {
+        let mut player = player_lock.write().await;
+        player.cancel_prefetch();
+        player.queue.clear();
+        let handle = player.current_track_handle.take();
+        player.now_playing = None;
+        player.playback_status = crate::core::PlaybackStatus::Idle;
+        player.clear_skip_votes();
+        handle
+    };
+
+    if let Some(ref handle) = handle_opt {
         let _ = handle.stop();
     }
-    player.current_track_handle = None;
-    player.now_playing = None;
-    player.playback_status = crate::core::PlaybackStatus::Idle;
-    player.clear_skip_votes();
 
     ctx.say("🧹 Cleared the queue and stopped playback.")
         .await?;
@@ -153,10 +198,20 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
         .data()
         .guild_players
         .get(&guild_id)
+        .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
-    let mut player = player_lock.write().await;
-    player.queue.shuffle();
+    {
+        let mut player = player_lock.write().await;
+        player.cancel_prefetch();
+        player.queue.shuffle();
+    }
+
+    let gp_clone = ctx.data().guild_players.clone();
+    let http_client_clone = ctx.data().http_client.clone();
+    tokio::spawn(async move {
+        crate::audio::events::trigger_prefetch(guild_id, gp_clone, http_client_clone).await;
+    });
 
     ctx.say("🔀 Shuffled the queue.").await?;
     Ok(())

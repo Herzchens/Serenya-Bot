@@ -247,9 +247,19 @@ pub fn stats_embed(
     queue_size: usize,
     listeners: usize,
     instance_name: &str,
+    query_cache: u64,
+    metadata_cache: u64,
+    stream_cache: u64,
+    sc_stream_cache: u64,
+    negative_cache: u64,
+    dropped_webhooks: u64,
 ) -> serenity::CreateEmbed {
-    serenity::CreateEmbed::new()
-        .title("📊 Serenya Bot Statistics")
+    let cache_info = format!(
+        "Query: {} | Meta: {} | Stream: {} | SC: {} | Neg: {}",
+        query_cache, metadata_cache, stream_cache, sc_stream_cache, negative_cache
+    );
+    let mut embed = serenity::CreateEmbed::new()
+        .title("\u{1f4ca} Serenya Bot Statistics")
         .field("Uptime", uptime_str, true)
         .field("Memory Usage", memory_str, true)
         .field("Global Guilds", guilds.to_string(), true)
@@ -263,7 +273,16 @@ pub fn stats_embed(
             true,
         )
         .field("Listeners in VC", listeners.to_string(), true)
-        .color(0x5865F2)
+        .field("\u{1f5c4}\u{fe0f} Cache Entries", &cache_info, false)
+        .color(0x5865F2);
+    if dropped_webhooks > 0 {
+        embed = embed.field(
+            "\u{26a0}\u{fe0f} Dropped Webhook Logs",
+            dropped_webhooks.to_string(),
+            true,
+        );
+    }
+    embed
 }
 
 /// Creates a queue finished/empty embed.

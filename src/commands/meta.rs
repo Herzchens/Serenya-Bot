@@ -85,7 +85,7 @@ pub async fn help(
             .description("Here is a list of all available commands grouped by category. Type `/help <command>` to see more details about a specific command.")
             .field(
                 "🎵 Music / Phát nhạc",
-                "`play` - Play a song/playlist\n`search` - Search songs on YouTube\n`lyrics` - Search lyrics\n`playlist` - Manage custom playlists\n`join` - Join voice channel\n`leave` - Leave voice channel",
+                "`play` - Play a song/playlist\n`lyrics` - Search lyrics\n`playlist` - Manage custom playlists\n`join` - Join voice channel\n`leave` - Leave voice channel",
                 false
             )
             .field(

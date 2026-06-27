@@ -134,6 +134,11 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
         }
     }
 
+    let (query_cache, metadata_cache, stream_cache, sc_stream_cache) =
+        crate::audio::source::cache_entry_counts();
+    let negative_cache = crate::audio::runtime::negative_cache_entry_count();
+    let dropped_webhooks = crate::logging::webhook::dropped_webhook_logs();
+
     let embed = crate::discord::embeds::stats_embed(
         &uptime_str,
         &memory_str,
@@ -144,6 +149,12 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
         queue_size,
         listeners,
         &instance_name,
+        query_cache,
+        metadata_cache,
+        stream_cache,
+        sc_stream_cache,
+        negative_cache,
+        dropped_webhooks,
     );
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;

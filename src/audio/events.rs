@@ -3,6 +3,7 @@ use poise::serenity_prelude as serenity;
 use songbird::{Event, EventContext, EventHandler};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::database::DatabaseManager;
 use crate::discord::embeds::now_playing_announce_embed;
@@ -187,12 +188,7 @@ async fn fail_and_maybe_advance(
         let mut player = player_lock.write().await;
         player.consecutive_errors += 1;
 
-        if player
-            .now_playing
-            .as_ref()
-            .map(|current| current.url.as_str())
-            == Some(track_url)
-        {
+        if player.now_playing.as_ref().map(|current| &*current.url) == Some(track_url) {
             player.now_playing = None;
             player.current_track_handle = None;
             player.playback_status = crate::core::PlaybackStatus::Idle;
@@ -209,8 +205,10 @@ async fn fail_and_maybe_advance(
             "Aborting play_next: too many consecutive errors ({})",
             consecutive_errors
         );
-        let mut call = call_lock.lock().await;
-        call.stop();
+        {
+            let mut call = call_lock.lock().await;
+            call.stop();
+        }
         {
             let mut player = player_lock.write().await;
             player.reset();
@@ -331,8 +329,10 @@ pub fn play_next(
                 "Aborting play_next: too many consecutive errors ({})",
                 consecutive_errors
             );
-            let mut call = call_lock.lock().await;
-            call.stop();
+            {
+                let mut call = call_lock.lock().await;
+                call.stop();
+            }
             {
                 let mut player = player_lock.write().await;
                 player.reset();
@@ -352,8 +352,10 @@ pub fn play_next(
         }
 
         let Some(mut track) = track else {
-            let mut call = call_lock.lock().await;
-            call.stop();
+            {
+                let mut call = call_lock.lock().await;
+                call.stop();
+            }
             {
                 let mut player = player_lock.write().await;
                 player.current_track_handle = None;
@@ -371,6 +373,24 @@ pub fn play_next(
                         .await;
                 });
             }
+
+            // If stay_in_voice is disabled, disconnect and reclaim resources
+            if !ctx.config.playback.stay_in_voice {
+                tracing::info!(
+                    guild_id = %ctx.guild_id,
+                    "Queue finished and stay_in_voice=false, disconnecting"
+                );
+                {
+                    let mut player = player_lock.write().await;
+                    player.reset();
+                    player.voice_channel = None;
+                    player.announce_channel = None;
+                }
+                ctx.guild_players.remove(&ctx.guild_id);
+                let _ = songbird_manager.remove(ctx.guild_id).await;
+                crate::audio::runtime::cleanup_guild(ctx.guild_id.get());
+            }
+
             return Ok(());
         };
 
@@ -442,7 +462,7 @@ pub fn play_next(
         };
 
         let source = match crate::audio::source::create_stream_input(
-            Some(track.url.clone()),
+            Some(track.url.to_string()),
             &resolved,
             eight_d_enabled,
         )
@@ -484,12 +504,7 @@ pub fn play_next(
 
         {
             let mut player = player_lock.write().await;
-            if player
-                .now_playing
-                .as_ref()
-                .map(|current| current.url.as_str())
-                == Some(track.url.as_str())
-            {
+            if player.now_playing.as_ref().map(|current| &*current.url) == Some(&*track.url) {
                 if let Some(ref mut np) = player.now_playing {
                     np.resolved_url = Some(resolved);
                 }
@@ -555,14 +570,45 @@ pub async fn trigger_prefetch(
     >,
     http_client: reqwest::Client,
 ) {
+    let (token, generation) = {
+        let player_lock = match guild_players.get(&guild_id) {
+            Some(p) => p.value().clone(),
+            None => return,
+        };
+        let mut player = player_lock.write().await;
+        if player.queue.is_empty() {
+            return;
+        }
+        player.start_prefetch()
+    };
+
+    trigger_prefetch_with_context(guild_id, guild_players, http_client, token, generation).await;
+}
+
+pub async fn trigger_prefetch_with_context(
+    guild_id: serenity::GuildId,
+    guild_players: Arc<
+        dashmap::DashMap<serenity::GuildId, Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>>,
+    >,
+    http_client: reqwest::Client,
+    token: CancellationToken,
+    generation: u64,
+) {
     let player_lock = match guild_players.get(&guild_id) {
         Some(p) => p.value().clone(),
         None => return,
     };
 
+    if token.is_cancelled() {
+        return;
+    }
+
     let mut needs_resolution = false;
     let mut track_to_resolve = {
         let player = player_lock.read().await;
+        if player.prefetch_generation != generation {
+            return;
+        }
         if let Some(track) = player.queue.iter().next() {
             if track.url.starts_with("ytsearch1:") {
                 needs_resolution = true;
@@ -576,23 +622,40 @@ pub async fn trigger_prefetch(
     };
 
     if needs_resolution && let Some(ref mut track) = track_to_resolve {
+        if token.is_cancelled() {
+            return;
+        }
         if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(track, &http_client).await {
             tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
         } else {
+            if token.is_cancelled() {
+                return;
+            }
             let mut player = player_lock.write().await;
-            if let Some(t) = player.queue.get_mut(0)
-                && t.url.starts_with("ytsearch1:")
-            {
-                t.url = track.url.clone();
-                if t.thumbnail.is_none() {
-                    t.thumbnail = track.thumbnail.clone();
+            if player.prefetch_generation == generation {
+                if let Some(t) = player.queue.get_mut(0)
+                    && t.url.starts_with("ytsearch1:")
+                {
+                    t.url = track.url.clone();
+                    if t.thumbnail.is_none() {
+                        t.thumbnail = track.thumbnail.clone();
+                    }
                 }
+            } else {
+                return;
             }
         }
     }
 
+    if token.is_cancelled() {
+        return;
+    }
+
     let next_track_url = {
         let player = player_lock.read().await;
+        if player.prefetch_generation != generation {
+            return;
+        }
         if let Some(track) = player.queue.iter().next() {
             if track.resolved_url.is_none() && !track.url.starts_with("ytsearch1:") {
                 Some(track.url.clone())
@@ -611,6 +674,10 @@ pub async fn trigger_prefetch(
 
     tracing::debug!(guild_id = %guild_id, "Prefetching stream URL for: {}", url_to_resolve);
 
+    if token.is_cancelled() {
+        return;
+    }
+
     match crate::audio::source::prefetch_stream_url_for_guild(
         guild_id.get(),
         &url_to_resolve,
@@ -619,12 +686,17 @@ pub async fn trigger_prefetch(
     .await
     {
         Ok(Some(resolved_url)) => {
+            if token.is_cancelled() {
+                return;
+            }
             let mut player = player_lock.write().await;
-            if let Some(track) = player.queue.get_mut(0)
-                && track.url == url_to_resolve
-            {
-                track.resolved_url = Some(Arc::new(resolved_url));
-                tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+            if player.prefetch_generation == generation {
+                if let Some(track) = player.queue.get_mut(0)
+                    && track.url == url_to_resolve
+                {
+                    track.resolved_url = Some(Arc::new(resolved_url));
+                    tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+                }
             }
         }
         Ok(None) => {}
@@ -642,17 +714,37 @@ pub fn schedule_prefetch(
     duration: Option<Duration>,
     http_client: reqwest::Client,
 ) {
-    let gp_clone2 = guild_players.clone();
+    let gp_clone = guild_players.clone();
+    let http_client_clone = http_client.clone();
     tokio::spawn(async move {
-        if let Some(dur) = duration {
+        let (token, generation) = {
+            let player_lock = match gp_clone.get(&guild_id) {
+                Some(p) => p.value().clone(),
+                None => return,
+            };
+            let mut player = player_lock.write().await;
+            if player.queue.is_empty() {
+                return;
+            }
+            player.start_prefetch()
+        };
+
+        let sleep_duration = if let Some(dur) = duration {
             let settings = crate::audio::runtime::settings();
             let limit = Duration::from_secs(settings.prefetch_when_remaining_seconds).min(dur / 10);
-            let delay = dur.saturating_sub(limit);
-            tracing::debug!(guild_id = %guild_id, "Scheduling fallback prefetch in {:?}", delay);
-            tokio::time::sleep(delay).await;
+            dur.saturating_sub(limit)
         } else {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            Duration::from_secs(5)
+        };
+
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {}
+            _ = token.cancelled() => {
+                tracing::debug!(guild_id = %guild_id, "Scheduled prefetch cancelled during sleep");
+                return;
+            }
         }
-        trigger_prefetch(guild_id, gp_clone2, http_client).await;
+
+        trigger_prefetch_with_context(guild_id, gp_clone, http_client_clone, token, generation).await;
     });
 }

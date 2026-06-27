@@ -2,15 +2,15 @@ use poise::serenity_prelude as serenity;
 
 #[derive(Debug, Clone)]
 pub struct Track {
-    pub title: String,
-    pub url: String,
+    pub title: Box<str>,
+    pub url: Box<str>,
     pub duration: Option<std::time::Duration>,
-    pub requester_id: serenity::UserId,
     pub requester_name: Option<std::sync::Arc<str>>,
-    pub source_type: SourceType,
-    pub resolved_url: Option<std::sync::Arc<youtube_resolver::ResolvedStream>>,
     pub thumbnail: Option<std::sync::Arc<str>>,
     pub source_provider: std::sync::Arc<str>,
+    pub resolved_url: Option<std::sync::Arc<youtube_resolver::ResolvedStream>>,
+    pub requester_id: serenity::UserId,
+    pub source_type: SourceType,
 }
 
 impl Track {

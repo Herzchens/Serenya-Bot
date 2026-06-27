@@ -62,7 +62,12 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
         .clone();
 
-    if let Some(player_lock) = ctx.data().guild_players.get(&guild_id) {
+    if let Some(player_lock) = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+    {
         let mut player = player_lock.write().await;
         player.reset();
         player.voice_channel = None;

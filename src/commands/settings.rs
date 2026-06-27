@@ -117,37 +117,49 @@ pub async fn quality(
         raw_bitrate.min(max_tier_bitrate)
     };
 
-    let player_lock = ctx.data().guild_players.get(&guild_id);
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone());
 
-    if let Some(player_lock) = player_lock {
+    let voice_channel = if let Some(ref player_lock) = player_lock {
         let player = player_lock.read().await;
-        if let Some(vc_id) = player.voice_channel {
-            if quality_mode != Quality::Auto {
-                let _ = vc_id
-                    .edit(
-                        &ctx.serenity_context().http,
-                        serenity::EditChannel::new().bitrate(target_bitrate),
-                    )
-                    .await;
-            }
+        player.voice_channel
+    } else {
+        None
+    };
 
-            let manager = songbird::get(ctx.serenity_context())
-                .await
-                .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized".into()))?
-                .clone();
-            if let Some(call_lock) = manager.get(guild_id) {
-                let mut call = call_lock.lock().await;
-                if quality_mode == Quality::Auto {
-                    if let Ok(serenity::Channel::Guild(channel)) =
-                        vc_id.to_channel(&ctx.serenity_context().http).await
-                    {
-                        let ch_bitrate = channel.bitrate.unwrap_or(64_000);
-                        call.set_bitrate(songbird::driver::Bitrate::Bits(ch_bitrate as i32));
-                    }
+    if let Some(vc_id) = voice_channel {
+        if quality_mode != Quality::Auto {
+            let _ = vc_id
+                .edit(
+                    &ctx.serenity_context().http,
+                    serenity::EditChannel::new().bitrate(target_bitrate),
+                )
+                .await;
+        }
+
+        let manager = songbird::get(ctx.serenity_context())
+            .await
+            .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized".into()))?
+            .clone();
+
+        if let Some(call_lock) = manager.get(guild_id) {
+            let ch_bitrate = if quality_mode == Quality::Auto {
+                if let Ok(serenity::Channel::Guild(channel)) =
+                    vc_id.to_channel(&ctx.serenity_context().http).await
+                {
+                    channel.bitrate.unwrap_or(64_000)
                 } else {
-                    call.set_bitrate(songbird::driver::Bitrate::Bits(target_bitrate as i32));
+                    64_000
                 }
-            }
+            } else {
+                target_bitrate
+            };
+
+            let mut call = call_lock.lock().await;
+            call.set_bitrate(songbird::driver::Bitrate::Bits(ch_bitrate as i32));
         }
     }
 
