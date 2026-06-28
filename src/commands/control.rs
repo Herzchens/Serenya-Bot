@@ -1,0 +1,534 @@
+use crate::utils::{Context, Error, SerenyaError};
+use std::time::Duration;
+
+fn format_seek_time(d: Duration) -> String {
+    let total_secs = d.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{:02}:{:02}", mins, secs)
+}
+
+pub(crate) async fn seek_by_restart(
+    ctx: Context<'_>,
+    guild_id: poise::serenity_prelude::GuildId,
+    player_lock: std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    target_position: Duration,
+) -> Result<(), Error> {
+    let (url, resolved_url) = {
+        let player = player_lock.read().await;
+        let track = player
+            .now_playing
+            .as_ref()
+            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?;
+        (track.url.clone(), track.resolved_url.clone())
+    };
+
+    let stream = match resolved_url {
+        Some(stream) => stream,
+        None => std::sync::Arc::new(
+            crate::audio::source::extract_stream_url_for_guild(
+                guild_id.get(),
+                &url,
+                &ctx.data().http_client,
+            )
+            .await?,
+        ),
+    };
+
+    let eight_d_enabled = {
+        let player = player_lock.read().await;
+        player.eight_d_enabled
+    };
+    let source = crate::audio::source::create_ffmpeg_stream_input(
+        Some(url.to_string()),
+        &stream,
+        Some(target_position),
+        eight_d_enabled,
+    )
+    .await?;
+
+    let manager = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
+        .clone();
+
+    let call_lock = manager
+        .get(guild_id)
+        .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel.".into()))?;
+
+    let old_handle_opt = {
+        let mut player = player_lock.write().await;
+        let has_old_handle = player.current_track_handle.is_some();
+        player.is_seeking = has_old_handle;
+        player.seek_offset = target_position;
+        player.current_track_handle.take()
+    };
+
+    let handle = {
+        let mut call = call_lock.lock().await;
+        call.play_input(source)
+    };
+
+    let playback_ctx = crate::audio::events::PlaybackContext {
+        guild_id,
+        database: std::sync::Arc::clone(&ctx.data().database),
+        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+        http_client: ctx.data().http_client.clone(),
+        serenity_ctx: ctx.serenity_context().clone(),
+        config: ctx.data().config(),
+    };
+
+    let end_handler = crate::audio::events::TrackEndHandler {
+        ctx: playback_ctx.clone(),
+    };
+    let _ = handle.add_event(
+        songbird::Event::Track(songbird::TrackEvent::End),
+        end_handler,
+    );
+
+    let error_handler = crate::audio::events::TrackErrorHandler { ctx: playback_ctx };
+    let _ = handle.add_event(
+        songbird::Event::Track(songbird::TrackEvent::Error),
+        error_handler,
+    );
+
+    {
+        let mut player = player_lock.write().await;
+        if player.now_playing.as_ref().map(|current| &*current.url) == Some(&*url) {
+            player.current_track_handle = Some(handle.clone());
+        } else {
+            let _ = handle.stop();
+        }
+        player.is_seeking = false;
+    }
+
+    if let Some(old_handle) = old_handle_opt {
+        let _ = old_handle.stop();
+    }
+
+    Ok(())
+}
+
+/// Seek to a specific position in the track.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn seek(
+    ctx: Context<'_>,
+    #[description = "Time to seek (e.g. 1m20s or 80)"] time: String,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let duration = crate::utils::time::parse_duration(&time)
+        .map_err(|e| SerenyaError::Config(format!("Invalid time format: {e}")))?;
+
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+
+    seek_by_restart(ctx, guild_id, player_lock, duration).await?;
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏩ Seek",
+        &format!("Seeked to **{time}**."),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+/// Fast-forward the song by a duration.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    aliases("fw"),
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn forward(
+    ctx: Context<'_>,
+    #[description = "Time to forward (default 10s)"] time: Option<String>,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let duration = match time {
+        Some(t) => crate::utils::time::parse_duration(&t)?,
+        None => Duration::from_secs(10),
+    };
+
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+
+    let (handle, seek_offset) = {
+        let player = player_lock.read().await;
+        let handle = player
+            .current_track_handle
+            .as_ref()
+            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?
+            .clone();
+        (handle, player.seek_offset)
+    };
+
+    let info = handle.get_info().await?;
+    let new_pos = seek_offset + info.position + duration;
+
+    seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
+    let new_pos_fmt = format_seek_time(new_pos);
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏩ Forward",
+        &format!(
+            "Forwarded by **{}s** → `{}`",
+            duration.as_secs(),
+            new_pos_fmt
+        ),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+/// Rewind the song by a duration.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    aliases("rw"),
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn rewind(
+    ctx: Context<'_>,
+    #[description = "Time to rewind (default 10s)"] time: Option<String>,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let duration = match time {
+        Some(t) => crate::utils::time::parse_duration(&t)?,
+        None => Duration::from_secs(10),
+    };
+
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+
+    let (handle, seek_offset) = {
+        let player = player_lock.read().await;
+        let handle = player
+            .current_track_handle
+            .as_ref()
+            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?
+            .clone();
+        (handle, player.seek_offset)
+    };
+
+    let info = handle.get_info().await?;
+    let total_elapsed = seek_offset + info.position;
+    let new_pos = total_elapsed
+        .checked_sub(duration)
+        .unwrap_or(Duration::from_secs(0));
+
+    seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
+    let new_pos_fmt = format_seek_time(new_pos);
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏪ Rewind",
+        &format!("Rewound by **{}s** → `{}`", duration.as_secs(), new_pos_fmt),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
+
+/// Replay the current song, or play the previous one if idle.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+    let mut player = player_lock.write().await;
+
+    if let Some(handle) = &player.current_track_handle {
+        let _ = handle.seek(Duration::from_secs(0));
+        drop(player);
+        let embed = crate::discord::embeds::playback_status_embed(
+            "🔄 Replay",
+            "Replaying current track from the beginning.",
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    } else if let Some(prev) = player.previous_track.take() {
+        let prev_title = prev.title.clone();
+        player.queue.push_front(prev);
+        drop(player);
+        let embed = crate::discord::embeds::playback_status_embed(
+            "🔄 Replay",
+            &format!("Replaying previous track: **{}**", prev_title),
+            0x5865F2,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        crate::audio::events::play_next(
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
+            None,
+            true,
+        )
+        .await?;
+    } else {
+        drop(player);
+        let embed = crate::discord::embeds::playback_status_embed(
+            "❌ Error",
+            "Nothing is playing, and there is no previous track.",
+            0xED4245,
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    }
+    Ok(())
+}
+
+/// Play the previously played track.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    aliases("pv"),
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+    let mut player = player_lock.write().await;
+
+    let prev = player
+        .previous_track
+        .take()
+        .ok_or_else(|| SerenyaError::NotFound("No previous track found.".into()))?;
+
+    player.cancel_prefetch();
+    if let Some(mut curr) = player.now_playing.take() {
+        curr.resolved_url = None;
+        player.queue.push_front(curr);
+    }
+    let mut prev_to_play = prev.clone();
+    prev_to_play.resolved_url = None;
+    player.queue.push_front(prev_to_play);
+
+    player.skip_forced = true;
+    let handle_opt = player.current_track_handle.clone();
+
+    drop(player);
+
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏮️ Previous",
+        &format!("Playing previous track: **{}**", prev.title),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+
+    if let Some(handle) = handle_opt {
+        let _ = handle.stop();
+    } else {
+        crate::audio::events::play_next(
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
+            None,
+            true,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Jump to a specific track in the queue, skipping all tracks before it.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn jump(
+    ctx: Context<'_>,
+    #[description = "1-based index of the track to jump to"] position: usize,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+    let mut player = player_lock.write().await;
+    let queue_len = player.queue.len();
+
+    if position == 0 {
+        return Err(SerenyaError::Queue("Position must be 1 or greater.".into()).into());
+    }
+
+    let index = if player.now_playing.is_some() {
+        if position == 1 {
+            return Err(SerenyaError::Queue(
+                "Cannot jump to the currently playing track. Use `/replay` to restart it.".into(),
+            )
+            .into());
+        }
+        if position > queue_len + 1 {
+            return Err(SerenyaError::Queue(format!(
+                "Index {position} out of bounds (queue size is {}).",
+                queue_len + 1
+            ))
+            .into());
+        }
+        position - 2
+    } else {
+        if position > queue_len {
+            return Err(SerenyaError::Queue(format!(
+                "Index {position} out of bounds (queue size is {}).",
+                queue_len
+            ))
+            .into());
+        }
+        position - 1
+    };
+
+    player.cancel_prefetch();
+    let skipped = player.queue.jump(index)?;
+    player.skip_forced = true;
+    let handle_opt = player.current_track_handle.clone();
+
+    drop(player);
+
+    let embed = crate::discord::embeds::playback_status_embed(
+        "⏭️ Jump",
+        &format!(
+            "Jumped to track #{position}. Skipped {} tracks.",
+            skipped.len()
+        ),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+
+    if let Some(handle) = handle_opt {
+        let _ = handle.stop();
+    } else {
+        crate::audio::events::play_next(
+            crate::audio::events::PlaybackContext {
+                guild_id,
+                database: std::sync::Arc::clone(&ctx.data().database),
+                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+                http_client: ctx.data().http_client.clone(),
+                serenity_ctx: ctx.serenity_context().clone(),
+                config: ctx.data().config(),
+            },
+            None,
+            true,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Move a track within the queue.
+#[poise::command(
+    slash_command,
+    prefix_command,
+    check = "crate::discord::checks::require_same_voice_channel"
+)]
+pub async fn r#move(
+    ctx: Context<'_>,
+    #[description = "1-based index of the track to move"] from: usize,
+    #[description = "1-based index of the destination position"] to: usize,
+) -> Result<(), Error> {
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
+    let player_lock = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+    let mut player = player_lock.write().await;
+    let queue_len = player.queue.len();
+
+    if from == 0 || to == 0 {
+        return Err(SerenyaError::Queue("Index must be 1 or greater.".into()).into());
+    }
+
+    let (from_idx, to_idx) = if player.now_playing.is_some() {
+        if from == 1 || to == 1 {
+            return Err(
+                SerenyaError::Queue("Cannot move the currently playing track.".into()).into(),
+            );
+        }
+        if from > queue_len + 1 || to > queue_len + 1 {
+            return Err(SerenyaError::Queue("Index out of bounds.".into()).into());
+        }
+        (from - 2, to - 2)
+    } else {
+        if from > queue_len || to > queue_len {
+            return Err(SerenyaError::Queue("Index out of bounds.".into()).into());
+        }
+        (from - 1, to - 1)
+    };
+
+    player.cancel_prefetch();
+    player.queue.move_item(from_idx, to_idx)?;
+    drop(player);
+
+    let gp_clone = ctx.data().guild_players.clone();
+    let http_client_clone = ctx.data().http_client.clone();
+    tokio::spawn(async move {
+        crate::audio::events::trigger_prefetch(guild_id, gp_clone, http_client_clone).await;
+    });
+    let embed = crate::discord::embeds::playback_status_embed(
+        "↕️ Move",
+        &format!("Moved track from #{from} to #{to}."),
+        0x5865F2,
+    );
+    ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    Ok(())
+}
