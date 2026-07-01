@@ -395,38 +395,101 @@ pub fn play_next(
         };
 
         if track.url.starts_with("ytsearch1:") {
-            if let Err(e) =
-                crate::audio::resolver::resolve_ytsearch_track(&mut track, &ctx.http_client).await
-            {
-                tracing::error!("Failed to resolve Spotify track search: {:?}", e);
-                return fail_and_maybe_advance(
-                    &ctx,
-                    &player_lock,
-                    &call_lock,
-                    &track.url,
-                    &track.title,
-                    announce_channel,
-                )
-                .await;
-            } else {
-                let mut player = player_lock.write().await;
-                if let Some(ref mut np) = player.now_playing
-                    && np.url.starts_with("ytsearch1:")
-                {
-                    *np = track.clone();
+            let mut track_clone = track.clone();
+            let http_client = ctx.http_client.clone();
+
+            let handle = tokio::spawn(async move {
+                let res =
+                    crate::audio::resolver::resolve_ytsearch_track(&mut track_clone, &http_client)
+                        .await;
+                (res, track_clone)
+            });
+
+            match handle.await {
+                Ok((Ok(()), updated_track)) => {
+                    track = updated_track;
+                    let mut player = player_lock.write().await;
+                    if let Some(ref mut np) = player.now_playing
+                        && np.url.starts_with("ytsearch1:")
+                    {
+                        *np = track.clone();
+                    }
+                }
+                Ok((Err(e), _)) => {
+                    tracing::error!("Failed to resolve Spotify track search: {:?}", e);
+                    return fail_and_maybe_advance(
+                        &ctx,
+                        &player_lock,
+                        &call_lock,
+                        &track.url,
+                        &track.title,
+                        announce_channel,
+                    )
+                    .await;
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        "resolve_ytsearch_track task panicked or was aborted: {:?}",
+                        join_err
+                    );
+                    return fail_and_maybe_advance(
+                        &ctx,
+                        &player_lock,
+                        &call_lock,
+                        &track.url,
+                        &track.title,
+                        announce_channel,
+                    )
+                    .await;
                 }
             }
         }
 
         let resolved_res = match track.resolved_url.clone() {
-            Some(url) => Ok(url),
-            None => crate::audio::source::extract_stream_url_for_guild(
-                ctx.guild_id.get(),
-                &track.url,
-                &ctx.http_client,
-            )
-            .await
-            .map(Arc::new),
+            Some(url) => {
+                if !crate::audio::source::is_verified_stream_domain(&url.url) {
+                    Err(SerenyaError::Audio(
+                        "Cached stream returned unverified domain".into(),
+                    ))
+                } else {
+                    Ok(url)
+                }
+            }
+            None => {
+                let guild_id = ctx.guild_id.get();
+                let url = track.url.clone();
+                let client = ctx.http_client.clone();
+                let handle = tokio::spawn(async move {
+                    crate::audio::source::extract_stream_url_for_guild(guild_id, &url, &client)
+                        .await
+                });
+
+                match handle.await {
+                    Ok(Ok(url)) => {
+                        if !crate::audio::source::is_verified_stream_domain(&url.url) {
+                            tracing::warn!(
+                                "Stream resolution returned unverified domain: {}",
+                                url.url
+                            );
+                            Err(SerenyaError::Audio(
+                                "Stream resolution returned unverified domain".into(),
+                            ))
+                        } else {
+                            Ok(Arc::new(url))
+                        }
+                    }
+                    Ok(Err(e)) => Err(e),
+                    Err(join_err) => {
+                        tracing::error!(
+                            "Stream resolution task panicked or aborted: {:?}",
+                            join_err
+                        );
+                        Err(SerenyaError::Audio(
+                            "Stream resolution task panicked or aborted".into(),
+                        ))
+                    }
+                }
+            }
         };
 
         let resolved = match resolved_res {
@@ -625,24 +688,42 @@ pub async fn trigger_prefetch_with_context(
         if token.is_cancelled() {
             return;
         }
-        if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(track, &http_client).await {
-            tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
-        } else {
-            if token.is_cancelled() {
-                return;
-            }
-            let mut player = player_lock.write().await;
-            if player.prefetch_generation == generation {
-                if let Some(t) = player.queue.get_mut(0)
-                    && t.url.starts_with("ytsearch1:")
-                {
-                    t.url = track.url.clone();
-                    if t.thumbnail.is_none() {
-                        t.thumbnail = track.thumbnail.clone();
-                    }
+
+        let mut track_clone = track.clone();
+        let client_clone = http_client.clone();
+
+        let handle = tokio::spawn(async move {
+            let res =
+                crate::audio::resolver::resolve_ytsearch_track(&mut track_clone, &client_clone)
+                    .await;
+            (res, track_clone)
+        });
+
+        match handle.await {
+            Ok((Ok(()), updated_track)) => {
+                *track = updated_track;
+                if token.is_cancelled() {
+                    return;
                 }
-            } else {
-                return;
+                let mut player = player_lock.write().await;
+                if player.prefetch_generation == generation {
+                    if let Some(t) = player.queue.get_mut(0)
+                        && t.url.starts_with("ytsearch1:")
+                    {
+                        t.url = track.url.clone();
+                        if t.thumbnail.is_none() {
+                            t.thumbnail = track.thumbnail.clone();
+                        }
+                    }
+                } else {
+                    return;
+                }
+            }
+            Ok((Err(e), _)) => {
+                tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
+            }
+            Err(e) => {
+                tracing::error!("Prefetch resolver task panicked or was aborted: {:?}", e);
             }
         }
     }
@@ -678,14 +759,17 @@ pub async fn trigger_prefetch_with_context(
         return;
     }
 
-    match crate::audio::source::prefetch_stream_url_for_guild(
-        guild_id.get(),
-        &url_to_resolve,
-        &http_client,
-    )
-    .await
-    {
-        Ok(Some(resolved_url)) => {
+    let guild_id_val = guild_id.get();
+    let url_clone = url_to_resolve.clone();
+    let client_clone = http_client.clone();
+
+    let handle = tokio::spawn(async move {
+        crate::audio::source::prefetch_stream_url_for_guild(guild_id_val, &url_clone, &client_clone)
+            .await
+    });
+
+    match handle.await {
+        Ok(Ok(Some(resolved_url))) => {
             if token.is_cancelled() {
                 return;
             }
@@ -694,13 +778,20 @@ pub async fn trigger_prefetch_with_context(
                 && let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
             {
-                track.resolved_url = Some(Arc::new(resolved_url));
-                tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+                if crate::audio::source::is_verified_stream_domain(&resolved_url.url) {
+                    track.resolved_url = Some(Arc::new(resolved_url));
+                    tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+                } else {
+                    tracing::warn!(guild_id = %guild_id, url = %resolved_url.url, "Prefetch rejected due to unverified domain");
+                }
             }
         }
-        Ok(None) => {}
-        Err(e) => {
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => {
             tracing::warn!(guild_id = %guild_id, "Prefetch failed for {}: {:?}", url_to_resolve, e);
+        }
+        Err(e) => {
+            tracing::error!(guild_id = %guild_id, "Prefetch task panicked or was aborted for {}: {:?}", url_to_resolve, e);
         }
     }
 }

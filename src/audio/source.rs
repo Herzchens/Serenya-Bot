@@ -87,10 +87,40 @@ pub async fn cache_invalidate_stream(url: &str) {
 }
 
 pub async fn cache_set_stream(url: String, stream: &youtube_resolver::ResolvedStream) {
+    if !is_verified_stream_domain(&stream.url) {
+        tracing::warn!(stream_url = %stream.url, "Refused to cache stream URL: unverified domain");
+        return;
+    }
     STREAM_CACHE
         .load()
         .insert(url, Arc::new(stream.clone()))
         .await;
+}
+
+pub fn is_verified_stream_domain(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    let allowlist = [
+        "googlevideo.com",
+        "googleusercontent.com",
+        "soundcloud.com",
+        "sndcdn.com",
+        "youtube.com",
+        "youtu.be",
+        "deezer.com",
+        "dzcdn.net",
+        "spotify.com",
+        "apple.com",
+    ];
+
+    allowlist
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{}", domain)))
 }
 
 fn url_encode(s: &str) -> String {
@@ -371,10 +401,14 @@ async fn resolve_soundcloud_stream_url(
     };
 
     // 6. Cache the result for 5 minutes (SoundCloud signed URLs expire quickly)
-    SOUNDCLOUD_STREAM_CACHE
-        .load()
-        .insert(track_url.to_owned(), Arc::new(stream.clone()))
-        .await;
+    if is_verified_stream_domain(&stream.url) {
+        SOUNDCLOUD_STREAM_CACHE
+            .load()
+            .insert(track_url.to_owned(), Arc::new(stream.clone()))
+            .await;
+    } else {
+        tracing::warn!(stream_url = %stream.url, "Refused to cache SoundCloud stream URL: unverified domain");
+    }
 
     Ok(stream)
 }
