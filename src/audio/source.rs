@@ -98,9 +98,13 @@ pub async fn cache_set_stream(url: String, stream: &youtube_resolver::ResolvedSt
 }
 
 pub fn is_verified_stream_domain(url: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(url) else { return false };
-    let Some(host) = parsed.host_str() else { return false };
-    
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
     let allowlist = [
         "googlevideo.com",
         "googleusercontent.com",
@@ -113,8 +117,10 @@ pub fn is_verified_stream_domain(url: &str) -> bool {
         "spotify.com",
         "apple.com",
     ];
-    
-    allowlist.iter().any(|domain| host == *domain || host.ends_with(&format!(".{}", domain)))
+
+    allowlist
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{}", domain)))
 }
 
 fn url_encode(s: &str) -> String {
