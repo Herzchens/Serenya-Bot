@@ -428,10 +428,24 @@ pub fn play_next(
                     .await;
                 }
                 Err(join_err) => {
-                    tracing::error!(
-                        "resolve_ytsearch_track task panicked or was aborted: {:?}",
-                        join_err
-                    );
+                    if join_err.is_cancelled() {
+                        tracing::debug!(
+                            guild_id = %ctx.guild_id,
+                            "resolver task cancelled — skipping (expected during skip/stop)"
+                        );
+                        return Ok(());
+                    }
+                    if join_err.is_panic() {
+                        tracing::error!(
+                            guild_id = %ctx.guild_id,
+                            "resolver task panicked: {:?}", join_err
+                        );
+                    } else {
+                        tracing::error!(
+                            guild_id = %ctx.guild_id,
+                            "resolver task aborted: {:?}", join_err
+                        );
+                    }
                     return fail_and_maybe_advance(
                         &ctx,
                         &player_lock,
@@ -446,14 +460,9 @@ pub fn play_next(
         }
 
         let resolved_res = match track.resolved_url.clone() {
-            Some(url) => {
-                if !crate::audio::source::is_verified_stream_domain(&url.url) {
-                    Err(SerenyaError::Audio(
-                        "Cached stream returned unverified domain".into(),
-                    ))
-                } else {
-                    Ok(url)
-                }
+            Some(verified) => {
+                // Already verified by VerifiedStream construction — trust it.
+                Ok(verified)
             }
             None => {
                 let guild_id = ctx.guild_id.get();
@@ -466,27 +475,42 @@ pub fn play_next(
 
                 match handle.await {
                     Ok(Ok(url)) => {
-                        if !crate::audio::source::is_verified_stream_domain(&url.url) {
-                            tracing::warn!(
-                                "Stream resolution returned unverified domain: {}",
-                                url.url
-                            );
-                            Err(SerenyaError::Audio(
-                                "Stream resolution returned unverified domain".into(),
-                            ))
-                        } else {
-                            Ok(Arc::new(url))
+                        match crate::audio::source::accept_resolved_stream(url) {
+                            Some(verified) => Ok(verified),
+                            None => Err(SerenyaError::Audio(
+                                "Stream domain verification failed".to_owned(),
+                            )),
                         }
                     }
                     Ok(Err(e)) => Err(e),
                     Err(join_err) => {
-                        tracing::error!(
-                            "Stream resolution task panicked or aborted: {:?}",
-                            join_err
-                        );
-                        Err(SerenyaError::Audio(
-                            "Stream resolution task panicked or aborted".into(),
-                        ))
+                        if join_err.is_cancelled() {
+                            tracing::debug!(
+                                guild_id = %guild_id,
+                                "resolver task cancelled — skipping (expected during skip/stop)"
+                            );
+                            return Ok(());
+                        }
+                        if join_err.is_panic() {
+                            tracing::error!(
+                                guild_id = %guild_id,
+                                "resolver task panicked: {:?}", join_err
+                            );
+                        } else {
+                            tracing::error!(
+                                guild_id = %guild_id,
+                                "resolver task aborted: {:?}", join_err
+                            );
+                        }
+                        return fail_and_maybe_advance(
+                            &ctx,
+                            &player_lock,
+                            &call_lock,
+                            &track.url,
+                            &track.title,
+                            announce_channel,
+                        )
+                        .await;
                     }
                 }
             }
@@ -526,7 +550,7 @@ pub fn play_next(
 
         let source = match crate::audio::source::create_stream_input(
             Some(track.url.to_string()),
-            &resolved,
+            resolved.inner(),
             eight_d_enabled,
         )
         .await
@@ -669,7 +693,7 @@ pub async fn trigger_prefetch_with_context(
     let mut needs_resolution = false;
     let mut track_to_resolve = {
         let player = player_lock.read().await;
-        if player.prefetch_generation != generation {
+        if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
             return;
         }
         if let Some(track) = player.queue.iter().next() {
@@ -706,7 +730,7 @@ pub async fn trigger_prefetch_with_context(
                     return;
                 }
                 let mut player = player_lock.write().await;
-                if player.prefetch_generation == generation {
+                if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
                     if let Some(t) = player.queue.get_mut(0)
                         && t.url.starts_with("ytsearch1:")
                     {
@@ -723,7 +747,15 @@ pub async fn trigger_prefetch_with_context(
                 tracing::error!("Failed to resolve Spotify track in prefetcher: {:?}", e);
             }
             Err(e) => {
-                tracing::error!("Prefetch resolver task panicked or was aborted: {:?}", e);
+                if e.is_cancelled() {
+                    tracing::debug!("prefetch task cancelled — expected");
+                    return;
+                }
+                if e.is_panic() {
+                    tracing::error!("prefetch task panicked: {:?}", e);
+                } else {
+                    tracing::error!("prefetch task aborted: {:?}", e);
+                }
             }
         }
     }
@@ -734,7 +766,7 @@ pub async fn trigger_prefetch_with_context(
 
     let next_track_url = {
         let player = player_lock.read().await;
-        if player.prefetch_generation != generation {
+        if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
             return;
         }
         if let Some(track) = player.queue.iter().next() {
@@ -774,15 +806,16 @@ pub async fn trigger_prefetch_with_context(
                 return;
             }
             let mut player = player_lock.write().await;
-            if player.prefetch_generation == generation
+            if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
                 && let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
             {
-                if crate::audio::source::is_verified_stream_domain(&resolved_url.url) {
-                    track.resolved_url = Some(Arc::new(resolved_url));
-                    tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
-                } else {
-                    tracing::warn!(guild_id = %guild_id, url = %resolved_url.url, "Prefetch rejected due to unverified domain");
+                match crate::audio::source::accept_resolved_stream(resolved_url) {
+                    Some(verified) => {
+                        track.resolved_url = Some(verified);
+                        tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
+                    }
+                    None => {}  // warning already emitted inside accept_resolved_stream
                 }
             }
         }
@@ -791,7 +824,15 @@ pub async fn trigger_prefetch_with_context(
             tracing::warn!(guild_id = %guild_id, "Prefetch failed for {}: {:?}", url_to_resolve, e);
         }
         Err(e) => {
-            tracing::error!(guild_id = %guild_id, "Prefetch task panicked or was aborted for {}: {:?}", url_to_resolve, e);
+            if e.is_cancelled() {
+                tracing::debug!("prefetch task cancelled — expected");
+                return;
+            }
+            if e.is_panic() {
+                tracing::error!(guild_id = %guild_id, "prefetch task panicked: {:?}", e);
+            } else {
+                tracing::error!(guild_id = %guild_id, "prefetch task aborted: {:?}", e);
+            }
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::core::track::StreamTrust;
 use crate::core::Track;
 use crate::utils::SerenyaError;
 use arc_swap::ArcSwap;
@@ -28,6 +29,7 @@ fn build_metadata_cache() -> Cache<String, Track> {
 fn build_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
         .max_capacity(crate::audio::runtime::settings().stream_cache_max_capacity as u64)
+        // YouTube CDN URLs expire ~15–30 min; default 900s
         .time_to_live(Duration::from_secs(
             crate::audio::runtime::settings().stream_cache_ttl_seconds,
         ))
@@ -121,6 +123,110 @@ pub fn is_verified_stream_domain(url: &str) -> bool {
     allowlist
         .iter()
         .any(|domain| host == *domain || host.ends_with(&format!(".{}", domain)))
+}
+
+/// Verifies a stream URL according to the trust level of its source.
+///
+/// - [`StreamTrust::Native`]: trusted by definition — no domain check needed.
+/// - [`StreamTrust::External`]: must pass the domain allowlist check.
+pub fn verify_stream_url(url: &str, trust: &StreamTrust) -> bool {
+    match trust {
+        StreamTrust::Native => true,
+        StreamTrust::External => {
+            let verified = is_verified_stream_domain(url);
+            if verified {
+                tracing::debug!(url = %url, "External stream domain verified");
+            }
+            verified
+        }
+    }
+}
+
+/// A newtype wrapper around a verified resolved stream.
+///
+/// Construction guarantees the wrapped stream URL passed domain
+/// verification (or came from a trusted source). Once constructed,
+/// the inner stream can be assumed safe to play.
+#[derive(Clone, Debug)]
+pub struct VerifiedStream(pub Arc<youtube_resolver::ResolvedStream>);
+
+impl VerifiedStream {
+    /// The verified stream URL string.
+    pub fn url(&self) -> &str {
+        &self.0.url
+    }
+    /// Access the inner [`Arc<ResolvedStream>`].
+    pub fn inner(&self) -> &Arc<youtube_resolver::ResolvedStream> {
+        &self.0
+    }
+}
+
+/// Attempt to construct a [`VerifiedStream`] from a raw resolved stream.
+///
+/// Returns `Some(VerifiedStream)` if the URL domain passes verification,
+/// or `None` with a warning if it does not.
+pub fn accept_resolved_stream(
+    stream: youtube_resolver::ResolvedStream,
+) -> Option<VerifiedStream> {
+    if is_verified_stream_domain(&stream.url) {
+        Some(VerifiedStream(Arc::new(stream)))
+    } else {
+        tracing::warn!(url = %stream.url, "Rejected unverified stream domain");
+        None
+    }
+}
+
+/// Resolves a stream URL with coalescing: concurrent callers for the
+/// same `url` share one resolution instead of running N in parallel.
+///
+/// Coalesce map check happens **before** semaphore acquisition so that
+/// subscribers bypass the semaphore entirely.
+pub async fn resolve_with_coalescing<F, Fut>(
+    url: String,
+    resolver: F,
+) -> Result<youtube_resolver::ResolvedStream, SerenyaError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<youtube_resolver::ResolvedStream, SerenyaError>>,
+{
+    let runtime = &crate::audio::runtime::RESOLVER_RUNTIME;
+
+    // 1. Check coalesce map FIRST — before semaphore.
+    if let Some(tx) = runtime.coalesce_map.get(&url) {
+        let mut rx = tx.subscribe();
+        drop(tx);
+        return rx
+            .recv()
+            .await
+            .map_err(|_| SerenyaError::Audio("coalesce channel closed".into()))?
+            .map_err(|e| SerenyaError::Audio(e));
+    }
+
+    // 2. New resolution — acquire semaphore only here.
+    let _permit = runtime
+        .global_resolver_semaphore
+        .acquire()
+        .await
+        .map_err(|_| SerenyaError::Audio("semaphore closed".into()))?;
+
+    let (tx, _) = tokio::sync::broadcast::channel(1);
+    runtime.coalesce_map.insert(url.clone(), tx.clone());
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), resolver())
+        .await
+        .map_err(|_| SerenyaError::Audio("resolver timed out".into()))
+        .and_then(|r| r);
+
+    // 3. Remove BEFORE broadcast — prevents stale entry race.
+    runtime.coalesce_map.remove(&url);
+
+    let broadcast_val = match &result {
+        Ok(s) => Ok(s.clone()),
+        Err(e) => Err(e.to_string()),
+    };
+    let _ = tx.send(broadcast_val);
+
+    result
 }
 
 fn url_encode(s: &str) -> String {
@@ -261,7 +367,12 @@ pub async fn extract_stream_url_for_guild(
     http_client: &reqwest::Client,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     let _guild_permit = crate::audio::runtime::acquire_guild_resolve(guild_id).await?;
-    extract_stream_url_inner(track_url, http_client).await
+    let url_owned = track_url.to_owned();
+    let client = http_client.clone();
+    resolve_with_coalescing(url_owned, move || {
+        extract_stream_url_inner(&url_owned, &client)
+    })
+    .await
 }
 
 pub async fn prefetch_stream_url_for_guild(
@@ -285,12 +396,15 @@ pub async fn prefetch_stream_url_for_guild(
         return Ok(None);
     };
 
-    let timeout = crate::audio::runtime::prefetch_timeout();
-    match tokio::time::timeout(timeout, extract_stream_url_inner(track_url, http_client)).await {
-        Ok(result) => result.map(Some),
-        Err(_) => Err(SerenyaError::Audio(format!(
-            "prefetch stream resolution timed out after {timeout:?}"
-        ))),
+    let url_owned = track_url.to_owned();
+    let client = http_client.clone();
+    match resolve_with_coalescing(url_owned, move || {
+        extract_stream_url_inner(&url_owned, &client)
+    })
+    .await
+    {
+        Ok(stream) => Ok(Some(stream)),
+        Err(e) => Err(e),
     }
 }
 
@@ -350,16 +464,29 @@ async fn run_ytdlp_stream_resolution(
     })
 }
 
+// SoundCloud signed URLs expire ~30 min; default 1800s
 fn build_soundcloud_stream_cache() -> Cache<String, Arc<youtube_resolver::ResolvedStream>> {
     Cache::builder()
         .max_capacity(crate::audio::runtime::settings().stream_cache_max_capacity as u64)
-        .time_to_live(Duration::from_secs(300))
+        .time_to_live(Duration::from_secs(
+            crate::audio::runtime::settings().soundcloud_stream_cache_ttl_seconds,
+        ))
         .build()
 }
 
 static SOUNDCLOUD_STREAM_CACHE: LazyLock<
     ArcSwap<Cache<String, Arc<youtube_resolver::ResolvedStream>>>,
 > = LazyLock::new(|| ArcSwap::from_pointee(build_soundcloud_stream_cache()));
+
+// SoundCloud circuit breaker — trips after SC_TRIP_THRESHOLD consecutive 429s.
+static SC_CONSECUTIVE_429S: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+static SC_CIRCUIT_OPEN_UNTIL: std::sync::LazyLock<
+    std::sync::RwLock<Option<std::time::Instant>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+const SC_TRIP_THRESHOLD: u8 = 5;
+const SC_COOLDOWN_SECS: u64 = 60;
 
 async fn resolve_soundcloud_stream_url(
     track_url: &str,
@@ -368,6 +495,18 @@ async fn resolve_soundcloud_stream_url(
     if let Some(stream) = SOUNDCLOUD_STREAM_CACHE.load().get(track_url).await {
         tracing::debug!(track_url, "SoundCloud stream cache hit");
         return Ok((*stream).clone());
+    }
+
+    // Circuit breaker — fast-fail before consuming a semaphore permit.
+    {
+        let until = SC_CIRCUIT_OPEN_UNTIL.read().unwrap();
+        if let Some(t) = *until {
+            if t > std::time::Instant::now() {
+                return Err(SerenyaError::Audio(
+                    "SoundCloud circuit open — cooling down".to_owned(),
+                ));
+            }
+        }
     }
 
     let _permit = crate::audio::runtime::acquire_soundcloud_resolve().await?;
@@ -484,6 +623,17 @@ async fn fetch_track_metadata_with_backoff(
             Ok(resp) => {
                 if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     attempt += 1;
+                    let consecutive = SC_CONSECUTIVE_429S.fetch_add(1,
+                        std::sync::atomic::Ordering::Relaxed) + 1;
+                    if consecutive >= SC_TRIP_THRESHOLD {
+                        let mut until = SC_CIRCUIT_OPEN_UNTIL.write().unwrap();
+                        *until = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(SC_COOLDOWN_SECS),
+                        );
+                        tracing::warn!("SoundCloud circuit tripped — cooling down for 60s");
+                        SC_CONSECUTIVE_429S.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if attempt >= max_attempts {
                         return Err(SerenyaError::Audio(
                             "SoundCloud rate limited (429) after max retries".to_owned(),
@@ -506,6 +656,8 @@ async fn fetch_track_metadata_with_backoff(
                             e
                         ))
                     })?;
+                // Reset consecutive counter on successful response.
+                SC_CONSECUTIVE_429S.store(0, std::sync::atomic::Ordering::Relaxed);
                 return Ok(metadata);
             }
             Err(e) => {
@@ -538,6 +690,17 @@ async fn fetch_stream_url_with_backoff(
             Ok(resp) => {
                 if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     attempt += 1;
+                    let consecutive = SC_CONSECUTIVE_429S.fetch_add(1,
+                        std::sync::atomic::Ordering::Relaxed) + 1;
+                    if consecutive >= SC_TRIP_THRESHOLD {
+                        let mut until = SC_CIRCUIT_OPEN_UNTIL.write().unwrap();
+                        *until = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(SC_COOLDOWN_SECS),
+                        );
+                        tracing::warn!("SoundCloud circuit tripped — cooling down for 60s");
+                        SC_CONSECUTIVE_429S.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if attempt >= max_attempts {
                         return Err(SerenyaError::Audio(
                             "SoundCloud rate limited (429) on stream resolution after max retries"
@@ -565,6 +728,8 @@ async fn fetch_stream_url_with_backoff(
                         e
                     ))
                 })?;
+                // Reset consecutive counter on successful response.
+                SC_CONSECUTIVE_429S.store(0, std::sync::atomic::Ordering::Relaxed);
                 return Ok(stream_res.url);
             }
             Err(e) => {
@@ -583,7 +748,8 @@ async fn fetch_stream_url_with_backoff(
 fn calculate_backoff(attempt: u32) -> Duration {
     use rand::Rng;
     let base = 2u64.pow(attempt);
-    let jitter = rand::rng().random_range(0..200);
+    // jitter desynchronizes simultaneous retry storms
+    let jitter = rand::rng().random_range(0..500);
     Duration::from_millis(base * 500 + jitter)
 }
 

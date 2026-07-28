@@ -33,7 +33,7 @@ fn build_negative_cache(settings: &ResolverSection) -> Cache<String, NegativeCac
         .build()
 }
 
-struct ResolverRuntime {
+pub(crate) struct ResolverRuntime {
     settings: ArcSwap<ResolverSection>,
     spotify_settings: ArcSwapOption<crate::config::SpotifySection>,
     ytdlp_semaphore: RwLock<Arc<Semaphore>>,
@@ -44,6 +44,13 @@ struct ResolverRuntime {
     max_playlist_import: std::sync::atomic::AtomicUsize,
     ytdlp_fallback_active: std::sync::atomic::AtomicBool,
     spotify_embed_fallback_active: std::sync::atomic::AtomicBool,
+    coalesce_map: DashMap<
+        String,
+        tokio::sync::broadcast::Sender<
+            Result<youtube_resolver::ResolvedStream, String>,
+        >,
+    >,
+    global_resolver_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ResolverRuntime {
@@ -64,11 +71,13 @@ impl ResolverRuntime {
             max_playlist_import: std::sync::atomic::AtomicUsize::new(100),
             ytdlp_fallback_active: std::sync::atomic::AtomicBool::new(ytdlp_active),
             spotify_embed_fallback_active: std::sync::atomic::AtomicBool::new(spotify_active),
+            coalesce_map: DashMap::new(),
+            global_resolver_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
         }
     }
 }
 
-static RESOLVER_RUNTIME: LazyLock<ResolverRuntime> = LazyLock::new(ResolverRuntime::new);
+pub(crate) static RESOLVER_RUNTIME: LazyLock<ResolverRuntime> = LazyLock::new(ResolverRuntime::new);
 
 pub fn configure(
     settings: &ResolverSection,

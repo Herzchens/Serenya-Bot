@@ -6,6 +6,7 @@ use crate::audio::ranking::{
     MetadataConfidence, TrackCandidate, adjust_single_word_score, contains_unrequested_variant,
     has_critical_risks, jaro_winkler_similarity, score_candidates,
 };
+use crate::core::track::StreamTrust;
 use crate::core::{SourceType, Track};
 use crate::database::DatabaseManager;
 use crate::utils::SerenyaError;
@@ -424,6 +425,7 @@ async fn collect_search_results(
                 candidate.source,
                 score * 100.0
             )),
+            stream_trust: StreamTrust::External,
         })
         .collect();
 
@@ -630,6 +632,7 @@ pub async fn resolve_input(
                     resolved_url: None,
                     thumbnail: None,
                     source_provider: source_prov.clone(),
+                    stream_trust: StreamTrust::External,
                 });
             }
             return Ok(ResolvedInput::Playlist(tracks));
@@ -1030,6 +1033,7 @@ fn evaluate_confidence_and_respond(
                     cand.source,
                     score * 100.0
                 )),
+                stream_trust: StreamTrust::External,
             });
         }
         Ok(ResolvedInput::SearchResults(tracks))
@@ -1073,6 +1077,7 @@ fn evaluate_confidence_and_respond(
             resolved_url: None,
             thumbnail: forced_thumbnail.or_else(|| top_cand.thumbnail.clone()),
             source_provider: std::sync::Arc::from(selected_provider),
+            stream_trust: StreamTrust::External,
         };
 
         // Cache the high-confidence search result asynchronously to keep it non-blocking
@@ -1260,6 +1265,7 @@ async fn resolve_spotify_embed_fallback(
                 resolved_url: None,
                 thumbnail: entity_thumbnail.clone().map(std::sync::Arc::from),
                 source_provider: std::sync::Arc::from("Spotify"),
+                stream_trust: StreamTrust::External,
             });
         }
     }
@@ -1537,6 +1543,7 @@ async fn resolve_spotify_playlist_api(
                 resolved_url: None,
                 thumbnail,
                 source_provider: source_prov.clone(),
+                stream_trust: StreamTrust::External,
             });
 
             if tracks.len() >= limit {
@@ -1760,6 +1767,7 @@ async fn resolve_spotify_album_api(
                 resolved_url: None,
                 thumbnail: thumbnail.clone(),
                 source_provider: source_prov.clone(),
+                stream_trust: StreamTrust::External,
             });
 
             if tracks.len() >= limit {
@@ -1959,6 +1967,7 @@ async fn resolve_spotify_artist_top_tracks_api(
             resolved_url: None,
             thumbnail,
             source_provider: source_prov.clone(),
+            stream_trust: StreamTrust::External,
         });
     }
 
@@ -2308,6 +2317,7 @@ fn recursive_find_tracks(
                     resolved_url: None,
                     thumbnail: None,
                     source_provider: std::sync::Arc::from(provider_name),
+                    stream_trust: StreamTrust::External,
                 });
             }
         } else if let Some(video) = obj.get("playlistVideoRenderer") {
@@ -2349,6 +2359,7 @@ fn recursive_find_tracks(
                         .and_then(|t| t["url"].as_str())
                         .map(std::sync::Arc::from),
                     source_provider: std::sync::Arc::from(provider_name),
+                    stream_trust: StreamTrust::External,
                 });
             }
         } else {
@@ -2437,6 +2448,7 @@ async fn resolve_youtube_playlist(
                             .first()
                             .map(|t| std::sync::Arc::from(t.url.as_str())),
                         source_provider: provider_name.clone(),
+                        stream_trust: StreamTrust::External,
                     });
                 }
             }

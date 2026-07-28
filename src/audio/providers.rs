@@ -1,4 +1,5 @@
 use crate::audio::ranking::TrackCandidate;
+use crate::core::track::StreamTrust;
 use crate::core::{SourceType, Track};
 use crate::utils::SerenyaError;
 use async_trait::async_trait;
@@ -1109,6 +1110,7 @@ impl YouTubeProvider {
             resolved_url: None,
             thumbnail: thumbnail.map(std::sync::Arc::from),
             source_provider: std::sync::Arc::from("YouTube"),
+            stream_trust: StreamTrust::External,
         }])
     }
     async fn search_scrape(
@@ -1709,6 +1711,7 @@ impl SoundCloudProvider {
                         resolved_url: None,
                         thumbnail: meta.artwork_url.map(std::sync::Arc::from),
                         source_provider: std::sync::Arc::from("SoundCloud"),
+                        stream_trust: StreamTrust::External,
                     });
                 }
             }
@@ -1733,6 +1736,7 @@ impl SoundCloudProvider {
                 resolved_url: None,
                 thumbnail: meta.artwork_url.map(std::sync::Arc::from),
                 source_provider: std::sync::Arc::from("SoundCloud"),
+                stream_trust: StreamTrust::External,
             }])
         }
     }
@@ -1757,6 +1761,7 @@ impl DirectUrlProvider {
             resolved_url: None,
             thumbnail: None,
             source_provider: std::sync::Arc::from("Direct Link"),
+            stream_trust: StreamTrust::External,
         }])
     }
 }

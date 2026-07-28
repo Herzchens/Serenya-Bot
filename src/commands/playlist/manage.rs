@@ -1,6 +1,7 @@
 use poise::serenity_prelude as serenity;
 use std::time::Duration;
 
+use crate::core::track::StreamTrust;
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Remove a song from a playlist by its index.
@@ -103,6 +104,7 @@ pub async fn info(
             resolved_url: None,
             thumbnail: None,
             source_provider: source_prov.clone(),
+            stream_trust: StreamTrust::External,
         })
         .collect();
 

@@ -35,7 +35,7 @@ pub struct GuildPlayer {
     pub eight_d_enabled: bool,
     pub consecutive_errors: usize,
     pub prefetch_cancel: Option<CancellationToken>,
-    pub prefetch_generation: u64,
+    pub prefetch_generation: std::sync::atomic::AtomicU64,
 }
 
 impl GuildPlayer {
@@ -58,7 +58,7 @@ impl GuildPlayer {
             eight_d_enabled: false,
             consecutive_errors: 0,
             prefetch_cancel: None,
-            prefetch_generation: 0,
+            prefetch_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -66,14 +66,15 @@ impl GuildPlayer {
         if let Some(cancel) = self.prefetch_cancel.take() {
             cancel.cancel();
         }
-        self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
+        self.prefetch_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn start_prefetch(&mut self) -> (CancellationToken, u64) {
         self.cancel_prefetch();
         let token = CancellationToken::new();
         self.prefetch_cancel = Some(token.clone());
-        (token, self.prefetch_generation)
+        (token, self.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     pub fn clear_skip_votes(&mut self) {

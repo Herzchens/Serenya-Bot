@@ -83,6 +83,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cancel_token = CancellationToken::new();
     let auto_save_handle =
         database.start_auto_save(std::time::Duration::from_secs(30), cancel_token.clone());
+    let monitor_handle_cell: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let http_client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(3))
@@ -95,6 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_clone = Arc::clone(&config);
     let database_clone = Arc::clone(&database);
+    let monitor_handle_cell_clone = monitor_handle_cell.clone();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -207,12 +210,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let guild_players = Arc::new(DashMap::new());
 
-                start_empty_room_monitor(
+                let handle = start_empty_room_monitor(
                     guild_players.clone(),
                     ctx.http.clone(),
                     config_clone.clone(),
                     ctx.clone(),
+                    cancel_token.clone(),
                 );
+                *monitor_handle_cell_clone.lock().unwrap() = Some(handle);
 
                 Ok(Data {
                     config: arc_swap::ArcSwap::new(config_clone),
@@ -271,18 +276,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    shutdown(cancel_token, auto_save_handle, &database).await;
+    let monitor_handle = monitor_handle_cell.lock().unwrap().take()
+        .expect("monitor_handle must be set during setup");
+    shutdown(cancel_token, auto_save_handle, monitor_handle, &database).await;
     Ok(())
 }
 
 async fn shutdown(
     cancel_token: CancellationToken,
     auto_save_handle: tokio::task::JoinHandle<()>,
+    monitor_handle: tokio::task::JoinHandle<()>,
     database: &DatabaseManager,
 ) {
     info!(target: "shutdown", "Initiating graceful shutdown...");
 
     cancel_token.cancel();
+
+    if let Err(err) = monitor_handle.await {
+        error!(%err, "Empty room monitor panicked during shutdown");
+    }
 
     if let Err(err) = auto_save_handle.await {
         error!(%err, "Auto-save task panicked during shutdown");
@@ -418,11 +430,13 @@ fn start_empty_room_monitor(
     http: Arc<serenity::Http>,
     config: Arc<BotConfig>,
     serenity_ctx: serenity::Context,
-) {
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {
             let now = std::time::Instant::now();
             // Phase 1: Collect guild IDs without holding the shard-lock across .await
             let guild_ids: Vec<_> = guild_players.iter().map(|e| *e.key()).collect();
@@ -491,8 +505,14 @@ fn start_empty_room_monitor(
                     }
                 }
             }
+                }
+                _ = cancel_token.cancelled() => {
+                    tracing::info!("Empty room monitor received shutdown signal");
+                    break;
+                }
+            }
         }
-    });
+    })
 }
 
 async fn handle_voice_state_update(

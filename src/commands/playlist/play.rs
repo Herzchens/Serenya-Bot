@@ -1,3 +1,4 @@
+use crate::core::track::StreamTrust;
 use crate::core::Track;
 use crate::utils::{Context, Error, SerenyaError};
 
@@ -54,6 +55,7 @@ pub async fn play(
             resolved_url: None,
             thumbnail: None,
             source_provider: source_prov.clone(),
+            stream_trust: StreamTrust::External,
         });
     }
 
