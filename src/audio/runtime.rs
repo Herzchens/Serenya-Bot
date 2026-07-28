@@ -44,13 +44,13 @@ pub(crate) struct ResolverRuntime {
     max_playlist_import: std::sync::atomic::AtomicUsize,
     ytdlp_fallback_active: std::sync::atomic::AtomicBool,
     spotify_embed_fallback_active: std::sync::atomic::AtomicBool,
-    coalesce_map: DashMap<
+    pub(crate) coalesce_map: DashMap<
         String,
         tokio::sync::broadcast::Sender<
             Result<youtube_resolver::ResolvedStream, String>,
         >,
     >,
-    global_resolver_semaphore: Arc<tokio::sync::Semaphore>,
+    pub(crate) global_resolver_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ResolverRuntime {

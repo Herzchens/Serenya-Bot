@@ -25,14 +25,20 @@ pub(crate) async fn seek_by_restart(
 
     let stream = match resolved_url {
         Some(stream) => stream,
-        None => std::sync::Arc::new(
-            crate::audio::source::extract_stream_url_for_guild(
+        None => {
+            let resolved = crate::audio::source::extract_stream_url_for_guild(
                 guild_id.get(),
                 &url,
                 &ctx.data().http_client,
             )
-            .await?,
-        ),
+            .await?;
+            match crate::audio::source::accept_resolved_stream(resolved) {
+                Some(v) => v,
+                None => return Err(SerenyaError::Audio(
+                    "Stream domain verification failed".to_owned()
+                ).into()),
+            }
+        },
     };
 
     let eight_d_enabled = {
@@ -41,7 +47,7 @@ pub(crate) async fn seek_by_restart(
     };
     let source = crate::audio::source::create_ffmpeg_stream_input(
         Some(url.to_string()),
-        &stream,
+        stream.inner(),
         Some(target_position),
         eight_d_enabled,
     )

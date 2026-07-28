@@ -369,7 +369,7 @@ pub async fn extract_stream_url_for_guild(
     let _guild_permit = crate::audio::runtime::acquire_guild_resolve(guild_id).await?;
     let url_owned = track_url.to_owned();
     let client = http_client.clone();
-    resolve_with_coalescing(url_owned, move || {
+    resolve_with_coalescing(url_owned.clone(), move || {
         extract_stream_url_inner(&url_owned, &client)
     })
     .await
@@ -398,7 +398,7 @@ pub async fn prefetch_stream_url_for_guild(
 
     let url_owned = track_url.to_owned();
     let client = http_client.clone();
-    match resolve_with_coalescing(url_owned, move || {
+    match resolve_with_coalescing(url_owned.clone(), move || {
         extract_stream_url_inner(&url_owned, &client)
     })
     .await

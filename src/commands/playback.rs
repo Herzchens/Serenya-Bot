@@ -363,7 +363,8 @@ pub(crate) async fn enqueue_and_play_resolved(
                 && let Some(ref mut current) = player.now_playing
                 && (current.url == current_track.url || current.url == original_url)
             {
-                current.resolved_url = Some(std::sync::Arc::new(resolved_url));
+                current.resolved_url =
+                    crate::audio::source::accept_resolved_stream(resolved_url);
                 player.current_track_handle = Some(handle);
                 crate::audio::events::schedule_prefetch(
                     guild_id,

@@ -98,6 +98,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config_clone = Arc::clone(&config);
     let database_clone = Arc::clone(&database);
     let monitor_handle_cell_clone = monitor_handle_cell.clone();
+    let cancel_token_for_setup = cancel_token.clone();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -215,7 +216,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ctx.http.clone(),
                     config_clone.clone(),
                     ctx.clone(),
-                    cancel_token.clone(),
+                    cancel_token_for_setup.clone(),
                 );
                 *monitor_handle_cell_clone.lock().unwrap() = Some(handle);
 
