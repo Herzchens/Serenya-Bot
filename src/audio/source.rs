@@ -200,7 +200,7 @@ where
             .recv()
             .await
             .map_err(|_| SerenyaError::Audio("coalesce channel closed".into()))?
-            .map_err(|e| SerenyaError::Audio(e));
+            .map_err(SerenyaError::Audio);
     }
 
     // 2. New resolution — acquire semaphore only here.
@@ -503,12 +503,12 @@ async fn resolve_soundcloud_stream_url(
     // Circuit breaker — fast-fail before consuming a semaphore permit.
     {
         let until = SC_CIRCUIT_OPEN_UNTIL.read().unwrap();
-        if let Some(t) = *until {
-            if t > std::time::Instant::now() {
-                return Err(SerenyaError::Audio(
-                    "SoundCloud circuit open — cooling down".to_owned(),
-                ));
-            }
+        if let Some(t) = *until
+            && t > std::time::Instant::now()
+        {
+            return Err(SerenyaError::Audio(
+                "SoundCloud circuit open — cooling down".to_owned(),
+            ));
         }
     }
 

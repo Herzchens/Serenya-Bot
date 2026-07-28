@@ -826,17 +826,11 @@ pub async fn trigger_prefetch_with_context(
                 == generation
                 && let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
+                && let Some(verified) =
+                    crate::audio::source::accept_resolved_stream(resolved_url, StreamTrust::Native)
             {
-                match crate::audio::source::accept_resolved_stream(
-                    resolved_url,
-                    StreamTrust::Native,
-                ) {
-                    Some(verified) => {
-                        track.resolved_url = Some(verified);
-                        tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
-                    }
-                    None => {} // warning already emitted inside accept_resolved_stream
-                }
+                track.resolved_url = Some(verified);
+                tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
             }
         }
         Ok(Ok(None)) => {}
