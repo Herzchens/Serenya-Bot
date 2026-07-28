@@ -476,7 +476,8 @@ pub fn play_next(
 
                 match handle.await {
                     Ok(Ok(url)) => {
-                        match crate::audio::source::accept_resolved_stream(url, StreamTrust::Native) {
+                        match crate::audio::source::accept_resolved_stream(url, StreamTrust::Native)
+                        {
                             Some(verified) => Ok(verified),
                             None => Err(SerenyaError::Audio(
                                 "Stream domain verification failed".to_owned(),
@@ -694,7 +695,11 @@ pub async fn trigger_prefetch_with_context(
     let mut needs_resolution = false;
     let mut track_to_resolve = {
         let player = player_lock.read().await;
-        if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        if player
+            .prefetch_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation
+        {
             return;
         }
         if let Some(track) = player.queue.iter().next() {
@@ -731,7 +736,11 @@ pub async fn trigger_prefetch_with_context(
                     return;
                 }
                 let mut player = player_lock.write().await;
-                if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) == generation {
+                if player
+                    .prefetch_generation
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == generation
+                {
                     if let Some(t) = player.queue.get_mut(0)
                         && t.url.starts_with("ytsearch1:")
                     {
@@ -767,7 +776,11 @@ pub async fn trigger_prefetch_with_context(
 
     let next_track_url = {
         let player = player_lock.read().await;
-        if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        if player
+            .prefetch_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != generation
+        {
             return;
         }
         if let Some(track) = player.queue.iter().next() {
@@ -807,16 +820,22 @@ pub async fn trigger_prefetch_with_context(
                 return;
             }
             let mut player = player_lock.write().await;
-            if player.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            if player
+                .prefetch_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == generation
                 && let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
             {
-                match crate::audio::source::accept_resolved_stream(resolved_url, StreamTrust::Native) {
+                match crate::audio::source::accept_resolved_stream(
+                    resolved_url,
+                    StreamTrust::Native,
+                ) {
                     Some(verified) => {
                         track.resolved_url = Some(verified);
                         tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
                     }
-                    None => {}  // warning already emitted inside accept_resolved_stream
+                    None => {} // warning already emitted inside accept_resolved_stream
                 }
             }
         }

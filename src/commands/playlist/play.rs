@@ -1,5 +1,5 @@
-use crate::core::track::StreamTrust;
 use crate::core::Track;
+use crate::core::track::StreamTrust;
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Play all tracks in a playlist.

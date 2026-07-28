@@ -74,7 +74,11 @@ impl GuildPlayer {
         self.cancel_prefetch();
         let token = CancellationToken::new();
         self.prefetch_cancel = Some(token.clone());
-        (token, self.prefetch_generation.load(std::sync::atomic::Ordering::SeqCst))
+        (
+            token,
+            self.prefetch_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     pub fn clear_skip_votes(&mut self) {

@@ -277,7 +277,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let monitor_handle = monitor_handle_cell.lock().unwrap().take()
+    let monitor_handle = monitor_handle_cell
+        .lock()
+        .unwrap()
+        .take()
         .expect("monitor_handle must be set during setup");
     shutdown(cancel_token, auto_save_handle, monitor_handle, &database).await;
     Ok(())

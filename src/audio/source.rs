@@ -1,5 +1,5 @@
-use crate::core::track::StreamTrust;
 use crate::core::Track;
+use crate::core::track::StreamTrust;
 use crate::utils::SerenyaError;
 use arc_swap::ArcSwap;
 use moka::future::Cache;
@@ -484,11 +484,9 @@ static SOUNDCLOUD_STREAM_CACHE: LazyLock<
 > = LazyLock::new(|| ArcSwap::from_pointee(build_soundcloud_stream_cache()));
 
 // SoundCloud circuit breaker — trips after SC_TRIP_THRESHOLD consecutive 429s.
-static SC_CONSECUTIVE_429S: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-static SC_CIRCUIT_OPEN_UNTIL: std::sync::LazyLock<
-    std::sync::RwLock<Option<std::time::Instant>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static SC_CONSECUTIVE_429S: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static SC_CIRCUIT_OPEN_UNTIL: std::sync::LazyLock<std::sync::RwLock<Option<std::time::Instant>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
 
 const SC_TRIP_THRESHOLD: u8 = 5;
 const SC_COOLDOWN_SECS: u64 = 60;
@@ -628,8 +626,8 @@ async fn fetch_track_metadata_with_backoff(
             Ok(resp) => {
                 if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     attempt += 1;
-                    let consecutive = SC_CONSECUTIVE_429S.fetch_add(1,
-                        std::sync::atomic::Ordering::Relaxed) + 1;
+                    let consecutive =
+                        SC_CONSECUTIVE_429S.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if consecutive >= SC_TRIP_THRESHOLD {
                         let mut until = SC_CIRCUIT_OPEN_UNTIL.write().unwrap();
                         *until = Some(
@@ -695,8 +693,8 @@ async fn fetch_stream_url_with_backoff(
             Ok(resp) => {
                 if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
                     attempt += 1;
-                    let consecutive = SC_CONSECUTIVE_429S.fetch_add(1,
-                        std::sync::atomic::Ordering::Relaxed) + 1;
+                    let consecutive =
+                        SC_CONSECUTIVE_429S.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if consecutive >= SC_TRIP_THRESHOLD {
                         let mut until = SC_CIRCUIT_OPEN_UNTIL.write().unwrap();
                         *until = Some(

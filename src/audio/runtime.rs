@@ -46,9 +46,7 @@ pub(crate) struct ResolverRuntime {
     spotify_embed_fallback_active: std::sync::atomic::AtomicBool,
     pub(crate) coalesce_map: DashMap<
         String,
-        tokio::sync::broadcast::Sender<
-            Result<youtube_resolver::ResolvedStream, String>,
-        >,
+        tokio::sync::broadcast::Sender<Result<youtube_resolver::ResolvedStream, String>>,
     >,
     pub(crate) global_resolver_semaphore: Arc<tokio::sync::Semaphore>,
 }

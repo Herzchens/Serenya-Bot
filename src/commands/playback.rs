@@ -1,7 +1,7 @@
 use poise::serenity_prelude as serenity;
 
-use crate::core::track::StreamTrust;
 use crate::audio::{ResolvedInput, TrackEndHandler, TrackErrorHandler, resolve_input};
+use crate::core::track::StreamTrust;
 use crate::core::{GuildPlayer, PlaybackStatus, Track};
 use crate::utils::{Context, Error, SerenyaError};
 
