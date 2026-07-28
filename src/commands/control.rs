@@ -1,3 +1,4 @@
+use crate::core::track::StreamTrust;
 use crate::utils::{Context, Error, SerenyaError};
 use std::time::Duration;
 
@@ -32,7 +33,7 @@ pub(crate) async fn seek_by_restart(
                 &ctx.data().http_client,
             )
             .await?;
-            match crate::audio::source::accept_resolved_stream(resolved) {
+            match crate::audio::source::accept_resolved_stream(resolved, StreamTrust::Native) {
                 Some(v) => v,
                 None => return Err(SerenyaError::Audio(
                     "Stream domain verification failed".to_owned()

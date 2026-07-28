@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::track::StreamTrust;
 use crate::database::DatabaseManager;
 use crate::discord::embeds::now_playing_announce_embed;
 use crate::utils::SerenyaError;
@@ -475,7 +476,7 @@ pub fn play_next(
 
                 match handle.await {
                     Ok(Ok(url)) => {
-                        match crate::audio::source::accept_resolved_stream(url) {
+                        match crate::audio::source::accept_resolved_stream(url, StreamTrust::Native) {
                             Some(verified) => Ok(verified),
                             None => Err(SerenyaError::Audio(
                                 "Stream domain verification failed".to_owned(),
@@ -810,7 +811,7 @@ pub async fn trigger_prefetch_with_context(
                 && let Some(track) = player.queue.get_mut(0)
                 && track.url == url_to_resolve
             {
-                match crate::audio::source::accept_resolved_stream(resolved_url) {
+                match crate::audio::source::accept_resolved_stream(resolved_url, StreamTrust::Native) {
                     Some(verified) => {
                         track.resolved_url = Some(verified);
                         tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);

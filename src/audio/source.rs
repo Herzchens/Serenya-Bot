@@ -167,11 +167,12 @@ impl VerifiedStream {
 /// or `None` with a warning if it does not.
 pub fn accept_resolved_stream(
     stream: youtube_resolver::ResolvedStream,
+    trust: StreamTrust,
 ) -> Option<VerifiedStream> {
-    if is_verified_stream_domain(&stream.url) {
+    if verify_stream_url(&stream.url, &trust) {
         Some(VerifiedStream(Arc::new(stream)))
     } else {
-        tracing::warn!(url = %stream.url, "Rejected unverified stream domain");
+        tracing::warn!(url = %stream.url, trust = ?trust, "Rejected unverified stream domain");
         None
     }
 }
@@ -370,7 +371,9 @@ pub async fn extract_stream_url_for_guild(
     let url_owned = track_url.to_owned();
     let client = http_client.clone();
     resolve_with_coalescing(url_owned.clone(), move || {
-        extract_stream_url_inner(&url_owned, &client)
+        let url = url_owned.clone();
+        let c = client.clone();
+        async move { extract_stream_url_inner(&url, &c).await }
     })
     .await
 }
@@ -399,7 +402,9 @@ pub async fn prefetch_stream_url_for_guild(
     let url_owned = track_url.to_owned();
     let client = http_client.clone();
     match resolve_with_coalescing(url_owned.clone(), move || {
-        extract_stream_url_inner(&url_owned, &client)
+        let url = url_owned.clone();
+        let c = client.clone();
+        async move { extract_stream_url_inner(&url, &c).await }
     })
     .await
     {

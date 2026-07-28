@@ -156,6 +156,7 @@ pub fn yt_dlp_timeout() -> Duration {
     Duration::from_secs(settings().yt_dlp_timeout_seconds.max(1))
 }
 
+#[allow(dead_code)]
 pub fn prefetch_timeout() -> Duration {
     Duration::from_secs(settings().prefetch_timeout_seconds.max(1))
 }
