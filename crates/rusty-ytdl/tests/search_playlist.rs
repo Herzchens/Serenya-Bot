@@ -12,8 +12,5 @@ async fn search_playlist() {
     )
     .await;
 
-    println!(
-        "{:#?}",
-        playlist.and_then(|x| Ok(x.videos.len())).unwrap_or(0)
-    );
+    println!("{:#?}", playlist.map(|x| x.videos.len()).unwrap_or(0));
 }

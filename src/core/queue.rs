@@ -131,3 +131,128 @@ impl Queue {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::Queue;
+    use crate::core::{SourceType, Track};
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+
+    fn track(title: &str, id: u64) -> Track {
+        Track {
+            title: title.into(),
+            url: format!("https://example.invalid/{id}").into(),
+            duration: None,
+            requester_name: None,
+            thumbnail: None,
+            source_provider: Arc::<str>::from("test"),
+            resolved_url: None,
+            requester_id: serenity::UserId::new(id),
+            source_type: SourceType::Search,
+        }
+    }
+
+    fn titles(queue: &Queue) -> Vec<&str> {
+        queue.iter().map(|track| track.title.as_ref()).collect()
+    }
+
+    fn ids(queue: &Queue) -> Vec<u64> {
+        queue.iter().map(|track| track.requester_id.get()).collect()
+    }
+
+    #[test]
+    fn jump_to_front_preserves_target_and_order() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(vec![track("a", 1), track("b", 2), track("c", 3)], 10)
+            .unwrap();
+
+        let skipped = queue.jump(0).unwrap();
+
+        assert!(skipped.is_empty());
+        assert_eq!(titles(&queue), vec!["a", "b", "c"]);
+        assert_eq!(ids(&queue), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn jump_to_middle_drains_exact_prefix_and_keeps_target_front() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(
+                vec![track("a", 1), track("b", 2), track("c", 3), track("d", 4)],
+                10,
+            )
+            .unwrap();
+
+        let skipped = queue.jump(2).unwrap();
+
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|track| track.requester_id.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(titles(&queue), vec!["c", "d"]);
+        assert_eq!(ids(&queue), vec![3, 4]);
+    }
+
+    #[test]
+    fn out_of_bounds_jump_is_atomic() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(vec![track("a", 1), track("b", 2), track("c", 3)], 10)
+            .unwrap();
+
+        assert!(queue.jump(3).is_err());
+        assert_eq!(ids(&queue), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn move_preserves_duplicate_track_identity_and_relative_order() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(
+                vec![
+                    track("dup", 11),
+                    track("middle", 12),
+                    track("dup", 13),
+                    track("tail", 14),
+                ],
+                10,
+            )
+            .unwrap();
+
+        queue.move_item(2, 0).unwrap();
+
+        assert_eq!(titles(&queue), vec!["dup", "dup", "middle", "tail"]);
+        assert_eq!(ids(&queue), vec![13, 11, 12, 14]);
+    }
+
+    #[test]
+    fn move_forward_uses_destination_position_after_removal() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(
+                vec![track("a", 1), track("b", 2), track("c", 3), track("d", 4)],
+                10,
+            )
+            .unwrap();
+
+        queue.move_item(0, 2).unwrap();
+
+        assert_eq!(ids(&queue), vec![2, 3, 1, 4]);
+    }
+
+    #[test]
+    fn invalid_move_is_atomic() {
+        let mut queue = Queue::new();
+        queue
+            .push_batch(vec![track("a", 1), track("b", 2), track("c", 3)], 10)
+            .unwrap();
+
+        assert!(queue.move_item(1, 3).is_err());
+        assert_eq!(ids(&queue), vec![1, 2, 3]);
+    }
+}

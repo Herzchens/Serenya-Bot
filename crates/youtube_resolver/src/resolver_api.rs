@@ -1,8 +1,8 @@
 use crate::{
-    InnerTubeClient, ResolveContext, ResolveError, ResolvedStream, create_android_client,
-    create_android_vr_client, create_ios_client, create_tvhtml5_client, create_web_safari_client,
-    format_selector, get_or_fetch_session, js_solver, resolve_best_audio_stream_rusty_ytdl,
-    stream_probe,
+    BaseInnerTubeClient, InnerTubeClient, ResolveContext, ResolveError, ResolvedStream,
+    create_android_client, create_android_vr_client, create_ios_client, create_tvhtml5_client,
+    create_web_safari_client, format_selector, get_or_fetch_session, js_solver,
+    resolve_best_audio_stream_rusty_ytdl, stream_probe,
 };
 
 pub async fn probe_resolved_stream_health(
@@ -22,23 +22,39 @@ pub async fn probe_resolved_stream_health(
     .await
 }
 
+fn ordered_clients() -> Vec<BaseInnerTubeClient> {
+    vec![
+        create_android_vr_client(),
+        create_tvhtml5_client(None),
+        create_web_safari_client(),
+        create_ios_client(None),
+        create_android_client(None),
+    ]
+}
+
+fn client_is_allowed(context: &ResolveContext, client_name: &str) -> bool {
+    context.excluded_client_kind.as_deref() != Some(client_name)
+}
+
 pub async fn resolve_best_audio_stream_via_api(
     video_id: &str,
     context: &ResolveContext,
 ) -> Result<ResolvedStream, ResolveError> {
     let http_client = &context.http_client;
     let player_url = get_or_fetch_session(http_client).await?.player_url;
-    let clients = vec![
-        create_android_vr_client(),
-        create_web_safari_client(),
-        create_ios_client(None),
-        create_android_client(None),
-        create_tvhtml5_client(None),
-    ];
+    let clients = ordered_clients();
     let mut last_err =
         ResolveError::NotPlayable("All Innertube clients failed to resolve stream".to_string());
 
     for client in clients {
+        if !client_is_allowed(context, client.name()) {
+            tracing::info!(
+                client = client.name(),
+                video_id,
+                "Skipping Innertube client excluded for this retry"
+            );
+            continue;
+        }
         tracing::debug!(
             client = client.name(),
             video_id,
@@ -59,7 +75,15 @@ pub async fn resolve_best_audio_stream(
     if let Ok(stream) = resolve_best_audio_stream_via_api(video_id, context).await {
         return Ok(stream);
     }
-    resolve_best_audio_stream_rusty_ytdl(video_id, context).await
+
+    let stream = resolve_best_audio_stream_rusty_ytdl(video_id, context).await?;
+    if !client_is_allowed(context, &stream.client_kind) {
+        return Err(ResolveError::NotPlayable(format!(
+            "Fallback resolver returned client {} excluded for this retry",
+            stream.client_kind
+        )));
+    }
+    Ok(stream)
 }
 
 async fn try_client(
@@ -161,4 +185,39 @@ async fn validate_stream(
         bitrate: best_format.bitrate,
         resolve_source: format!("api_client_{}", client.name().to_lowercase()),
     })
+}
+
+#[cfg(test)]
+mod retry_client_tests {
+    use super::{client_is_allowed, ordered_clients};
+    use crate::{InnerTubeClient, ResolveContext};
+
+    #[test]
+    fn retry_exclusion_skips_only_the_failed_client() {
+        let android_vr_context = ResolveContext {
+            excluded_client_kind: Some("ANDROID_VR".to_owned()),
+            ..Default::default()
+        };
+        assert!(!client_is_allowed(&android_vr_context, "ANDROID_VR"));
+        assert!(client_is_allowed(&android_vr_context, "TVHTML5"));
+        assert!(client_is_allowed(&android_vr_context, "WEB_SAFARI"));
+
+        let tv_context = ResolveContext {
+            excluded_client_kind: Some("TVHTML5".to_owned()),
+            ..Default::default()
+        };
+        assert!(!client_is_allowed(&tv_context, "TVHTML5"));
+    }
+
+    #[test]
+    fn native_client_order_prefers_tv_before_token_sensitive_fallbacks() {
+        let names = ordered_clients()
+            .iter()
+            .map(|client| client.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["ANDROID_VR", "TVHTML5", "WEB_SAFARI", "IOS", "ANDROID"]
+        );
+    }
 }

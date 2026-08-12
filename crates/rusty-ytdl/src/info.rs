@@ -71,6 +71,10 @@ impl Video<'static> {
     }
 }
 
+fn initial_range_end(start: u64, dl_chunk_size: u64) -> u64 {
+    start.saturating_add(dl_chunk_size.saturating_sub(1))
+}
+
 impl<'opts> Video<'opts> {
     /// Crate [`Video`] struct to get info or download with custom [`VideoOptions`]
     /// `VideoOptions` can be passed by value or by reference, if passed by
@@ -337,7 +341,7 @@ impl<'opts> Video<'opts> {
             .unwrap_or(DEFAULT_DL_CHUNK_SIZE);
 
         let start = 0;
-        let end = start + dl_chunk_size;
+        let end = initial_range_end(start, dl_chunk_size);
 
         let mut content_length = format
             .content_length
@@ -433,7 +437,7 @@ impl<'opts> Video<'opts> {
             .unwrap_or(DEFAULT_DL_CHUNK_SIZE);
 
         let start = 0;
-        let end = start + dl_chunk_size;
+        let end = initial_range_end(start, dl_chunk_size);
 
         let mut content_length = format
             .content_length
@@ -636,4 +640,27 @@ async fn get_m3u8(
             })
         })
         .collect::<Vec<(String, String)>>())
+}
+
+#[cfg(test)]
+mod initial_range_tests {
+    use super::initial_range_end;
+
+    #[test]
+    fn initial_range_respects_configured_maximum_chunk_size() {
+        let start = 0;
+        let chunk_size = 3;
+        let end = initial_range_end(start, chunk_size);
+        assert_eq!(end - start + 1, chunk_size);
+        assert_eq!(end, 2);
+    }
+
+    #[test]
+    fn nonzero_start_preserves_same_maximum_chunk_size() {
+        let start = 41;
+        let chunk_size = 7;
+        let end = initial_range_end(start, chunk_size);
+        assert_eq!(end - start + 1, chunk_size);
+        assert_eq!(end, 47);
+    }
 }

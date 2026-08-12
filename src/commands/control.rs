@@ -1,6 +1,13 @@
 use crate::utils::{Context, Error, SerenyaError};
 use std::time::Duration;
 
+fn restart_play_mode(status: crate::core::PlaybackStatus) -> songbird::tracks::PlayMode {
+    match status {
+        crate::core::PlaybackStatus::Paused => songbird::tracks::PlayMode::Pause,
+        _ => songbird::tracks::PlayMode::Play,
+    }
+}
+
 fn format_seek_time(d: Duration) -> String {
     let total_secs = d.as_secs();
     let mins = total_secs / 60;
@@ -14,26 +21,30 @@ pub(crate) async fn seek_by_restart(
     player_lock: std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
     target_position: Duration,
 ) -> Result<(), Error> {
-    let (url, resolved_url) = {
+    let (url, interrupted_handle_uuid) = {
         let player = player_lock.read().await;
-        let track = player
+        let url = player
             .now_playing
             .as_ref()
-            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?;
-        (track.url.clone(), track.resolved_url.clone())
+            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?
+            .url
+            .clone();
+        let handle_uuid = player
+            .current_track_handle
+            .as_ref()
+            .ok_or_else(|| SerenyaError::Voice("Nothing is currently playing.".into()))?
+            .uuid();
+        (url, handle_uuid)
     };
 
-    let stream = match resolved_url {
-        Some(stream) => stream,
-        None => std::sync::Arc::new(
-            crate::audio::source::extract_stream_url_for_guild(
-                guild_id.get(),
-                &url,
-                &ctx.data().http_client,
-            )
-            .await?,
-        ),
-    };
+    let stream = std::sync::Arc::new(
+        crate::audio::source::extract_stream_url_for_guild(
+            guild_id.get(),
+            &url,
+            &ctx.data().http_client,
+        )
+        .await?,
+    );
 
     let eight_d_enabled = {
         let player = player_lock.read().await;
@@ -56,17 +67,40 @@ pub(crate) async fn seek_by_restart(
         .get(guild_id)
         .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel.".into()))?;
 
+    crate::audio::events::finalize_interrupted_playback_stats_for_handle(
+        ctx.data().database.as_ref(),
+        guild_id,
+        &player_lock,
+        interrupted_handle_uuid,
+    )
+    .await;
+
     let old_handle_opt = {
         let mut player = player_lock.write().await;
-        let has_old_handle = player.current_track_handle.is_some();
-        player.is_seeking = has_old_handle;
+        let current_handle_uuid = player
+            .current_track_handle
+            .as_ref()
+            .map(|handle| handle.uuid());
+        if current_handle_uuid != Some(interrupted_handle_uuid)
+            || player.now_playing.as_ref().map(|track| &*track.url) != Some(&*url)
+        {
+            return Err(SerenyaError::Voice(
+                "Track changed while seek was being prepared. Try the command again.".into(),
+            )
+            .into());
+        }
+        player.is_seeking = true;
         player.seek_offset = target_position;
-        player.current_track_handle.take()
+        let restart_mode = restart_play_mode(player.playback_status);
+        (player.current_track_handle.take(), restart_mode)
     };
 
+    let (old_handle_opt, restart_mode) = old_handle_opt;
     let handle = {
         let mut call = call_lock.lock().await;
-        call.play_input(source)
+        let mut track = songbird::tracks::Track::from(source);
+        track.playing = restart_mode;
+        call.play(track)
     };
 
     let playback_ctx = crate::audio::events::PlaybackContext {
@@ -75,7 +109,7 @@ pub(crate) async fn seek_by_restart(
         guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
         http_client: ctx.data().http_client.clone(),
         serenity_ctx: ctx.serenity_context().clone(),
-        config: ctx.data().config(),
+        config: std::sync::Arc::clone(&ctx.data().config),
     };
 
     let end_handler = crate::audio::events::TrackEndHandler {
@@ -95,6 +129,8 @@ pub(crate) async fn seek_by_restart(
     {
         let mut player = player_lock.write().await;
         if player.now_playing.as_ref().map(|current| &*current.url) == Some(&*url) {
+            player.failure_state.reset();
+            player.failure_state.begin_attempt(handle.uuid());
             player.current_track_handle = Some(handle.clone());
         } else {
             let _ = handle.stop();
@@ -271,9 +307,9 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
     let mut player = player_lock.write().await;
 
-    if let Some(handle) = &player.current_track_handle {
-        let _ = handle.seek(Duration::from_secs(0));
+    if player.current_track_handle.is_some() {
         drop(player);
+        seek_by_restart(ctx, guild_id, player_lock, Duration::ZERO).await?;
         let embed = crate::discord::embeds::playback_status_embed(
             "🔄 Replay",
             "Replaying current track from the beginning.",
@@ -297,7 +333,7 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
                 guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
                 http_client: ctx.data().http_client.clone(),
                 serenity_ctx: ctx.serenity_context().clone(),
-                config: ctx.data().config(),
+                config: std::sync::Arc::clone(&ctx.data().config),
             },
             None,
             true,
@@ -371,7 +407,7 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
                 guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
                 http_client: ctx.data().http_client.clone(),
                 serenity_ctx: ctx.serenity_context().clone(),
-                config: ctx.data().config(),
+                config: std::sync::Arc::clone(&ctx.data().config),
             },
             None,
             true,
@@ -379,6 +415,10 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
         .await?;
     }
     Ok(())
+}
+
+fn jump_skipped_count(has_current: bool, queued_skipped: usize) -> usize {
+    queued_skipped + usize::from(has_current)
 }
 
 /// Jump to a specific track in the queue, skipping all tracks before it.
@@ -403,12 +443,13 @@ pub async fn jump(
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
     let mut player = player_lock.write().await;
     let queue_len = player.queue.len();
+    let has_current = player.now_playing.is_some();
 
     if position == 0 {
         return Err(SerenyaError::Queue("Position must be 1 or greater.".into()).into());
     }
 
-    let index = if player.now_playing.is_some() {
+    let index = if has_current {
         if position == 1 {
             return Err(SerenyaError::Queue(
                 "Cannot jump to the currently playing track. Use `/replay` to restart it.".into(),
@@ -441,11 +482,12 @@ pub async fn jump(
 
     drop(player);
 
+    let skipped_count = jump_skipped_count(has_current, skipped.len());
     let embed = crate::discord::embeds::playback_status_embed(
         "⏭️ Jump",
         &format!(
             "Jumped to track #{position}. Skipped {} tracks.",
-            skipped.len()
+            skipped_count
         ),
         0x5865F2,
     );
@@ -461,7 +503,7 @@ pub async fn jump(
                 guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
                 http_client: ctx.data().http_client.clone(),
                 serenity_ctx: ctx.serenity_context().clone(),
-                config: ctx.data().config(),
+                config: std::sync::Arc::clone(&ctx.data().config),
             },
             None,
             true,
@@ -531,4 +573,38 @@ pub async fn r#move(
     );
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod restart_play_mode_tests {
+    use super::restart_play_mode;
+    use crate::core::PlaybackStatus;
+    use songbird::tracks::PlayMode;
+
+    #[test]
+    fn paused_seek_restart_stays_paused() {
+        assert_eq!(restart_play_mode(PlaybackStatus::Paused), PlayMode::Pause);
+    }
+
+    #[test]
+    fn playing_seek_restart_keeps_playing() {
+        assert_eq!(restart_play_mode(PlaybackStatus::Playing), PlayMode::Play);
+    }
+}
+
+#[cfg(test)]
+mod jump_count_tests {
+    use super::jump_skipped_count;
+
+    #[test]
+    fn jump_count_includes_current_track_when_playback_is_active() {
+        assert_eq!(jump_skipped_count(true, 0), 1);
+        assert_eq!(jump_skipped_count(true, 2), 3);
+    }
+
+    #[test]
+    fn jump_count_without_current_track_is_only_queue_prefix() {
+        assert_eq!(jump_skipped_count(false, 0), 0);
+        assert_eq!(jump_skipped_count(false, 2), 2);
+    }
 }

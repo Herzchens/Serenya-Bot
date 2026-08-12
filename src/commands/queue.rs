@@ -162,6 +162,13 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
         .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
+    crate::audio::events::finalize_interrupted_playback_stats(
+        ctx.data().database.as_ref(),
+        guild_id,
+        &player_lock,
+    )
+    .await;
+
     let handle_opt = {
         let mut player = player_lock.write().await;
         player.cancel_prefetch();
@@ -169,6 +176,7 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
         let handle = player.current_track_handle.take();
         player.now_playing = None;
         player.playback_status = crate::core::PlaybackStatus::Idle;
+        player.failure_state.reset();
         player.clear_skip_votes();
         handle
     };

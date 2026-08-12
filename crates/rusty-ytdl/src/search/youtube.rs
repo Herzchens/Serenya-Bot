@@ -35,6 +35,29 @@ pub struct YouTube {
     innertube_cache: Arc<RwLock<Option<String>>>,
 }
 
+fn parse_suggestion_body(body: &str) -> Result<Vec<String>, VideoError> {
+    let serde_value = serde_json::from_str::<serde_json::Value>(body)
+        .map_err(|_| VideoError::BodyCannotParsed)?;
+
+    let suggestion = serde_value
+        .as_array()
+        .and_then(|x| x.get(1))
+        .and_then(|x| x.as_array())
+        .map(|x| {
+            x.iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(|text| text.to_owned())
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(suggestion)
+}
+
 impl YouTube {
     /// Create new YouTube search struct with default [`RequestOptions`]
     pub fn new() -> Result<Self, VideoError> {
@@ -231,16 +254,7 @@ impl YouTube {
 
         let body = get_html(&self.client, url, None).await?;
 
-        let serde_value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
-
-        let suggestion = serde_value
-            .as_array()
-            .and_then(|x| x.get(1))
-            .and_then(|x| x.as_array())
-            .map(|x| x.iter().map(|x| x.to_string()).collect())
-            .unwrap_or_default();
-
-        Ok(suggestion)
+        parse_suggestion_body(&body)
     }
 
     async fn innertube_key(&self) -> String {
@@ -474,6 +488,28 @@ pub struct Playlist {
     #[serde(skip_serializing)]
     #[derivative(PartialEq = "ignore")]
     client: reqwest_middleware::ClientWithMiddleware,
+}
+
+fn build_continuation_body(continuation_token: &str, client_version: &str) -> serde_json::Value {
+    let mut client = serde_json::json!({
+        "utcOffsetMinutes": 0,
+        "gl": "US",
+        "hl": "en",
+        "clientName": "WEB"
+    });
+
+    if !client_version.is_empty() {
+        client["clientVersion"] = serde_json::Value::String(client_version.to_owned());
+    }
+
+    serde_json::json!({
+        "continuation": continuation_token,
+        "context": {
+            "client": client,
+            "user": {},
+            "request": {}
+        }
+    })
 }
 
 impl Playlist {
@@ -895,17 +931,11 @@ impl Playlist {
             .as_ref()
             .and_then(|x| x.token.clone())
             .unwrap_or("".to_string());
-        let mut client_version = self
+        let client_version = self
             .continuation
             .as_ref()
             .and_then(|x| x.client_version.clone())
             .unwrap_or("".to_string());
-
-        if client_version.is_empty() {
-            client_version = "".to_string();
-        } else {
-            client_version = format!(r#""clientVersion": "{client_version}""#);
-        }
 
         let continuation_api = self
             .continuation
@@ -913,26 +943,8 @@ impl Playlist {
             .and_then(|x| x.api.clone())
             .unwrap_or("".to_string());
 
-        let format_str = format!(
-            r#"{{
-                "continuation": "{continuation_token}",
-                "context": {{
-                    "client": {{
-                        "utcOffsetMinutes": 0,
-                        "gl": "US",
-                        "hl": "en",
-                        "clientName": "WEB",
-                        {client_version}
-                    }},
-                    "user": {{}},
-                    "request": {{}}
-                }}
-            }}
-            "#
-        );
-
         // Get json object with continuation token
-        let body: serde_json::Value = serde_json::from_str(&format_str).unwrap();
+        let body = build_continuation_body(&continuation_token, &client_version);
 
         let res = self
             .client
@@ -1328,6 +1340,36 @@ fn get_api_key(html: &str) -> String {
     DEFAULT_INNERTUBE_KEY.to_string()
 }
 
+fn build_innertube_url(path: &str, key: &str) -> String {
+    format!("https://youtube.com/youtubei/v1{path}?key={key}")
+}
+
+fn build_search_request_body(
+    query: &str,
+    filter: Option<&str>,
+    original_url: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "query": query,
+        "context": {
+            "client": {
+                "utcOffsetMinutes": 0,
+                "gl": "US",
+                "hl": "en",
+                "clientName": "WEB",
+                "clientVersion": "1.20220406.00.00",
+                "originalUrl": original_url
+            }
+        }
+    });
+
+    if let Some(filter) = filter {
+        body["params"] = serde_json::Value::String(filter.to_owned());
+    }
+
+    body
+}
+
 async fn make_request(
     client: &reqwest_middleware::ClientWithMiddleware,
     key: impl Into<String>,
@@ -1361,39 +1403,14 @@ async fn make_request(
         );
     }
 
-    let original_url = &request_options.original_url;
-    let query = &request_options.query;
-    let filter = if request_options.filter.is_some() {
-        format!(
-            r#""params": "{}","#,
-            request_options.filter.as_ref().unwrap()
-        )
-    } else {
-        "".to_string()
-    };
-
-    let format_str = format!(
-        r#"{{
-            "query": "{query}",
-            {filter}
-            "context": {{
-                "client": {{
-                    "utcOffsetMinutes": 0,
-                    "gl": "US",
-                    "hl": "en",
-                    "clientName": "WEB",
-                    "clientVersion": "1.20220406.00.00",
-                    "originalUrl": "{original_url}"
-                }}
-            }}
-        }}
-        "#
+    let body = build_search_request_body(
+        &request_options.query,
+        request_options.filter.as_deref(),
+        &request_options.original_url,
     );
 
-    let body: serde_json::Value = serde_json::from_str(&format_str).unwrap();
-
     let res = client
-        .post(format!("https://youtube.com/youtubei/v1${url}?key=${key}"))
+        .post(build_innertube_url(&url, &key))
         .headers(headers)
         .json(&body)
         .send()
@@ -2079,4 +2096,146 @@ fn format_search_result(
 
     // return results array
     res
+}
+
+#[cfg(test)]
+mod suggestion_parser_tests {
+    use super::parse_suggestion_body;
+    use crate::VideoError;
+
+    #[test]
+    fn valid_suggestion_json_control_preserves_current_values() {
+        let parsed = parse_suggestion_body(r#"["query",["alpha","beta"]]"#)
+            .expect("valid suggestion fixture should parse");
+        assert_eq!(parsed, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn non_string_suggestion_values_preserve_previous_fallback_rendering() {
+        let parsed = parse_suggestion_body(r#"["query",["alpha",17,null]]"#)
+            .expect("mixed suggestion fixture should parse");
+        assert_eq!(parsed, vec!["alpha", "17", "null"]);
+    }
+
+    #[test]
+    fn malformed_suggestion_json_returns_error_without_panicking() {
+        let call = std::panic::catch_unwind(|| parse_suggestion_body("not-json"));
+        assert!(call.is_ok(), "malformed provider JSON must not panic");
+        let result = call.expect("parser must return normally");
+        assert!(matches!(result, Err(VideoError::BodyCannotParsed)));
+    }
+}
+
+#[cfg(test)]
+mod innertube_url_tests {
+    use super::build_innertube_url;
+
+    #[test]
+    fn innertube_search_url_has_no_literal_dollar_markers() {
+        assert_eq!(
+            build_innertube_url("/search", "abc123"),
+            "https://youtube.com/youtubei/v1/search?key=abc123"
+        );
+    }
+
+    #[test]
+    fn innertube_url_preserves_requested_api_path() {
+        assert_eq!(
+            build_innertube_url("/browse", "key-42"),
+            "https://youtube.com/youtubei/v1/browse?key=key-42"
+        );
+    }
+}
+
+#[cfg(test)]
+mod continuation_body_tests {
+    use super::build_continuation_body;
+
+    #[test]
+    fn continuation_body_control_preserves_normal_values() {
+        let body = build_continuation_body("token-123", "2.20260811.00.00");
+        assert_eq!(body["continuation"].as_str(), Some("token-123"));
+        assert_eq!(
+            body["context"]["client"]["clientVersion"].as_str(),
+            Some("2.20260811.00.00")
+        );
+    }
+
+    #[test]
+    fn continuation_body_preserves_json_special_characters() {
+        let token = "tok\"en\\with\nnewline";
+        let version = "2.\"quoted\\version";
+        let call = std::panic::catch_unwind(|| build_continuation_body(token, version));
+        assert!(
+            call.is_ok(),
+            "provider values must not break JSON construction"
+        );
+        let body = call.expect("continuation body construction must return normally");
+        assert_eq!(body["continuation"].as_str(), Some(token));
+        assert_eq!(
+            body["context"]["client"]["clientVersion"].as_str(),
+            Some(version)
+        );
+    }
+
+    #[test]
+    fn empty_client_version_omits_optional_field_without_panicking() {
+        let call = std::panic::catch_unwind(|| build_continuation_body("token-123", ""));
+        assert!(
+            call.is_ok(),
+            "missing client version must not create invalid JSON"
+        );
+        let body = call.expect("continuation body construction must return normally");
+        assert_eq!(body["continuation"].as_str(), Some("token-123"));
+        assert!(body["context"]["client"].get("clientVersion").is_none());
+    }
+}
+
+#[cfg(test)]
+mod search_request_body_tests {
+    use super::build_search_request_body;
+
+    #[test]
+    fn search_request_body_control_preserves_normal_values() {
+        let body = build_search_request_body(
+            "normal query",
+            Some("EgIQAQ%253D%253D"),
+            "https://youtube.com/results?search_query=normal+query",
+        );
+        assert_eq!(body["query"].as_str(), Some("normal query"));
+        assert_eq!(body["params"].as_str(), Some("EgIQAQ%253D%253D"));
+    }
+
+    #[test]
+    fn search_request_body_preserves_user_query_json_special_characters() {
+        let query = "quote \" slash \\ newline\nvalue";
+        let call = std::panic::catch_unwind(|| {
+            build_search_request_body(query, None, "https://youtube.com/results?search_query=test")
+        });
+        assert!(
+            call.is_ok(),
+            "valid user query text must not break JSON construction"
+        );
+        let body = call.expect("search request body must return normally");
+        assert_eq!(body["query"].as_str(), Some(query));
+    }
+
+    #[test]
+    fn filter_and_original_url_are_structurally_escaped() {
+        let filter = "filter\"\\value";
+        let original_url = "https://youtube.com/results?x=\"quoted\"&y=\\slash";
+        let call = std::panic::catch_unwind(|| {
+            build_search_request_body("query", Some(filter), original_url)
+        });
+        assert!(
+            call.is_ok(),
+            "filter and original URL values must not break JSON construction"
+        );
+        let body = call.expect("search request body must return normally");
+        assert_eq!(body["params"].as_str(), Some(filter));
+        assert_eq!(
+            body["context"]["client"]["originalUrl"].as_str(),
+            Some(original_url)
+        );
+    }
 }

@@ -57,29 +57,9 @@ pub async fn play(
         });
     }
 
-    let manager = songbird::get(ctx.serenity_context())
-        .await
-        .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
-        .clone();
+    crate::commands::playback::ensure_play_voice(ctx, guild_id, user_channel_id).await?;
 
-    let call_lock = if let Some(call) = manager.get(guild_id) {
-        call
-    } else {
-        let call = manager
-            .join(guild_id, user_channel_id)
-            .await
-            .map_err(|e| SerenyaError::Voice(format!("Failed to join voice channel: {}", e)))?;
-        let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await;
-        call
-    };
-
-    crate::commands::playback::enqueue_and_play_resolved(
-        ctx,
-        guild_id,
-        user_channel_id,
-        call_lock,
-        tracks,
-    )
-    .await?;
+    crate::commands::playback::enqueue_and_play_resolved(ctx, guild_id, user_channel_id, tracks)
+        .await?;
     Ok(())
 }

@@ -112,3 +112,69 @@ async fn test_db_playlists() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tokio::fs::remove_file(&db_path).await;
     Ok(())
 }
+
+async fn remove_db_files(path: &Path) {
+    let _ = tokio::fs::remove_file(path).await;
+    let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+    let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+}
+
+#[tokio::test]
+async fn stale_save_cannot_mark_a_newer_update_as_persisted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db_path = get_temp_db_path();
+    let manager = DatabaseManager::load(&db_path).await?;
+
+    let mut first = manager.get_guild_settings(100).await;
+    first.announce_track = false;
+    manager.update_guild_settings(100, first).await;
+
+    let (stale_snapshot, stale_revision) = manager.snapshot_for_save().await;
+
+    let mut newer = manager.get_guild_settings(100).await;
+    newer.announce_track = true;
+    newer.quality = "max".to_owned();
+    manager.update_guild_settings(100, newer).await;
+
+    manager
+        .persist_snapshot(stale_snapshot, stale_revision)
+        .await?;
+    assert!(manager.is_dirty());
+
+    manager.save().await?;
+    assert!(!manager.is_dirty());
+
+    let reloaded = DatabaseManager::load(&db_path).await?;
+    let persisted = reloaded.get_guild_settings(100).await;
+    assert!(persisted.announce_track);
+    assert_eq!(persisted.quality, "max");
+
+    remove_db_files(&db_path).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_saves_share_one_serialized_persistence_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db_path = get_temp_db_path();
+    let manager = DatabaseManager::load(&db_path).await?;
+
+    let mut settings = manager.get_guild_settings(200).await;
+    settings.quality = "premium".to_owned();
+    manager.update_guild_settings(200, settings).await;
+
+    let (left, right) = tokio::join!(manager.save(), manager.save());
+    left?;
+    right?;
+    assert!(!manager.is_dirty());
+
+    let persisted = tokio::fs::read_to_string(&db_path).await?;
+    let parsed: Database = serde_saphyr::from_str(&persisted)?;
+    assert_eq!(
+        parsed.guild_settings.get("200").map(|s| s.quality.as_str()),
+        Some("premium")
+    );
+
+    remove_db_files(&db_path).await;
+    Ok(())
+}

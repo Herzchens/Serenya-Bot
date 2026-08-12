@@ -30,6 +30,7 @@ fn build_negative_cache(settings: &ResolverSection) -> Cache<String, NegativeCac
     Cache::builder()
         .max_capacity(settings.negative_cache_max_capacity as u64)
         .time_to_live(Duration::from_secs(settings.negative_cache_ttl_seconds))
+        .support_invalidation_closures()
         .build()
 }
 
@@ -105,8 +106,25 @@ pub fn configure(
         .store(Arc::new(build_negative_cache(settings)));
 }
 
+fn cleanup_guild_state(runtime: &ResolverRuntime, guild_id: u64) {
+    runtime.guild_resolve_semaphores.remove(&guild_id);
+
+    let prefix = format!("stream:{guild_id}:");
+    if let Err(error) = runtime
+        .negative_cache
+        .load()
+        .invalidate_entries_if(move |key, _| key.starts_with(&prefix))
+    {
+        tracing::warn!(
+            guild_id,
+            error = %error,
+            "failed to invalidate guild-scoped resolver negative-cache entries"
+        );
+    }
+}
+
 pub fn cleanup_guild(guild_id: u64) {
-    RESOLVER_RUNTIME.guild_resolve_semaphores.remove(&guild_id);
+    cleanup_guild_state(&RESOLVER_RUNTIME, guild_id);
 }
 
 pub fn negative_cache_entry_count() -> u64 {
@@ -200,6 +218,21 @@ pub async fn acquire_soundcloud_resolve() -> Result<OwnedSemaphorePermit, Sereny
         .map_err(|_| SerenyaError::Audio("SoundCloud limiter is closed".into()))
 }
 
+async fn within_deadline<T, F>(
+    context: &str,
+    timeout_duration: Duration,
+    future: F,
+) -> Result<T, SerenyaError>
+where
+    F: std::future::Future<Output = Result<T, SerenyaError>>,
+{
+    tokio::time::timeout(timeout_duration, future)
+        .await
+        .map_err(|_| {
+            SerenyaError::Audio(format!("{context} timed out after {timeout_duration:?}"))
+        })?
+}
+
 pub async fn run_ytdlp(
     context: &'static str,
     args: Vec<String>,
@@ -211,25 +244,23 @@ pub async fn run_ytdlp(
         return Err(youtube_degraded_error());
     }
 
-    let _permit = acquire_ytdlp().await?;
     let started = Instant::now();
-    let mut command = tokio::process::Command::new("yt-dlp");
-    command.args(&args).kill_on_drop(true);
-    #[cfg(windows)]
-    {
-        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
-    }
+    let output = within_deadline(context, timeout_duration, async {
+        let _permit = acquire_ytdlp().await?;
+        let mut command = tokio::process::Command::new("yt-dlp");
+        command.args(&args).kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
+        }
 
-    let output = tokio::time::timeout(timeout_duration, command.output())
-        .await
-        .map_err(|_| {
-            SerenyaError::Audio(format!("{context} timed out after {timeout_duration:?}"))
-        })?
-        .map_err(|err| {
+        command.output().await.map_err(|err| {
             SerenyaError::Audio(format!("Failed to execute yt-dlp for {context}: {err}"))
-        })?;
+        })
+    })
+    .await?;
 
     let elapsed_ms = started.elapsed().as_millis();
     tracing::debug!(
@@ -345,8 +376,7 @@ pub fn contains_youtube_rate_limit(stderr: &str) -> bool {
 
 pub fn should_negative_cache(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    contains_youtube_rate_limit(&lower)
-        || lower.contains("video unavailable")
+    lower.contains("video unavailable")
         || lower.contains("content isn't available")
         || lower.contains("requested format is not available")
         || lower.contains("this video is unavailable")
@@ -365,6 +395,136 @@ fn summarize_stderr(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_guild_clears_only_target_guild_runtime_state() {
+        let runtime = ResolverRuntime::new();
+        let guilds = [
+            9_301_001_u64,
+            9_301_002,
+            9_301_003,
+            9_301_004,
+            9_301_005,
+            9_301_006,
+            9_301_007,
+        ];
+        let target_index = 3_usize;
+        let source = "https://youtube.com/watch?v=cleanup-seven-guilds";
+        let mut keys = Vec::with_capacity(guilds.len());
+        let mut semaphores = Vec::with_capacity(guilds.len());
+
+        for guild_id in guilds {
+            let semaphore = Arc::new(Semaphore::new(1));
+            runtime
+                .guild_resolve_semaphores
+                .insert(guild_id, Arc::clone(&semaphore));
+            semaphores.push(semaphore);
+
+            let key = negative_cache_key("stream", &format!("{guild_id}:{source}"));
+            runtime
+                .negative_cache
+                .load()
+                .insert(
+                    key.clone(),
+                    NegativeCacheEntry {
+                        reason: format!("guild-{guild_id}-failure"),
+                    },
+                )
+                .await;
+            keys.push(key);
+        }
+
+        cleanup_guild_state(&runtime, guilds[target_index]);
+
+        assert!(
+            runtime
+                .negative_cache
+                .load()
+                .get(&keys[target_index])
+                .await
+                .is_none(),
+            "cleanup must remove the target guild's stale stream negative-cache entries"
+        );
+        assert!(
+            runtime
+                .guild_resolve_semaphores
+                .get(&guilds[target_index])
+                .is_none(),
+            "cleanup must remove the target guild resolver semaphore"
+        );
+
+        for (index, guild_id) in guilds.into_iter().enumerate() {
+            if index == target_index {
+                continue;
+            }
+
+            assert!(
+                runtime
+                    .negative_cache
+                    .load()
+                    .get(&keys[index])
+                    .await
+                    .is_some(),
+                "cleanup of one guild must not erase another guild's negative-cache state"
+            );
+            let current = runtime
+                .guild_resolve_semaphores
+                .get(&guild_id)
+                .expect("non-target guild semaphore must remain");
+            assert!(
+                Arc::ptr_eq(current.value(), &semaphores[index]),
+                "cleanup of one guild must not replace another guild's resolver semaphore"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn negative_cache_entries_are_isolated_by_guild_key() {
+        let source = "https://youtube.com/watch?v=same-source";
+        let guild_a = negative_cache_key("stream", &format!("{}:{source}", 101));
+        let guild_b = negative_cache_key("stream", &format!("{}:{source}", 202));
+        remember_negative(guild_a.clone(), "temporary guild-a failure".to_owned()).await;
+        assert!(negative_cache_get(&guild_a).await.is_some());
+        assert!(negative_cache_get(&guild_b).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn deadline_includes_time_waiting_for_a_permit() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+        let release_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            drop(held);
+        });
+        let operation_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_flag = std::sync::Arc::clone(&operation_started);
+        let waiting_semaphore = std::sync::Arc::clone(&semaphore);
+
+        let started = Instant::now();
+        let result = within_deadline("permit wait", Duration::from_millis(40), async move {
+            let _permit = waiting_semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| SerenyaError::Audio("test semaphore closed".into()))?;
+            started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), SerenyaError>(())
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err());
+        assert!(!operation_started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(elapsed < Duration::from_millis(100));
+        release_task.await.unwrap();
+    }
+
+    #[test]
+    fn transient_youtube_rate_limit_is_not_negative_cached() {
+        let rate_limit = "The current session has been rate-limited by YouTube for up to an hour.";
+        assert!(contains_youtube_rate_limit(rate_limit));
+        assert!(!should_negative_cache(rate_limit));
+        assert!(should_negative_cache("ERROR: Private video"));
+    }
 
     #[test]
     fn detects_youtube_rate_limit_message() {

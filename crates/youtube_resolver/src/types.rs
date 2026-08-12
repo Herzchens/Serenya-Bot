@@ -16,6 +16,7 @@ pub struct ResolveContext {
     pub region: Option<String>,
     pub timeout: Duration,
     pub trace_id: Option<String>,
+    pub excluded_client_kind: Option<String>,
     pub http_client: reqwest::Client,
 }
 
@@ -31,6 +32,7 @@ impl Default for ResolveContext {
             region: Some("US".to_string()),
             timeout: Duration::from_secs(5),
             trace_id: None,
+            excluded_client_kind: None,
             http_client,
         }
     }
@@ -45,6 +47,7 @@ impl ResolveContext {
             region: Some("US".to_string()),
             timeout: Duration::from_secs(5),
             trace_id: None,
+            excluded_client_kind: None,
             http_client,
         }
     }

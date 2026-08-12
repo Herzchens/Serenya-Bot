@@ -193,6 +193,11 @@ fn validate_resolver_config(resolver: &ResolverSection) -> Result<(), SerenyaErr
             "resolver.max_concurrent_resolves_per_guild must be greater than zero".into(),
         ));
     }
+    if resolver.max_concurrent_soundcloud == 0 {
+        return Err(SerenyaError::Config(
+            "resolver.max_concurrent_soundcloud must be greater than zero".into(),
+        ));
+    }
     if resolver.yt_dlp_timeout_seconds == 0 {
         return Err(SerenyaError::Config(
             "resolver.yt_dlp_timeout_seconds must be greater than zero".into(),
@@ -333,6 +338,21 @@ mod tests {
             emojis: Some(EmojisSection::default()),
         };
         assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_soundcloud_concurrency() {
+        let invalid = ResolverSection {
+            max_concurrent_soundcloud: 0,
+            ..Default::default()
+        };
+        assert!(validate_resolver_config(&invalid).is_err());
+
+        let valid = ResolverSection {
+            max_concurrent_soundcloud: 1,
+            ..Default::default()
+        };
+        assert!(validate_resolver_config(&valid).is_ok());
     }
 
     #[test]

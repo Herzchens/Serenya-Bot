@@ -66,6 +66,59 @@ native-tls = ["reqwest/native-tls"]
 rustls = ["reqwest/rustls"]
 native-tls-vendored = ["reqwest/native-tls-vendored"]
 socks = ["reqwest/socks"]
+# Explicit opt-in for tests that depend on the live YouTube service or a local ffmpeg binary.
+# Default workspace CI intentionally excludes these nondeterministic provider smoke tests.
+live-tests = []
+
+[[test]]
+name = "download_with_chunks"
+path = "tests/download_with_chunks.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "download_with_blocking_chunks"
+path = "tests/download_with_blocking_chunks.rs"
+required-features = ["live-tests", "blocking"]
+
+[[test]]
+name = "get_info"
+path = "tests/get_info.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "get_info_blocking"
+path = "tests/get_info_blocking.rs"
+required-features = ["live-tests", "blocking"]
+
+[[test]]
+name = "get_info_with_options"
+path = "tests/get_info_with_options.rs"
+required-features = ["live-tests"]
+
+[[test]]
+name = "search"
+path = "tests/search.rs"
+required-features = ["live-tests", "search"]
+
+[[test]]
+name = "search_playlist"
+path = "tests/search_playlist.rs"
+required-features = ["live-tests", "search"]
+
+[[test]]
+name = "suggestion"
+path = "tests/suggestion.rs"
+required-features = ["live-tests", "search"]
+
+[[test]]
+name = "ffmpeg_download_test"
+path = "tests/ffmpeg_download_test.rs"
+required-features = ["live-tests", "ffmpeg"]
+
+[[test]]
+name = "ffmpeg_test"
+path = "tests/ffmpeg_test.rs"
+required-features = ["live-tests", "ffmpeg"]
 
 [[example]]
 name = "multiple_downloads"

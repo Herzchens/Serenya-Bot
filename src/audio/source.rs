@@ -81,6 +81,15 @@ pub async fn cache_get_stream(url: &str) -> Option<youtube_resolver::ResolvedStr
     None
 }
 
+pub async fn cached_resolved_stream_is_current(
+    source_url: &str,
+    resolved: &youtube_resolver::ResolvedStream,
+) -> bool {
+    cache_get_stream(source_url)
+        .await
+        .is_some_and(|cached| cached.url == resolved.url)
+}
+
 pub async fn cache_invalidate_stream(url: &str) {
     STREAM_CACHE.load().invalidate(url).await;
     SOUNDCLOUD_STREAM_CACHE.load().invalidate(url).await;
@@ -101,6 +110,9 @@ pub fn is_verified_stream_domain(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if parsed.scheme() != "https" {
+        return false;
+    }
     let Some(host) = parsed.host_str() else {
         return false;
     };
@@ -260,8 +272,17 @@ pub async fn extract_stream_url_for_guild(
     track_url: &str,
     http_client: &reqwest::Client,
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
+    extract_stream_url_for_guild_excluding(guild_id, track_url, http_client, None).await
+}
+
+pub async fn extract_stream_url_for_guild_excluding(
+    guild_id: u64,
+    track_url: &str,
+    http_client: &reqwest::Client,
+    excluded_client_kind: Option<&str>,
+) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     let _guild_permit = crate::audio::runtime::acquire_guild_resolve(guild_id).await?;
-    extract_stream_url_inner(track_url, http_client).await
+    extract_stream_url_inner(guild_id, track_url, http_client, excluded_client_kind).await
 }
 
 pub async fn prefetch_stream_url_for_guild(
@@ -286,7 +307,12 @@ pub async fn prefetch_stream_url_for_guild(
     };
 
     let timeout = crate::audio::runtime::prefetch_timeout();
-    match tokio::time::timeout(timeout, extract_stream_url_inner(track_url, http_client)).await {
+    match tokio::time::timeout(
+        timeout,
+        extract_stream_url_inner(guild_id, track_url, http_client, None),
+    )
+    .await
+    {
         Ok(result) => result.map(Some),
         Err(_) => Err(SerenyaError::Audio(format!(
             "prefetch stream resolution timed out after {timeout:?}"
@@ -297,11 +323,10 @@ pub async fn prefetch_stream_url_for_guild(
 async fn run_ytdlp_stream_resolution(
     track_url: &str,
     youtube_url: bool,
-    negative_key: &str,
-) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
+) -> Result<youtube_resolver::ResolvedStream, StreamResolveFailure> {
     if youtube_url && !crate::audio::runtime::is_ytdlp_fallback_active() {
-        return Err(SerenyaError::Audio(
-            "Python yt-dlp stream fallback is disabled for YouTube".to_owned(),
+        return Err(StreamResolveFailure::message(
+            "Python yt-dlp stream fallback is disabled for YouTube",
         ));
     }
 
@@ -323,19 +348,15 @@ async fn run_ytdlp_stream_resolution(
         ytdlp_args,
         crate::audio::runtime::yt_dlp_timeout(),
         youtube_url,
-        Some(negative_key.to_owned()),
+        None,
     )
-    .await?;
+    .await
+    .map_err(StreamResolveFailure::from_ytdlp_error)?;
 
     let stream_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stream_url.is_empty() {
-        crate::audio::runtime::remember_negative(
-            negative_key.to_owned(),
-            "yt-dlp returned an empty stream URL".to_owned(),
-        )
-        .await;
-        return Err(SerenyaError::Audio(
-            "yt-dlp returned an empty stream URL".to_owned(),
+        return Err(StreamResolveFailure::message(
+            "yt-dlp returned an empty stream URL",
         ));
     }
 
@@ -587,28 +608,107 @@ fn calculate_backoff(attempt: u32) -> Duration {
     Duration::from_millis(base * 500 + jitter)
 }
 
-async fn extract_stream_url_inner(
+#[derive(Clone, Debug)]
+struct StreamResolveFailure {
+    message: String,
+    negative_reason: Option<String>,
+}
+
+impl StreamResolveFailure {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            negative_reason: None,
+        }
+    }
+
+    fn from_serenya(error: SerenyaError) -> Self {
+        match error {
+            SerenyaError::Audio(message) => Self::message(message),
+            other => Self::message(other.to_string()),
+        }
+    }
+
+    fn from_ytdlp_error(error: SerenyaError) -> Self {
+        let mut failure = Self::from_serenya(error);
+        if crate::audio::runtime::should_negative_cache(&failure.message) {
+            failure.negative_reason = Some(failure.message.clone());
+        }
+        failure
+    }
+
+    fn into_serenya(self) -> SerenyaError {
+        SerenyaError::Audio(self.message)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct StreamResolveFlightKey {
+    track_url: String,
+    excluded_client_kind: Option<String>,
+}
+
+impl StreamResolveFlightKey {
+    fn new(track_url: &str, excluded_client_kind: Option<&str>) -> Self {
+        Self {
+            track_url: track_url.to_owned(),
+            excluded_client_kind: excluded_client_kind.map(str::to_owned),
+        }
+    }
+}
+
+static STREAM_RESOLVE_FLIGHTS: LazyLock<
+    Cache<StreamResolveFlightKey, Arc<youtube_resolver::ResolvedStream>>,
+> = LazyLock::new(|| Cache::builder().max_capacity(256).build());
+
+async fn resolve_stream_singleflight<F>(
+    key: StreamResolveFlightKey,
+    init: F,
+) -> Result<youtube_resolver::ResolvedStream, StreamResolveFailure>
+where
+    F: std::future::Future<Output = Result<youtube_resolver::ResolvedStream, StreamResolveFailure>>,
+{
+    let result = STREAM_RESOLVE_FLIGHTS
+        .try_get_with(key.clone(), async move { init.await.map(Arc::new) })
+        .await;
+
+    // This cache exists only to join concurrent work. Long-lived source caching remains
+    // STREAM_CACHE / SOUNDCLOUD_STREAM_CACHE, so a resolver failure or 403 invalidation
+    // can never be masked by a second success cache. Existing waiters retain their Arc.
+    STREAM_RESOLVE_FLIGHTS.invalidate(&key).await;
+
+    match result {
+        Ok(stream) => Ok((*stream).clone()),
+        Err(error) => Err((*error).clone()),
+    }
+}
+
+async fn finish_stream_resolve_for_guild(
+    negative_key: &str,
+    result: Result<youtube_resolver::ResolvedStream, StreamResolveFailure>,
+) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
+    match result {
+        Ok(stream) => Ok(stream),
+        Err(failure) => {
+            if let Some(reason) = failure.negative_reason.clone() {
+                crate::audio::runtime::remember_negative(negative_key.to_owned(), reason).await;
+            }
+            Err(failure.into_serenya())
+        }
+    }
+}
+
+async fn resolve_stream_uncached(
     track_url: &str,
     http_client: &reqwest::Client,
-) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
-    if let Some(stream) = cache_get_stream(track_url).await {
-        tracing::debug!(track_url, stream_url = %stream.url, "stream cache hit");
-        return Ok(stream);
-    }
-
-    let negative_key = crate::audio::runtime::negative_cache_key("stream", track_url);
-    if let Some(entry) = crate::audio::runtime::negative_cache_get(&negative_key).await {
-        tracing::info!(track_url, reason = %entry.reason, "negative cache hit");
-        return Err(SerenyaError::Audio(format!(
-            "Skipping recently failed source: {}",
-            entry.reason
-        )));
-    }
-
+    excluded_client_kind: Option<&str>,
+) -> Result<youtube_resolver::ResolvedStream, StreamResolveFailure> {
     let youtube_url = is_youtube_url(track_url);
 
     if youtube_url {
-        if let Some(stream) = resolve_youtube_stream_native(track_url, http_client).await {
+        if let Some(stream) =
+            resolve_youtube_stream_native(track_url, http_client, excluded_client_kind).await
+        {
             tracing::info!(track_url, stream_url = %stream.url, "native stream resolution succeeded");
             cache_set_stream(track_url.to_owned(), &stream).await;
             return Ok(stream);
@@ -618,28 +718,18 @@ async fn extract_stream_url_inner(
                 track_url,
                 "native YouTube stream resolution failed, falling back to yt-dlp"
             );
-            match run_ytdlp_stream_resolution(track_url, youtube_url, &negative_key).await {
+            match run_ytdlp_stream_resolution(track_url, youtube_url).await {
                 Ok(stream) => {
                     cache_set_stream(track_url.to_owned(), &stream).await;
                     return Ok(stream);
                 }
                 Err(err) => {
-                    crate::audio::runtime::remember_negative(
-                        negative_key,
-                        format!("native resolution and yt-dlp fallback both failed: {}", err),
-                    )
-                    .await;
                     return Err(err);
                 }
             }
         }
-        crate::audio::runtime::remember_negative(
-            negative_key,
-            "native YouTube stream resolution failed without yt-dlp fallback".to_owned(),
-        )
-        .await;
-        return Err(SerenyaError::Audio(
-            "native YouTube stream resolution failed".to_owned(),
+        return Err(StreamResolveFailure::message(
+            "native YouTube stream resolution failed",
         ));
     }
 
@@ -651,22 +741,54 @@ async fn extract_stream_url_inner(
                 return Ok(stream);
             }
             Err(e) => {
-                crate::audio::runtime::remember_negative(
-                    negative_key.clone(),
-                    format!("SoundCloud native resolution failed: {e}"),
-                )
-                .await;
-                return Err(e);
+                return Err(StreamResolveFailure::from_serenya(e));
             }
         }
     }
 
-    let res = run_ytdlp_stream_resolution(track_url, youtube_url, &negative_key).await;
+    let res = run_ytdlp_stream_resolution(track_url, youtube_url).await;
     if let Ok(ref stream) = res {
         tracing::info!(track_url, stream_url = %stream.url, "yt-dlp stream resolution succeeded");
         cache_set_stream(track_url.to_owned(), stream).await;
     }
     res
+}
+
+async fn extract_stream_url_inner(
+    guild_id: u64,
+    track_url: &str,
+    http_client: &reqwest::Client,
+    excluded_client_kind: Option<&str>,
+) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
+    if let Some(stream) = cache_get_stream(track_url).await {
+        if excluded_client_kind != Some(stream.client_kind.as_str()) {
+            tracing::debug!(track_url, stream_url = %stream.url, "stream cache hit");
+            return Ok(stream);
+        }
+        tracing::debug!(
+            track_url,
+            client = %stream.client_kind,
+            "Ignoring cached stream from client excluded for retry"
+        );
+    }
+
+    let negative_key =
+        crate::audio::runtime::negative_cache_key("stream", &format!("{guild_id}:{track_url}"));
+    if let Some(entry) = crate::audio::runtime::negative_cache_get(&negative_key).await {
+        tracing::info!(track_url, reason = %entry.reason, "negative cache hit");
+        return Err(SerenyaError::Audio(format!(
+            "Skipping recently failed source: {}",
+            entry.reason
+        )));
+    }
+
+    let flight_key = StreamResolveFlightKey::new(track_url, excluded_client_kind);
+    let result = resolve_stream_singleflight(
+        flight_key,
+        resolve_stream_uncached(track_url, http_client, excluded_client_kind),
+    )
+    .await;
+    finish_stream_resolve_for_guild(&negative_key, result).await
 }
 
 fn is_direct_stream_url(url: &str) -> bool {
@@ -676,11 +798,13 @@ fn is_direct_stream_url(url: &str) -> bool {
 async fn resolve_youtube_stream_native(
     track_url: &str,
     http_client: &reqwest::Client,
+    excluded_client_kind: Option<&str>,
 ) -> Option<youtube_resolver::ResolvedStream> {
     let video_id_opt = extract_youtube_video_id(track_url);
     // 1. Try our custom youtube_resolver (direct Google stream via ANDROID/IOS mobile clients)
     if let Some(video_id) = video_id_opt {
         let ctx = youtube_resolver::ResolveContext {
+            excluded_client_kind: excluded_client_kind.map(str::to_owned),
             http_client: http_client.clone(),
             ..Default::default()
         };
@@ -736,12 +860,11 @@ pub async fn create_stream_input(
     create_ffmpeg_stream_input(original_url, stream, None, eight_d_enabled).await
 }
 
-pub async fn create_ffmpeg_stream_input(
-    original_url: Option<String>,
+fn build_ffmpeg_args(
     stream: &youtube_resolver::ResolvedStream,
     seek: Option<Duration>,
     eight_d_enabled: bool,
-) -> Result<songbird::input::Input, SerenyaError> {
+) -> Vec<String> {
     let mut args = vec![
         "-nostdin".to_owned(),
         "-hide_banner".to_owned(),
@@ -822,6 +945,17 @@ pub async fn create_ffmpeg_stream_input(
         "pipe:1".to_owned(),
     ]);
 
+    args
+}
+
+pub async fn create_ffmpeg_stream_input(
+    original_url: Option<String>,
+    stream: &youtube_resolver::ResolvedStream,
+    seek: Option<Duration>,
+    eight_d_enabled: bool,
+) -> Result<songbird::input::Input, SerenyaError> {
+    let args = build_ffmpeg_args(stream, seek, eight_d_enabled);
+
     let mut child = tokio::task::spawn_blocking(move || {
         Command::new("ffmpeg")
             .args(args)
@@ -877,16 +1011,307 @@ pub fn cache_entry_counts() -> (u64, u64, u64, u64) {
     (query, metadata, stream, sc_stream)
 }
 
-/// Rebuilds all caches with fresh TTL values from current settings.
-/// Called by /reload to ensure config changes actually take effect.
-pub fn clear_caches() -> (usize, usize) {
-    let q_len = QUERY_CACHE.load().entry_count() as usize;
-    let m_len = METADATA_CACHE.load().entry_count() as usize;
-    let s_len = STREAM_CACHE.load().entry_count() as usize;
-    // Rebuild with current TTL from settings (not the frozen initial values)
-    QUERY_CACHE.store(Arc::new(build_query_cache()));
-    METADATA_CACHE.store(Arc::new(build_metadata_cache()));
-    STREAM_CACHE.store(Arc::new(build_stream_cache()));
-    SOUNDCLOUD_STREAM_CACHE.store(Arc::new(build_soundcloud_stream_cache()));
-    (q_len + m_len, s_len)
+#[cfg(test)]
+mod cache_tests {
+    use super::{cache_invalidate_stream, cache_set_stream, cached_resolved_stream_is_current};
+
+    fn stream(url: &str) -> youtube_resolver::ResolvedStream {
+        youtube_resolver::ResolvedStream {
+            url: url.to_owned(),
+            client_kind: "TEST".to_owned(),
+            user_agent: "test".to_owned(),
+            expires_at: None,
+            mime_type: None,
+            bitrate: None,
+            resolve_source: "test".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalidated_prefetched_stream_is_not_treated_as_current() {
+        let source = "https://youtube.com/watch?v=cache-test-multiguild";
+        let resolved = stream("https://rr1.googlevideo.com/test-stream");
+        cache_set_stream(source.to_owned(), &resolved).await;
+        assert!(cached_resolved_stream_is_current(source, &resolved).await);
+        cache_invalidate_stream(source).await;
+        assert!(!cached_resolved_stream_is_current(source, &resolved).await);
+    }
+}
+
+#[cfg(all(test, feature = "live-tests"))]
+mod live_ffmpeg_tests {
+    use super::{build_ffmpeg_args, extract_stream_url_for_guild, is_verified_stream_domain};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn resolved_youtube_stream_produces_ffmpeg_pcm_bytes() {
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("build live-test HTTP client");
+        let source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+
+        let stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            extract_stream_url_for_guild(9_999_991, source_url, &http_client),
+        )
+        .await
+        .expect("YouTube stream resolution exceeded 30 seconds")
+        .expect("YouTube stream resolution failed");
+        assert!(is_verified_stream_domain(&stream.url));
+
+        let mut args = build_ffmpeg_args(&stream, None, false);
+        let output_index = args
+            .len()
+            .checked_sub(1)
+            .expect("ffmpeg argument list must contain an output target");
+        assert_eq!(args[output_index], "pipe:1");
+        args.splice(
+            output_index..output_index,
+            ["-t".to_owned(), "1".to_owned()],
+        );
+
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new("ffmpeg")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .expect("ffmpeg playback exceeded 30 seconds")
+        .expect("failed to execute ffmpeg");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("403 Forbidden") && !stderr.contains("Server returned 403"),
+            "ffmpeg playback received HTTP 403 for a resolver-validated stream"
+        );
+        assert!(
+            output.status.success(),
+            "ffmpeg playback exited unsuccessfully: {}",
+            output.status
+        );
+        assert!(
+            output.stdout.len() > 44,
+            "ffmpeg produced no PCM payload beyond the WAV header"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_singleflight_tests {
+    use super::{
+        StreamResolveFailure, StreamResolveFlightKey, finish_stream_resolve_for_guild,
+        resolve_stream_singleflight,
+    };
+    use crate::audio::runtime::{negative_cache_get, negative_cache_key};
+    use crate::utils::SerenyaError;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+
+    fn stream(label: &str) -> youtube_resolver::ResolvedStream {
+        youtube_resolver::ResolvedStream {
+            url: format!("https://rr1.googlevideo.com/{label}"),
+            client_kind: "TEST".to_owned(),
+            user_agent: "test".to_owned(),
+            expires_at: None,
+            mime_type: None,
+            bitrate: None,
+            resolve_source: "test".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_source_across_concurrent_guild_callers_is_resolved_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = StreamResolveFlightKey::new("https://youtube.com/watch?v=shared", None);
+
+        let first_calls = Arc::clone(&calls);
+        let first = resolve_stream_singleflight(key.clone(), async move {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(stream("first"))
+        });
+
+        let second_calls = Arc::clone(&calls);
+        let second = resolve_stream_singleflight(key, async move {
+            second_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok(stream("second"))
+        });
+
+        let (first_result, second_result) = tokio::join!(first, second);
+        let first_result = first_result.expect("first shared resolver result");
+        let second_result = second_result.expect("second shared resolver result");
+        assert_eq!(first_result.url, second_result.url);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "same source key should run only one resolver initializer"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_source_keys_keep_parallel_admission() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let first_calls = Arc::clone(&calls);
+        let first_barrier = Arc::clone(&barrier);
+        let first = resolve_stream_singleflight(
+            StreamResolveFlightKey::new("https://youtube.com/watch?v=one", None),
+            async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                first_barrier.wait().await;
+                Ok(stream("one"))
+            },
+        );
+
+        let second_calls = Arc::clone(&calls);
+        let second_barrier = Arc::clone(&barrier);
+        let second = resolve_stream_singleflight(
+            StreamResolveFlightKey::new("https://youtube.com/watch?v=two", None),
+            async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                second_barrier.wait().await;
+                Ok(stream("two"))
+            },
+        );
+
+        let joined = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("different resolver keys must not serialize each other");
+        assert!(joined.0.is_ok());
+        assert!(joined.1.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn excluded_client_kind_uses_a_distinct_flight_key() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let url = "https://youtube.com/watch?v=retry";
+
+        let normal_calls = Arc::clone(&calls);
+        let normal_barrier = Arc::clone(&barrier);
+        let normal =
+            resolve_stream_singleflight(StreamResolveFlightKey::new(url, None), async move {
+                normal_calls.fetch_add(1, Ordering::SeqCst);
+                normal_barrier.wait().await;
+                Ok(stream("normal"))
+            });
+
+        let retry_calls = Arc::clone(&calls);
+        let retry_barrier = Arc::clone(&barrier);
+        let retry = resolve_stream_singleflight(
+            StreamResolveFlightKey::new(url, Some("ANDROID_VR")),
+            async move {
+                retry_calls.fetch_add(1, Ordering::SeqCst);
+                retry_barrier.wait().await;
+                Ok(stream("retry"))
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let (normal_result, retry_result) = tokio::join!(normal, retry);
+            assert!(normal_result.is_ok());
+            assert!(retry_result.is_ok());
+        })
+        .await
+        .expect("excluded-client retry must not join the normal resolver flight");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_flight_is_retryable_instead_of_becoming_a_negative_flight_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = StreamResolveFlightKey::new("https://youtube.com/watch?v=retryable", None);
+
+        for _ in 0..2 {
+            let calls = Arc::clone(&calls);
+            let result = resolve_stream_singleflight(key.clone(), async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(StreamResolveFailure::message("transient resolver failure"))
+            })
+            .await;
+            assert!(result.is_err());
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_flight_is_not_a_second_long_lived_stream_cache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let key = StreamResolveFlightKey::new("https://youtube.com/watch?v=flight-only", None);
+
+        for label in ["first", "second"] {
+            let calls = Arc::clone(&calls);
+            let result = resolve_stream_singleflight(key.clone(), async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(stream(label))
+            })
+            .await;
+            assert!(result.is_ok());
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_shared_failure_is_recorded_for_each_guild_waiter() {
+        let source = "https://youtube.com/watch?v=shared-private";
+        let key_a = negative_cache_key("stream", &format!("{}:{source}", 9_910_101));
+        let key_b = negative_cache_key("stream", &format!("{}:{source}", 9_910_202));
+        let failure = StreamResolveFailure::from_ytdlp_error(SerenyaError::Audio(
+            "ERROR: Private video".to_owned(),
+        ));
+
+        assert!(
+            finish_stream_resolve_for_guild(&key_a, Err(failure.clone()))
+                .await
+                .is_err()
+        );
+        assert!(
+            finish_stream_resolve_for_guild(&key_b, Err(failure))
+                .await
+                .is_err()
+        );
+        assert!(negative_cache_get(&key_a).await.is_some());
+        assert!(negative_cache_get(&key_b).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn transient_shared_failure_is_not_negative_cached_for_any_guild() {
+        let source = "https://youtube.com/watch?v=shared-rate-limit";
+        let key_a = negative_cache_key("stream", &format!("{}:{source}", 9_920_101));
+        let key_b = negative_cache_key("stream", &format!("{}:{source}", 9_920_202));
+        let failure = StreamResolveFailure::from_ytdlp_error(SerenyaError::Audio(
+            "The current session has been rate-limited by YouTube for up to an hour.".to_owned(),
+        ));
+
+        assert!(
+            finish_stream_resolve_for_guild(&key_a, Err(failure.clone()))
+                .await
+                .is_err()
+        );
+        assert!(
+            finish_stream_resolve_for_guild(&key_b, Err(failure))
+                .await
+                .is_err()
+        );
+        assert!(negative_cache_get(&key_a).await.is_none());
+        assert!(negative_cache_get(&key_b).await.is_none());
+    }
 }

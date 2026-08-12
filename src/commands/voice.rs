@@ -1,5 +1,22 @@
 use crate::utils::{Context, Error, SerenyaError};
 
+async fn record_join_state_then_reply<F, Fut, E>(
+    player_lock: std::sync::Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    channel_id: poise::serenity_prelude::ChannelId,
+    announce_channel: poise::serenity_prelude::ChannelId,
+    reply: F,
+) -> Result<(), E>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+{
+    let mut player = player_lock.write().await;
+    player.voice_channel = Some(channel_id);
+    player.announce_channel = Some(announce_channel);
+    drop(player);
+    reply().await
+}
+
 /// Join the user's voice channel.
 #[poise::command(slash_command, prefix_command, aliases("j"))]
 pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
@@ -27,7 +44,10 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
         .clone();
 
     tracing::info!("Voice connect start: joining channel {:?}", channel_id);
-    let _handler = manager.join(guild_id, channel_id).await;
+    manager
+        .join(guild_id, channel_id)
+        .await
+        .map_err(|err| SerenyaError::Voice(format!("Failed to join voice channel: {err}")))?;
     tracing::info!("Voice connect complete: channel {:?}", channel_id);
     let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, channel_id).await;
 
@@ -40,13 +60,12 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
         })
         .clone();
 
-    let mut player = player_lock.write().await;
-    player.voice_channel = Some(channel_id);
-    player.announce_channel = Some(ctx.channel_id());
-
-    tracing::info!("Join completed successfully for channel {:?}", channel_id);
-    ctx.say(format!("🔊 Joined <#{channel_id}>")).await?;
-    Ok(())
+    record_join_state_then_reply(player_lock, channel_id, ctx.channel_id(), || async move {
+        tracing::info!("Join completed successfully for channel {:?}", channel_id);
+        ctx.say(format!("🔊 Joined <#{channel_id}>")).await?;
+        Ok::<(), Error>(())
+    })
+    .await
 }
 
 /// Leave the voice channel and clear queue state.
@@ -68,6 +87,12 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         .get(&guild_id)
         .map(|r| r.value().clone())
     {
+        crate::audio::events::finalize_interrupted_playback_stats(
+            ctx.data().database.as_ref(),
+            guild_id,
+            &player_lock,
+        )
+        .await;
         let mut player = player_lock.write().await;
         player.reset();
         player.voice_channel = None;
@@ -91,4 +116,48 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
 
     ctx.say("👋 Left voice channel and cleared state.").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod lock_scope_tests {
+    use super::record_join_state_then_reply;
+    use crate::core::GuildPlayer;
+    use poise::serenity_prelude::ChannelId;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{RwLock, oneshot};
+
+    #[tokio::test]
+    async fn join_reply_does_not_hold_player_write_lock() {
+        let player = Arc::new(RwLock::new(GuildPlayer::new()));
+        let task_player = Arc::clone(&player);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            record_join_state_then_reply(
+                task_player,
+                ChannelId::new(10),
+                ChannelId::new(20),
+                move || async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                    Ok::<(), ()>(())
+                },
+            )
+            .await
+        });
+
+        entered_rx.await.expect("reply hook should start");
+        let writer_acquired = tokio::time::timeout(Duration::from_millis(500), player.write())
+            .await
+            .is_ok();
+        let _ = release_tx.send(());
+        task.await.expect("join test task should join").unwrap();
+
+        assert!(
+            writer_acquired,
+            "Discord reply await must not retain the guild player write lock"
+        );
+    }
 }

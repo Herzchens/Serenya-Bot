@@ -133,6 +133,11 @@ struct SpotifyToken {
 
 static SPOTIFY_TOKEN_CACHE: std::sync::OnceLock<Mutex<Option<SpotifyToken>>> =
     std::sync::OnceLock::new();
+static SPOTIFY_TOKEN_REFRESH_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+
+fn spotify_token_is_fresh(token: &SpotifyToken, cookie_hash: u64, now: Instant) -> bool {
+    token.cookie_hash == cookie_hash && token.expires_at > now + Duration::from_secs(60)
+}
 
 const SPOTIFY_WEB_TOKEN_URL: &str = "https://open.spotify.com/api/token";
 const SPOTIFY_WEB_HOME_URL: &str = "https://open.spotify.com/";
@@ -151,6 +156,7 @@ pub(crate) struct SpotifySessionInfo {
 }
 
 struct SpotifyClientTokenCache {
+    client_id: String,
     client_token: String,
     client_version: String,
     device_id: String,
@@ -159,6 +165,16 @@ struct SpotifyClientTokenCache {
 
 static SPOTIFY_CLIENT_TOKEN_CACHE: std::sync::OnceLock<Mutex<Option<SpotifyClientTokenCache>>> =
     std::sync::OnceLock::new();
+static SPOTIFY_CLIENT_TOKEN_REFRESH_LOCK: std::sync::OnceLock<Mutex<()>> =
+    std::sync::OnceLock::new();
+
+fn spotify_client_token_is_fresh(
+    cached: &SpotifyClientTokenCache,
+    client_id: &str,
+    now: Instant,
+) -> bool {
+    cached.client_id == client_id && cached.expires_at > now
+}
 
 pub(crate) struct SpotifyClientTokenInfo {
     pub client_token: String,
@@ -207,8 +223,24 @@ pub(crate) async fn get_spotify_session_info(
     {
         let cache = cache_lock.lock().await;
         if let Some(ref token) = *cache
-            && token.cookie_hash == cookie_hash
-            && token.expires_at > now + Duration::from_secs(60)
+            && spotify_token_is_fresh(token, cookie_hash, now)
+        {
+            return Ok(SpotifySessionInfo {
+                access_token: token.access_token.clone(),
+                client_id: token.client_id.clone(),
+            });
+        }
+    }
+
+    let _refresh_guard = SPOTIFY_TOKEN_REFRESH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    let now = Instant::now();
+    {
+        let cache = cache_lock.lock().await;
+        if let Some(ref token) = *cache
+            && spotify_token_is_fresh(token, cookie_hash, now)
         {
             return Ok(SpotifySessionInfo {
                 access_token: token.access_token.clone(),
@@ -254,7 +286,10 @@ pub(crate) async fn get_spotify_session_info(
             )
         });
 
-    crate::logging::register_secret_to_redact(&access_token);
+    crate::logging::set_rotating_secret_to_redact(
+        crate::logging::RotatingSecretSlot::SpotifyAccessToken,
+        &access_token,
+    );
 
     let mut cache = cache_lock.lock().await;
     *cache = Some(SpotifyToken {
@@ -280,7 +315,25 @@ pub(crate) async fn get_spotify_client_token_info(
     {
         let cache = cache_lock.lock().await;
         if let Some(ref cached) = *cache
-            && cached.expires_at > now
+            && spotify_client_token_is_fresh(cached, client_id, now)
+        {
+            return Ok(SpotifyClientTokenInfo {
+                client_token: cached.client_token.clone(),
+                client_version: cached.client_version.clone(),
+                device_id: cached.device_id.clone(),
+            });
+        }
+    }
+
+    let _refresh_guard = SPOTIFY_CLIENT_TOKEN_REFRESH_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .await;
+    let now = Instant::now();
+    {
+        let cache = cache_lock.lock().await;
+        if let Some(ref cached) = *cache
+            && spotify_client_token_is_fresh(cached, client_id, now)
         {
             return Ok(SpotifyClientTokenInfo {
                 client_token: cached.client_token.clone(),
@@ -412,10 +465,14 @@ pub(crate) async fn get_spotify_client_token_info(
         })?
         .to_owned();
 
-    crate::logging::register_secret_to_redact(&client_token);
+    crate::logging::set_rotating_secret_to_redact(
+        crate::logging::RotatingSecretSlot::SpotifyClientToken,
+        &client_token,
+    );
 
     let mut cache = cache_lock.lock().await;
     *cache = Some(SpotifyClientTokenCache {
+        client_id: client_id.to_owned(),
         client_token: client_token.clone(),
         client_version: client_version.clone(),
         device_id: device_id.clone(),
@@ -1373,6 +1430,76 @@ impl MetadataProvider for YouTubeMusicProvider {
         }
 
         Ok(ytm_candidates)
+    }
+}
+
+#[cfg(test)]
+mod spotify_cache_tests {
+    use super::*;
+
+    #[test]
+    fn access_cache_is_scoped_to_cookie_and_refresh_window() {
+        let now = Instant::now();
+        let token = SpotifyToken {
+            access_token: "access".to_owned(),
+            client_id: "client".to_owned(),
+            expires_at: now + Duration::from_secs(120),
+            cookie_hash: 7,
+        };
+        assert!(spotify_token_is_fresh(&token, 7, now));
+        assert!(!spotify_token_is_fresh(&token, 8, now));
+        assert!(!spotify_token_is_fresh(
+            &token,
+            7,
+            now + Duration::from_secs(61)
+        ));
+    }
+
+    #[test]
+    fn client_cache_is_scoped_to_client_id() {
+        let now = Instant::now();
+        let cached = SpotifyClientTokenCache {
+            client_id: "client-a".to_owned(),
+            client_token: "token".to_owned(),
+            client_version: "version".to_owned(),
+            device_id: "device".to_owned(),
+            expires_at: now + Duration::from_secs(60),
+        };
+        assert!(spotify_client_token_is_fresh(&cached, "client-a", now));
+        assert!(!spotify_client_token_is_fresh(&cached, "client-b", now));
+        assert!(!spotify_client_token_is_fresh(
+            &cached,
+            "client-a",
+            now + Duration::from_secs(61)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn access_refresh_gate_serializes_concurrent_refreshers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                let _guard = SPOTIFY_TOKEN_REFRESH_LOCK
+                    .get_or_init(|| Mutex::new(()))
+                    .lock()
+                    .await;
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            task.await.expect("refresh gate task panicked");
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 }
 

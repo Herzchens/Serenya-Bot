@@ -605,6 +605,10 @@ async fn run_provider_batch(
     Ok(all_scored)
 }
 
+fn direct_url_is_allowed(input: &str) -> bool {
+    crate::audio::source::is_verified_stream_domain(input)
+}
+
 /// Orchestrates track resolution, mirroring, and search ranking.
 pub async fn resolve_input(
     query: &str,
@@ -844,6 +848,11 @@ pub async fn resolve_input(
                 ))
             }
         } else if direct_provider.supports(query_trimmed) {
+            if !direct_url_is_allowed(query_trimmed) {
+                return Err(SerenyaError::Audio(
+                    "Direct URLs are restricted to supported HTTPS streaming hosts.".to_owned(),
+                ));
+            }
             let mut tracks = direct_provider.load(query_trimmed, user_id).await?;
             if !tracks.is_empty() {
                 let mut track = tracks.remove(0);
@@ -2581,6 +2590,7 @@ mod tests {
         assert_eq!(&*tracks[1].source_provider, "YouTube");
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_live_youtube_album_resolution() {
         let url =
@@ -2698,12 +2708,9 @@ mod tests {
         assert_eq!(tracks[0].duration, Some(1000));
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_spotify_playlist_resolution() -> Result<(), Box<dyn std::error::Error>> {
-        if !std::path::Path::new("config.yml").exists() {
-            println!("Skipping test: config.yml not found");
-            return Ok(());
-        }
         let config = crate::config::load_config("config.yml").await?;
         crate::audio::runtime::configure(
             &config.resolver,
@@ -2759,12 +2766,9 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_spotify_track_resolution() -> Result<(), Box<dyn std::error::Error>> {
-        if !std::path::Path::new("config.yml").exists() {
-            println!("Skipping test: config.yml not found");
-            return Ok(());
-        }
         let config = crate::config::load_config("config.yml").await?;
         crate::audio::runtime::configure(
             &config.resolver,
@@ -2788,5 +2792,30 @@ mod tests {
         );
         assert!(artist.contains("r.tee") || artist.contains("pubg"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod direct_url_policy_tests {
+    use super::direct_url_is_allowed;
+
+    #[test]
+    fn direct_url_policy_rejects_arbitrary_local_spoofed_and_non_https_hosts() {
+        assert!(!direct_url_is_allowed("http://127.0.0.1:8080/audio.mp3"));
+        assert!(!direct_url_is_allowed("https://localhost/audio.mp3"));
+        assert!(!direct_url_is_allowed("https://example.com/audio.mp3"));
+        assert!(!direct_url_is_allowed(
+            "https://googlevideo.com.evil.example/audio"
+        ));
+        assert!(!direct_url_is_allowed("file://googlevideo.com/etc/passwd"));
+        assert!(!direct_url_is_allowed("ftp://rr1.googlevideo.com/audio"));
+    }
+
+    #[test]
+    fn direct_url_policy_accepts_supported_https_stream_hosts() {
+        assert!(direct_url_is_allowed(
+            "https://rr1.googlevideo.com/videoplayback"
+        ));
+        assert!(direct_url_is_allowed("https://cf-media.sndcdn.com/stream"));
     }
 }

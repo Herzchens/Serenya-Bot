@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::utils::error::SerenyaError;
@@ -23,7 +23,9 @@ pub enum CachedPrefix {
 pub struct DatabaseManager {
     data: Arc<RwLock<Arc<Database>>>,
     path: PathBuf,
-    is_dirty: Arc<std::sync::atomic::AtomicBool>,
+    revision: Arc<std::sync::atomic::AtomicU64>,
+    persisted_revision: Arc<std::sync::atomic::AtomicU64>,
+    save_gate: Arc<Mutex<()>>,
     prefix_cache: Arc<dashmap::DashMap<u64, CachedPrefix>>,
 }
 
@@ -61,19 +63,38 @@ impl DatabaseManager {
         Ok(Self {
             data: Arc::new(RwLock::new(Arc::new(db))),
             path,
-            is_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            persisted_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            save_gate: Arc::new(Mutex::new(())),
             prefix_cache: Arc::new(prefix_cache),
         })
     }
 
-    pub async fn save(&self) -> Result<(), SerenyaError> {
-        let db_clone = {
-            let data = self.data.read().await;
-            Arc::clone(&*data)
-        };
+    fn mark_dirty(&self) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
 
+    fn is_dirty(&self) -> bool {
+        self.revision.load(std::sync::atomic::Ordering::SeqCst)
+            != self
+                .persisted_revision
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn snapshot_for_save(&self) -> (Arc<Database>, u64) {
+        let data = self.data.read().await;
+        let revision = self.revision.load(std::sync::atomic::Ordering::SeqCst);
+        (Arc::clone(&*data), revision)
+    }
+
+    async fn persist_snapshot(
+        &self,
+        db_snapshot: Arc<Database>,
+        snapshot_revision: u64,
+    ) -> Result<(), SerenyaError> {
         let yaml = tokio::task::spawn_blocking(move || {
-            serde_saphyr::to_string(&*db_clone)
+            serde_saphyr::to_string(&*db_snapshot)
                 .map_err(|e| SerenyaError::Database(format!("serialization failed: {e}")))
         })
         .await
@@ -83,15 +104,20 @@ impl DatabaseManager {
         let bak_path = self.path.with_extension("yml.bak");
 
         tokio::fs::write(&tmp_path, &yaml).await?;
-
         if self.path.exists() {
             tokio::fs::copy(&self.path, &bak_path).await?;
         }
-
         tokio::fs::rename(&tmp_path, &self.path).await?;
-        self.is_dirty
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        self.persisted_revision
+            .fetch_max(snapshot_revision, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    pub async fn save(&self) -> Result<(), SerenyaError> {
+        let _save_guard = self.save_gate.lock().await;
+        let (snapshot, revision) = self.snapshot_for_save().await;
+        self.persist_snapshot(snapshot, revision).await
     }
 
     pub fn start_auto_save(
@@ -112,7 +138,7 @@ impl DatabaseManager {
                         break;
                     }
                     _ = ticker.tick() => {
-                        if manager.is_dirty.load(std::sync::atomic::Ordering::SeqCst)
+                        if manager.is_dirty()
                             && let Err(e) = manager.save().await {
                                 tracing::error!(error = %e, "auto-save failed");
                             }
@@ -158,8 +184,7 @@ impl DatabaseManager {
             self.prefix_cache.insert(guild_id, CachedPrefix::Default);
         }
 
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
     }
 
     pub async fn update_guild_settings_mut<F, R>(&self, guild_id: u64, f: F) -> R
@@ -180,8 +205,7 @@ impl DatabaseManager {
             self.prefix_cache.insert(guild_id, CachedPrefix::Default);
         }
 
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
         res
     }
 
@@ -195,8 +219,7 @@ impl DatabaseManager {
         let mut data_guard = self.data.write().await;
         let data = Arc::make_mut(&mut *data_guard);
         data.user_settings.insert(user_id.to_string(), settings);
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
     }
 
     pub async fn get_user_playlist_names(&self, user_id: u64) -> Vec<String> {
@@ -255,8 +278,7 @@ impl DatabaseManager {
                 tracks: Vec::new(),
             },
         );
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
 
         Ok(())
     }
@@ -286,8 +308,7 @@ impl DatabaseManager {
 
         playlist.updated_at = chrono::Utc::now().to_rfc3339();
         playlist.tracks.push(track);
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
         Ok(())
     }
 
@@ -306,8 +327,7 @@ impl DatabaseManager {
                 "playlist '{name}' not found"
             )));
         }
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
 
         Ok(())
     }
@@ -336,8 +356,7 @@ impl DatabaseManager {
 
         playlist.tracks.remove(index - 1);
         playlist.updated_at = chrono::Utc::now().to_rfc3339();
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
         Ok(())
     }
 
@@ -366,8 +385,7 @@ impl DatabaseManager {
             .ok_or_else(|| SerenyaError::NotFound(format!("playlist '{old_name}' not found")))?;
 
         playlists.insert(new_name.to_owned(), playlist);
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
         Ok(())
     }
 
@@ -387,7 +405,6 @@ impl DatabaseManager {
             }
         }
 
-        self.is_dirty
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.mark_dirty();
     }
 }

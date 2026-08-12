@@ -22,8 +22,44 @@ pub enum SerenyaError {
     Discord(Box<poise::serenity_prelude::Error>),
 }
 
+impl SerenyaError {
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Config(_) => "Config",
+            Self::Database(_) => "Database",
+            Self::Audio(_) => "Audio",
+            Self::Voice(_) => "Voice",
+            Self::Queue(_) => "Queue",
+            Self::Permission(_) => "Permission",
+            Self::NotFound(_) => "NotFound",
+            Self::Io(_) => "Io",
+            Self::Discord(_) => "Discord",
+        }
+    }
+}
+
 impl From<poise::serenity_prelude::Error> for SerenyaError {
     fn from(err: poise::serenity_prelude::Error) -> Self {
         SerenyaError::Discord(Box::new(err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SerenyaError;
+
+    #[test]
+    fn error_classes_are_stable_and_message_free() {
+        assert_eq!(SerenyaError::Voice("secret detail".into()).class(), "Voice");
+        assert_eq!(SerenyaError::Audio("secret detail".into()).class(), "Audio");
+        assert_eq!(
+            SerenyaError::Database("secret detail".into()).class(),
+            "Database"
+        );
+        assert!(
+            !SerenyaError::Voice("secret detail".into())
+                .class()
+                .contains("secret")
+        );
     }
 }

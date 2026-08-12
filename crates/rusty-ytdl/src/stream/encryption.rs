@@ -89,7 +89,13 @@ impl Encryption {
             Self::Aes128 { key_uri, iv } => {
                 let body = client.get(key_uri.clone()).send().await?.bytes().await?;
                 let mut key = [0_u8; 16];
-                key.copy_from_slice(&body[..16]);
+                if body.len() != key.len() {
+                    return Err(VideoError::EncryptionError(format!(
+                        "AES-128 key must be exactly 16 bytes, got {}",
+                        body.len()
+                    )));
+                }
+                key.copy_from_slice(&body);
                 Aes128CbcDec::new(&key.into(), iv.into())
                     .decrypt_padded_vec_mut::<Pkcs7>(data)
                     .map_err(|e| VideoError::DecryptionError(e.to_string()))?
@@ -98,5 +104,95 @@ impl Encryption {
         };
 
         Ok(r)
+    }
+}
+
+#[cfg(test)]
+mod aes128_key_tests {
+    use super::Encryption;
+    use crate::VideoError;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn key_client(
+        body: &'static [u8],
+    ) -> (
+        reqwest_middleware::ClientWithMiddleware,
+        reqwest::Url,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local key server");
+        let address = listener
+            .local_addr()
+            .expect("read local key server address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept key request");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.expect("read key request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write key response headers");
+            socket
+                .write_all(body)
+                .await
+                .expect("write key response body");
+        });
+        let client = reqwest_middleware::ClientBuilder::new(
+            reqwest::Client::builder()
+                .build()
+                .expect("build test client"),
+        )
+        .build();
+        let url =
+            reqwest::Url::parse(&format!("http://{address}/key.bin")).expect("parse local key URL");
+        (client, url, server)
+    }
+
+    #[tokio::test]
+    async fn exact_16_byte_aes128_key_control_does_not_panic() {
+        let (client, key_uri, server) = key_client(&[0_u8; 16]).await;
+        let encryption = Encryption::Aes128 {
+            key_uri,
+            iv: [0_u8; 16],
+        };
+        let result = encryption.decrypt(&client, &[0_u8; 16]).await;
+        server.await.expect("local key server should join");
+        assert!(matches!(result, Err(VideoError::DecryptionError(_))));
+    }
+
+    #[tokio::test]
+    async fn short_aes128_key_returns_encryption_error_without_panicking() {
+        let (client, key_uri, server) = key_client(b"tiny").await;
+        let task = tokio::spawn(async move {
+            let encryption = Encryption::Aes128 {
+                key_uri,
+                iv: [0_u8; 16],
+            };
+            encryption.decrypt(&client, &[0_u8; 16]).await
+        });
+        let result = task
+            .await
+            .expect("short AES-128 key response must not panic");
+        server.await.expect("local key server should join");
+        assert!(matches!(result, Err(VideoError::EncryptionError(_))));
+    }
+
+    #[tokio::test]
+    async fn oversized_aes128_key_is_rejected_instead_of_truncated() {
+        let (client, key_uri, server) = key_client(&[0_u8; 17]).await;
+        let encryption = Encryption::Aes128 {
+            key_uri,
+            iv: [0_u8; 16],
+        };
+        let result = encryption.decrypt(&client, &[0_u8; 16]).await;
+        server.await.expect("local key server should join");
+        assert!(matches!(result, Err(VideoError::EncryptionError(_))));
     }
 }

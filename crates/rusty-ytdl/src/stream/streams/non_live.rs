@@ -4,9 +4,7 @@ use bytes::{Bytes, BytesMut};
 #[cfg(feature = "ffmpeg")]
 use std::sync::Arc;
 
-#[cfg(feature = "ffmpeg")]
-use tokio::sync::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::constants::{DEFAULT_HEADERS, DEFAULT_MAX_RETRIES};
 use crate::stream::streams::Stream;
@@ -38,6 +36,7 @@ pub struct NonLiveStream {
     end: RwLock<u64>,
     start_static: u64,
     end_static: u64,
+    chunk_lock: Mutex<()>,
 
     client: reqwest_middleware::ClientWithMiddleware,
 
@@ -104,6 +103,7 @@ impl NonLiveStream {
                 end: RwLock::new(options.end),
                 start_static: options.start,
                 end_static: options.end,
+                chunk_lock: Mutex::new(()),
                 ffmpeg_args,
                 ffmpeg_stream,
             })
@@ -120,6 +120,7 @@ impl NonLiveStream {
                 end: RwLock::new(options.end),
                 start_static: options.start,
                 end_static: options.end,
+                chunk_lock: Mutex::new(()),
             })
         }
     }
@@ -140,6 +141,8 @@ impl NonLiveStream {
 #[async_trait]
 impl Stream for NonLiveStream {
     async fn chunk(&self) -> Result<Option<Bytes>, VideoError> {
+        let _chunk_guard = self.chunk_lock.lock().await;
+
         #[cfg(feature = "ffmpeg")]
         {
             if !self.ffmpeg_args.is_empty() {
@@ -236,5 +239,122 @@ impl Stream for NonLiveStream {
 
     fn content_length(&self) -> usize {
         self.content_length() as usize
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::{NonLiveStream, NonLiveStreamOptions, Stream};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = socket.read(&mut buffer).await.expect("read range request");
+            assert!(read > 0, "client closed before request headers completed");
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("HTTP request must be UTF-8")
+    }
+
+    fn range_header(request: &str) -> String {
+        request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("range")
+                    .then(|| value.trim().to_owned())
+            })
+            .expect("request must contain Range header")
+    }
+
+    async fn respond(mut socket: TcpStream) {
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntest")
+            .await
+            .expect("write range response");
+    }
+
+    #[tokio::test]
+    async fn concurrent_chunk_calls_advance_to_distinct_ranges() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local range server");
+        let address = listener.local_addr().expect("read local server address");
+
+        let server = tokio::spawn(async move {
+            let (mut first_socket, _) =
+                listener.accept().await.expect("accept first range request");
+            let first_request = read_request(&mut first_socket).await;
+            let first_range = range_header(&first_request);
+
+            let second_early =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await;
+            let (second_range, second_socket) = match second_early {
+                Ok(Ok((mut second_socket, _))) => {
+                    let second_request = read_request(&mut second_socket).await;
+                    let second_range = range_header(&second_request);
+                    respond(first_socket).await;
+                    (second_range, second_socket)
+                }
+                Ok(Err(error)) => panic!("accept second range request failed: {error}"),
+                Err(_) => {
+                    respond(first_socket).await;
+                    let (mut second_socket, _) = listener
+                        .accept()
+                        .await
+                        .expect("accept serialized second range request");
+                    let second_request = read_request(&mut second_socket).await;
+                    let second_range = range_header(&second_request);
+                    (second_range, second_socket)
+                }
+            };
+            respond(second_socket).await;
+            [first_range, second_range]
+        });
+
+        let stream = Arc::new(
+            NonLiveStream::new(NonLiveStreamOptions {
+                client: None,
+                link: format!("http://{address}/audio"),
+                content_length: 8,
+                dl_chunk_size: 3,
+                start: 0,
+                end: 3,
+                #[cfg(feature = "ffmpeg")]
+                ffmpeg_args: None,
+            })
+            .expect("construct non-live stream"),
+        );
+
+        let first_stream = Arc::clone(&stream);
+        let first = tokio::spawn(async move { first_stream.chunk().await });
+        let second_stream = Arc::clone(&stream);
+        let second = tokio::spawn(async move { second_stream.chunk().await });
+
+        first
+            .await
+            .expect("first chunk call must not panic")
+            .expect("first chunk result")
+            .expect("first chunk must contain bytes");
+        second
+            .await
+            .expect("second chunk call must not panic")
+            .expect("second chunk result")
+            .expect("second chunk must contain bytes");
+
+        let ranges = server.await.expect("range server should join");
+        assert_eq!(ranges[0], "bytes=0-3");
+        assert_eq!(
+            ranges[1], "bytes=4-6",
+            "two concurrent callers must not download the same byte range"
+        );
     }
 }
