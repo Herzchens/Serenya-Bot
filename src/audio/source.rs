@@ -792,7 +792,19 @@ async fn extract_stream_url_inner(
 }
 
 fn is_direct_stream_url(url: &str) -> bool {
-    url.contains("googlevideo.com") || url.contains("googleusercontent.com")
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    ["googlevideo.com", "googleusercontent.com"]
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
 async fn resolve_youtube_stream_native(
@@ -1313,5 +1325,32 @@ mod stream_singleflight_tests {
         );
         assert!(negative_cache_get(&key_a).await.is_none());
         assert!(negative_cache_get(&key_b).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod direct_stream_domain_validation_tests {
+    use super::is_direct_stream_url;
+
+    #[test]
+    fn attacker_host_cannot_pass_by_putting_google_domain_in_url_text() {
+        assert!(
+            !is_direct_stream_url("https://attacker.example/media?next=googlevideo.com"),
+            "a Google domain substring in a query must not authorize an unrelated host"
+        );
+        assert!(
+            !is_direct_stream_url("http://127.0.0.1/internal/googleusercontent.com"),
+            "a Google domain substring in a path must not authorize a non-HTTPS local host"
+        );
+    }
+
+    #[test]
+    fn canonical_google_stream_hosts_remain_accepted() {
+        assert!(is_direct_stream_url(
+            "https://rr1---sn.example.googlevideo.com/videoplayback?id=control"
+        ));
+        assert!(is_direct_stream_url(
+            "https://redirector.googleusercontent.com/media?id=control"
+        ));
     }
 }
