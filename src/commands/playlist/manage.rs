@@ -1,6 +1,6 @@
-use poise::serenity_prelude as serenity;
 use std::time::Duration;
 
+use crate::discord::embeds::QueueTrackSnapshot;
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Remove a song from a playlist by its index.
@@ -89,20 +89,13 @@ pub async fn info(
     ctx.defer().await?;
 
     let req_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
-    let source_prov: std::sync::Arc<str> = std::sync::Arc::from("Playlist");
-    let tracks: Vec<crate::core::Track> = playlist
+    let tracks: Vec<QueueTrackSnapshot> = playlist
         .tracks
         .iter()
-        .map(|t| crate::core::Track {
+        .map(|t| QueueTrackSnapshot {
             title: t.title.as_str().into(),
-            url: t.url.as_str().into(),
             duration: t.duration_secs.map(Duration::from_secs),
-            requester_id: serenity::UserId::new(user_id),
             requester_name: Some(req_name.clone()),
-            source_type: crate::core::track::SourceType::Playlist,
-            resolved_url: None,
-            thumbnail: None,
-            source_provider: source_prov.clone(),
         })
         .collect();
 

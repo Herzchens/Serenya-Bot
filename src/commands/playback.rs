@@ -2,6 +2,7 @@ use poise::serenity_prelude as serenity;
 
 use crate::audio::{ResolvedInput, resolve_input};
 use crate::core::{GuildPlayer, PlaybackStatus, Track};
+use crate::discord::embeds::QueueTrackSnapshot;
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Play a song or playlist.
@@ -333,13 +334,13 @@ pub(crate) async fn enqueue_and_play_resolved(
 
 async fn queue_snapshot(
     player_lock: &std::sync::Arc<tokio::sync::RwLock<GuildPlayer>>,
-) -> Vec<Track> {
+) -> Vec<QueueTrackSnapshot> {
     let player = player_lock.read().await;
     let mut tracks = Vec::new();
     if let Some(ref np) = player.now_playing {
-        tracks.push(np.clone());
+        tracks.push(QueueTrackSnapshot::from(np));
     }
-    tracks.extend(player.queue.iter().cloned());
+    tracks.extend(player.queue.iter().map(QueueTrackSnapshot::from));
     tracks
 }
 

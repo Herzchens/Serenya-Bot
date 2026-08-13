@@ -1,5 +1,19 @@
+use crate::core::Track;
+use crate::discord::embeds::QueueTrackSnapshot;
 use crate::discord::pagination::paginate_queue;
 use crate::utils::{Context, Error, SerenyaError};
+
+fn build_queue_snapshot<'a>(
+    now_playing: Option<&'a Track>,
+    queued: impl Iterator<Item = &'a Track>,
+) -> Vec<QueueTrackSnapshot> {
+    let mut tracks = Vec::new();
+    if let Some(np) = now_playing {
+        tracks.push(QueueTrackSnapshot::from(np));
+    }
+    tracks.extend(queued.map(QueueTrackSnapshot::from));
+    tracks
+}
 
 /// View the current queue.
 #[poise::command(
@@ -21,11 +35,7 @@ pub async fn queue(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
 
     let player = player_lock.read().await;
-    let mut tracks = Vec::new();
-    if let Some(ref np) = player.now_playing {
-        tracks.push(np.clone());
-    }
-    tracks.extend(player.queue.iter().cloned());
+    let tracks = build_queue_snapshot(player.now_playing.as_ref(), player.queue.iter());
 
     // Release read lock before awaiting paginate_queue
     drop(player);
@@ -223,4 +233,39 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
 
     ctx.say("🔀 Shuffled the queue.").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::SourceType;
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+
+    #[test]
+    fn queue_pagination_snapshot_does_not_retain_unused_thumbnail_payload() {
+        let thumbnail: Arc<str> = Arc::from("x".repeat(1024 * 1024));
+        let thumbnail_weak = Arc::downgrade(&thumbnail);
+        let track = Track {
+            title: "retention probe".into(),
+            url: "https://example.invalid/retention-probe".into(),
+            duration: Some(std::time::Duration::from_secs(123)),
+            requester_name: Some(Arc::from("requester")),
+            thumbnail: Some(Arc::clone(&thumbnail)),
+            source_provider: Arc::from("youtube"),
+            resolved_url: None,
+            requester_id: serenity::UserId::new(1),
+            source_type: SourceType::Url,
+        };
+        drop(thumbnail);
+
+        let snapshot = build_queue_snapshot(Some(&track), std::iter::empty::<&Track>());
+        drop(track);
+
+        assert!(
+            thumbnail_weak.upgrade().is_none(),
+            "queue pagination snapshots must not retain thumbnail payloads that queue_embed never reads"
+        );
+        assert_eq!(snapshot.len(), 1);
+    }
 }
