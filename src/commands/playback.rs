@@ -139,6 +139,21 @@ fn existing_voice_action(bot_channel: Option<u64>, user_channel: u64) -> Existin
     }
 }
 
+async fn join_then_configure_voice<J, JFut, C, CFut, E>(join: J, configure: C) -> Result<(), E>
+where
+    J: FnOnce() -> JFut,
+    JFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    join().await?;
+    if let Err(err) = configure().await {
+        tracing::warn!(%err, "Failed to apply voice bitrate after successful join");
+    }
+    Ok(())
+}
+
 pub(crate) async fn ensure_play_voice(
     ctx: Context<'_>,
     guild_id: serenity::GuildId,
@@ -164,12 +179,22 @@ pub(crate) async fn ensure_play_voice(
         )
         .into()),
         ExistingVoiceAction::Join => {
-            manager
-                .join(guild_id, user_channel_id)
-                .await
-                .map_err(|err| SerenyaError::Voice(format!("Failed to join voice channel: {err}")))?;
-            crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await?;
-            Ok(())
+            let join_manager = manager.clone();
+            join_then_configure_voice(
+                move || async move {
+                    join_manager
+                        .join(guild_id, user_channel_id)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| -> Error {
+                            SerenyaError::Voice(format!("Failed to join voice channel: {err}")).into()
+                        })
+                },
+                move || async move {
+                    crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await
+                },
+            )
+            .await
         }
     }
 }
@@ -793,5 +818,69 @@ mod lifecycle_tests {
         assert!(player.now_playing.is_some());
         assert_eq!(player.playback_status, PlaybackStatus::Idle);
         assert!(player.current_track_handle.is_none());
+    }
+}
+
+#[cfg(test)]
+mod post_join_voice_configuration_tests {
+    use super::join_then_configure_voice;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn bitrate_failure_after_successful_join_is_nonfatal() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let configured = Arc::new(AtomicBool::new(false));
+        let joined_for_task = Arc::clone(&joined);
+        let configured_for_task = Arc::clone(&configured);
+
+        let result = join_then_configure_voice(
+            move || async move {
+                joined_for_task.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            move || async move {
+                configured_for_task.store(true, Ordering::SeqCst);
+                Err::<(), &'static str>("guild cache unavailable")
+            },
+        )
+        .await;
+
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "voice join must have completed"
+        );
+        assert!(
+            configured.load(Ordering::SeqCst),
+            "bitrate configuration must run after a successful join"
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "bitrate tuning is auxiliary; a failure after a successful join must not abort /play and leave the connection orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_failure_remains_fatal_and_skips_bitrate_configuration() {
+        let configured = Arc::new(AtomicBool::new(false));
+        let configured_for_task = Arc::clone(&configured);
+
+        let result = join_then_configure_voice(
+            || async { Err::<(), &'static str>("join failed") },
+            move || async move {
+                configured_for_task.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("join failed"));
+        assert!(
+            !configured.load(Ordering::SeqCst),
+            "bitrate configuration must not run when the voice join itself failed"
+        );
     }
 }

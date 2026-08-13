@@ -198,7 +198,7 @@ impl YouTube {
 
         let body = get_html(&self.client, url, Some(&headers)).await?;
 
-        Ok(parse_search_result(&self.client, body, options))
+        parse_search_result(&self.client, body, options)
     }
 
     /// Classic search function but only get first [`SearchResult`] item. `SearchOptions.limit` not use in request its will be always `1`
@@ -1433,7 +1433,7 @@ fn parse_search_result(
     client: &reqwest_middleware::ClientWithMiddleware,
     html: impl Into<String>,
     options: &SearchOptions,
-) -> Vec<SearchResult> {
+) -> Result<Vec<SearchResult>, VideoError> {
     let mut html: String = html.into();
 
     html = {
@@ -1455,25 +1455,20 @@ fn parse_search_result(
 
     // check if html is not empty
     if !html.is_empty() {
-        let serde_value = match serde_json::from_str::<serde_json::Value>(&html) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to parse ytInitialData in search results: {}", e);
-                return Vec::new();
-            }
-        };
+        let serde_value = serde_json::from_str::<serde_json::Value>(&html)
+            .map_err(|_| VideoError::BodyCannotParsed)?;
         let contents = &serde_value["contents"]["twoColumnSearchResultsRenderer"]
             ["primaryContents"]["sectionListRenderer"]["contents"][0]["itemSectionRenderer"]
             ["contents"];
 
         // if contents found try to format values
         if !contents.is_null() {
-            return format_search_result(client, contents, options);
+            return Ok(format_search_result(client, contents, options));
         }
     }
 
-    // if cannot fetch initial data return empty array
-    vec![]
+    // No initial data is still a legitimate empty search result.
+    Ok(vec![])
 }
 
 fn format_search_result(
@@ -2236,6 +2231,72 @@ mod search_request_body_tests {
         assert_eq!(
             body["context"]["client"]["originalUrl"].as_str(),
             Some(original_url)
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_fallback_error_contract_tests {
+    use super::{parse_search_result, SearchOptions, SearchResult};
+    use crate::VideoError;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum ParseOutcome {
+        Success(usize),
+        Error,
+    }
+
+    trait IntoParseOutcome {
+        fn into_parse_outcome(self) -> ParseOutcome;
+    }
+
+    // Current vendored behavior is infallible and collapses malformed provider JSON
+    // into an empty result. Keep this impl so the regression compiles on the RED tree.
+    impl IntoParseOutcome for Vec<SearchResult> {
+        fn into_parse_outcome(self) -> ParseOutcome {
+            ParseOutcome::Success(self.len())
+        }
+    }
+
+    // Correct behavior preserves a parse failure through the existing Result-returning
+    // public search API. This impl lets the same regression survive the GREEN fix.
+    impl IntoParseOutcome for Result<Vec<SearchResult>, VideoError> {
+        fn into_parse_outcome(self) -> ParseOutcome {
+            match self {
+                Ok(results) => ParseOutcome::Success(results.len()),
+                Err(_) => ParseOutcome::Error,
+            }
+        }
+    }
+
+    fn test_client() -> reqwest_middleware::ClientWithMiddleware {
+        let client = reqwest::Client::builder()
+            .build()
+            .expect("test reqwest client should build");
+        reqwest_middleware::ClientBuilder::new(client).build()
+    }
+
+    #[test]
+    fn valid_missing_initial_data_preserves_empty_success_contract() {
+        let outcome = parse_search_result(
+            &test_client(),
+            "<html><body>no ytInitialData here</body></html>",
+            &SearchOptions::default(),
+        )
+        .into_parse_outcome();
+        assert_eq!(outcome, ParseOutcome::Success(0));
+    }
+
+    #[test]
+    fn malformed_search_fallback_is_not_reported_as_empty_success() {
+        let malformed = "<script>var ytInitialData = {not-json};</script>";
+        let outcome = parse_search_result(&test_client(), malformed, &SearchOptions::default())
+            .into_parse_outcome();
+
+        assert_eq!(
+            outcome,
+            ParseOutcome::Error,
+            "malformed provider ytInitialData must remain distinguishable from a legitimate empty search"
         );
     }
 }

@@ -178,3 +178,23 @@ async fn concurrent_saves_share_one_serialized_persistence_path()
     remove_db_files(&db_path).await;
     Ok(())
 }
+
+#[tokio::test]
+async fn final_shutdown_surfaces_real_persistence_io_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let db_path = get_temp_db_path();
+    let manager = DatabaseManager::load(&db_path).await?;
+
+    tokio::fs::remove_file(&db_path).await?;
+    tokio::fs::create_dir(&db_path).await?;
+
+    let result = manager.shutdown().await;
+    assert!(
+        result.is_err(),
+        "DatabaseManager::shutdown must expose a real final-save I/O failure"
+    );
+
+    let _ = tokio::fs::remove_dir(&db_path).await;
+    remove_db_files(&db_path).await;
+    Ok(())
+}

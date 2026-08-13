@@ -54,6 +54,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(run())
 }
 
+fn normalize_client_start_result<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Client exited with error");
+            Err(err)
+        }
+    }
+}
+
+fn normalize_shutdown_signal_result<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Shutdown signal listener failed");
+            Err(err)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn normalize_sigterm_registration<T, E>(result: Result<T, E>) -> Result<T, E> {
+    result
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     installer::ensure_dependencies().await;
 
@@ -99,6 +124,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let live_config_clone = Arc::clone(&live_config);
     let database_clone = Arc::clone(&database);
+    let empty_room_monitor_handle = Arc::new(tokio::sync::Mutex::new(None));
+    let empty_room_monitor_handle_for_setup = Arc::clone(&empty_room_monitor_handle);
+    let empty_room_monitor_cancel = cancel_token.clone();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -223,13 +251,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let guild_players = Arc::new(DashMap::new());
 
-                start_empty_room_monitor(
+                let monitor_handle = start_empty_room_monitor(
                     guild_players.clone(),
                     ctx.http.clone(),
                     live_config_clone.clone(),
                     Arc::clone(&database_clone),
                     ctx.clone(),
+                    empty_room_monitor_cancel.clone(),
                 );
+                *empty_room_monitor_handle_for_setup.lock().await = Some(monitor_handle);
 
                 Ok(Data {
                     config: live_config_clone,
@@ -266,52 +296,107 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     let sigterm_future = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .unwrap()
-            .recv()
-            .await;
+        let mut signal = normalize_sigterm_registration(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ))?;
+        signal.recv().await;
+        Ok::<(), std::io::Error>(())
     };
     #[cfg(not(unix))]
-    let sigterm_future = std::future::pending::<()>();
+    let sigterm_future = std::future::pending::<Result<(), std::io::Error>>();
 
-    tokio::select! {
+    let run_error: Option<Box<dyn std::error::Error>> = tokio::select! {
         result = client.start() => {
-            if let Err(err) = result {
-                error!(%err, "Client exited with error");
+            normalize_client_start_result(result)
+                .err()
+                .map(|err| Box::new(err) as Box<dyn std::error::Error>)
+        }
+        result = tokio::signal::ctrl_c() => {
+            match normalize_shutdown_signal_result(result) {
+                Ok(()) => {
+                    info!(target: "shutdown", "Shutdown signal received (ctrl+c)");
+                    None
+                }
+                Err(err) => Some(Box::new(err)),
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!(target: "shutdown", "Shutdown signal received (ctrl+c)");
+        result = sigterm_future => {
+            match result {
+                Ok(()) => {
+                    info!(target: "shutdown", "Shutdown signal received (SIGTERM)");
+                    None
+                }
+                Err(err) => {
+                    error!(%err, "SIGTERM signal listener failed");
+                    Some(Box::new(err))
+                }
+            }
         }
-        _ = sigterm_future => {
-            info!(target: "shutdown", "Shutdown signal received (SIGTERM)");
+    };
+
+    // Always flush database/webhook state first, then surface any unexpected
+    // client, signal-listener, or final persistence failure to the process.
+    let shutdown_result = shutdown(
+        cancel_token,
+        auto_save_handle,
+        &database,
+        empty_room_monitor_handle,
+    )
+    .await;
+    if let Some(err) = run_error {
+        if let Err(shutdown_err) = &shutdown_result {
+            error!(%shutdown_err, "Final database save also failed while handling a prior runtime error");
+        }
+        return Err(err);
+    }
+    shutdown_result?;
+    Ok(())
+}
+
+fn normalize_final_database_shutdown_result<E: std::fmt::Display>(
+    result: Result<(), E>,
+) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Failed to save database during shutdown");
+            Err(err)
         }
     }
+}
 
-    shutdown(cancel_token, auto_save_handle, &database).await;
-    Ok(())
+async fn synchronize_empty_room_monitor(handle: tokio::task::JoinHandle<()>) {
+    if let Err(err) = handle.await {
+        error!(%err, "Empty-room monitor task panicked during shutdown");
+    }
 }
 
 async fn shutdown(
     cancel_token: CancellationToken,
     auto_save_handle: tokio::task::JoinHandle<()>,
     database: &DatabaseManager,
-) {
+    empty_room_monitor_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> Result<(), utils::error::SerenyaError> {
     info!(target: "shutdown", "Initiating graceful shutdown...");
 
     cancel_token.cancel();
+
+    if let Some(handle) = empty_room_monitor_handle.lock().await.take() {
+        synchronize_empty_room_monitor(handle).await;
+    }
 
     if let Err(err) = auto_save_handle.await {
         error!(%err, "Auto-save task panicked during shutdown");
     }
 
-    if let Err(err) = database.shutdown().await {
-        error!(%err, "Failed to save database during shutdown");
+    let database_result = normalize_final_database_shutdown_result(database.shutdown().await);
+    if database_result.is_ok() {
+        info!(target: "shutdown", "Serenya shut down gracefully");
     }
 
-    info!(target: "shutdown", "Serenya shut down gracefully");
-
+    // Flush observability regardless of whether the final database save succeeded.
     logging::webhook::shutdown().await;
+    database_result
 }
 
 /// Prepends the dependency directory to PATH before auto-install runs.
@@ -443,11 +528,15 @@ fn start_empty_room_monitor(
     config: Arc<arc_swap::ArcSwap<BotConfig>>,
     database: Arc<DatabaseManager>,
     serenity_ctx: serenity::Context,
-) {
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let now = std::time::Instant::now();
             // Phase 1: Collect guild IDs without holding the shard-lock across .await
             let guild_ids: Vec<_> = guild_players.iter().map(|e| *e.key()).collect();
@@ -583,7 +672,7 @@ fn start_empty_room_monitor(
                 }
             }
         }
-    });
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1015,5 +1104,132 @@ mod voice_room_cache_tests {
     #[test]
     fn cached_room_with_humans_is_occupied() {
         assert_eq!(voice_room_is_empty(Some(2)), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod client_exit_status_tests {
+    use super::normalize_client_start_result;
+
+    #[test]
+    fn client_start_error_reaches_run_outcome() {
+        let result = normalize_client_start_result::<&'static str>(Err("gateway failed"));
+        assert_eq!(
+            result,
+            Err("gateway failed"),
+            "an unexpected Discord client shutdown must not be converted into a successful process outcome"
+        );
+    }
+
+    #[test]
+    fn clean_client_completion_remains_successful() {
+        assert_eq!(
+            normalize_client_start_result::<&'static str>(Ok(())),
+            Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_signal_error_tests {
+    use super::normalize_shutdown_signal_result;
+
+    #[test]
+    fn ctrl_c_listener_error_reaches_run_outcome() {
+        let result = normalize_shutdown_signal_result::<&'static str>(Err("listener failed"));
+        assert_eq!(
+            result,
+            Err("listener failed"),
+            "a ctrl_c listener error must not be mistaken for a graceful shutdown signal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_registration_error_is_propagated_without_panicking() {
+        let outcome = std::panic::catch_unwind(|| {
+            super::normalize_sigterm_registration::<(), &'static str>(Err("registration failed"))
+        });
+        assert!(
+            outcome.is_ok(),
+            "SIGTERM listener registration failure must be returned, not panic"
+        );
+        assert_eq!(outcome.unwrap(), Err("registration failed"));
+    }
+}
+
+#[cfg(test)]
+mod final_database_shutdown_error_tests {
+    use super::normalize_final_database_shutdown_result;
+
+    #[test]
+    fn final_database_save_error_reaches_process_outcome() {
+        let result = normalize_final_database_shutdown_result::<&'static str>(Err("disk full"));
+        assert_eq!(
+            result,
+            Err("disk full"),
+            "a failed final database save must not be converted into a successful process shutdown"
+        );
+    }
+
+    #[test]
+    fn successful_final_database_save_remains_successful() {
+        assert_eq!(
+            normalize_final_database_shutdown_result::<&'static str>(Ok(())),
+            Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_room_monitor_shutdown_tests {
+    use super::{DatabaseManager, synchronize_empty_room_monitor};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn temp_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "serenya-monitor-shutdown-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn cleanup(path: &std::path::Path) {
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_write_cannot_land_after_final_database_save()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let manager = Arc::new(DatabaseManager::load(&path).await?);
+        let writer = Arc::clone(&manager);
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let mut settings = writer.get_guild_settings(4242).await;
+            settings.quality = "late-monitor-write".to_owned();
+            writer.update_guild_settings(4242, settings).await;
+        });
+
+        synchronize_empty_room_monitor(handle).await;
+        manager.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let reloaded = DatabaseManager::load(&path).await?;
+        let persisted = reloaded.get_guild_settings(4242).await;
+        assert_eq!(
+            persisted.quality, "late-monitor-write",
+            "shutdown must quiesce an in-flight monitor before the final database save"
+        );
+
+        cleanup(&path).await;
+        Ok(())
     }
 }
