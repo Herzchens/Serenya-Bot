@@ -710,25 +710,29 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 
         let embed =
             crate::discord::embeds::playback_status_embed("⏭️ Skip", "Skipping track...", 0x5865F2);
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
-
-        if let Some(handle) = handle_opt {
-            let _ = handle.stop();
-        } else {
-            crate::audio::events::play_next(
-                crate::audio::events::PlaybackContext {
-                    guild_id,
-                    database: std::sync::Arc::clone(&ctx.data().database),
-                    guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-                    http_client: ctx.data().http_client.clone(),
-                    serenity_ctx: ctx.serenity_context().clone(),
-                    config: std::sync::Arc::clone(&ctx.data().config),
-                },
-                None,
-                true,
-            )
-            .await?;
-        }
+        let playback_ctx = crate::audio::events::PlaybackContext {
+            guild_id,
+            database: std::sync::Arc::clone(&ctx.data().database),
+            guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+            http_client: ctx.data().http_client.clone(),
+            serenity_ctx: ctx.serenity_context().clone(),
+            config: std::sync::Arc::clone(&ctx.data().config),
+        };
+        crate::commands::control::run_control_transition(
+            async {
+                ctx.send(poise::CreateReply::default().embed(embed)).await?;
+                Ok::<(), Error>(())
+            },
+            async move {
+                if let Some(handle) = handle_opt {
+                    let _ = handle.stop();
+                } else {
+                    crate::audio::events::play_next(playback_ctx, None, true).await?;
+                }
+                Ok::<(), Error>(())
+            },
+        )
+        .await?;
     }
 
     Ok(())

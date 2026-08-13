@@ -26,6 +26,31 @@ fn stay_in_voice(config: &Arc<arc_swap::ArcSwap<crate::config::BotConfig>>) -> b
     config.load().playback.stay_in_voice
 }
 
+async fn automatic_disconnect_then_cleanup<D, DFut, C, CFut, E>(
+    disconnect: D,
+    cleanup: C,
+) -> Result<(), E>
+where
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    disconnect().await?;
+    cleanup().await;
+    Ok(())
+}
+
+pub(crate) fn register_terminal_handlers<End, Error, E>(end: End, error: Error) -> Result<(), E>
+where
+    End: FnOnce() -> Result<(), E>,
+    Error: FnOnce() -> Result<(), E>,
+{
+    end()?;
+    error()?;
+    Ok(())
+}
+
 fn playback_stat_delta(play_time: Duration, completed: bool) -> (u64, u64) {
     (u64::from(completed), play_time.as_secs())
 }
@@ -61,8 +86,10 @@ pub(crate) async fn record_guild_playback_stats(
     let (songs_played, listening_seconds) = playback_stat_delta(play_time, completed);
     database
         .update_guild_settings_mut(guild_id.get(), |settings| {
-            settings.total_songs_played += songs_played;
-            settings.total_listening_seconds += listening_seconds;
+            settings.total_songs_played = settings.total_songs_played.saturating_add(songs_played);
+            settings.total_listening_seconds = settings
+                .total_listening_seconds
+                .saturating_add(listening_seconds);
         })
         .await;
 }
@@ -572,15 +599,30 @@ pub fn play_next(
                     guild_id = %ctx.guild_id,
                     "Queue finished and stay_in_voice=false, disconnecting"
                 );
+                let cleanup_player = Arc::clone(&player_lock);
+                let cleanup_players = Arc::clone(&ctx.guild_players);
+                let guild_id = ctx.guild_id;
+                if let Err(err) = automatic_disconnect_then_cleanup(
+                    || songbird_manager.remove(guild_id),
+                    move || async move {
+                        {
+                            let mut player = cleanup_player.write().await;
+                            player.reset();
+                            player.voice_channel = None;
+                            player.announce_channel = None;
+                        }
+                        cleanup_players.remove(&guild_id);
+                        crate::audio::runtime::cleanup_guild(guild_id.get());
+                    },
+                )
+                .await
                 {
-                    let mut player = player_lock.write().await;
-                    player.reset();
-                    player.voice_channel = None;
-                    player.announce_channel = None;
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        error = %err,
+                        "Automatic queue-finished voice disconnect failed; preserving local state for retry"
+                    );
                 }
-                ctx.guild_players.remove(&ctx.guild_id);
-                let _ = songbird_manager.remove(ctx.guild_id).await;
-                crate::audio::runtime::cleanup_guild(ctx.guild_id.get());
             }
 
             return Ok(());
@@ -764,14 +806,36 @@ pub fn play_next(
             call.play_input(source)
         };
 
-        let _ = handle.add_event(
-            Event::Track(songbird::TrackEvent::End),
-            TrackEndHandler { ctx: ctx.clone() },
-        );
-        let _ = handle.add_event(
-            Event::Track(songbird::TrackEvent::Error),
-            TrackErrorHandler { ctx: ctx.clone() },
-        );
+        if let Err(err) = register_terminal_handlers(
+            || {
+                handle.add_event(
+                    Event::Track(songbird::TrackEvent::End),
+                    TrackEndHandler { ctx: ctx.clone() },
+                )
+            },
+            || {
+                handle.add_event(
+                    Event::Track(songbird::TrackEvent::Error),
+                    TrackErrorHandler { ctx: ctx.clone() },
+                )
+            },
+        ) {
+            let _ = handle.stop();
+            tracing::error!(
+                guild_id = %ctx.guild_id,
+                error = %err,
+                "Failed to register playback terminal handlers"
+            );
+            return fail_and_maybe_advance(
+                &ctx,
+                &player_lock,
+                &call_lock,
+                &track.url,
+                &track.title,
+                announce_channel,
+            )
+            .await;
+        }
 
         {
             let mut player = player_lock.write().await;
@@ -1210,5 +1274,156 @@ mod interrupted_stats_tests {
             Some(observed),
             observed,
         ));
+    }
+}
+
+#[cfg(test)]
+mod automatic_disconnect_cleanup_tests {
+    use super::automatic_disconnect_then_cleanup;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn failed_gateway_leave_does_not_commit_local_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = automatic_disconnect_then_cleanup(
+            || async { Err::<(), &'static str>("gateway unavailable") },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("gateway unavailable"));
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "local GuildPlayer/runtime state must remain available when Songbird says leave must be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_gateway_leave_commits_local_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = automatic_disconnect_then_cleanup(
+            || async { Ok::<(), &'static str>(()) },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod final_boundary_regression_tests {
+    use super::{record_guild_playback_stats, register_terminal_handlers};
+    use crate::database::DatabaseManager;
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_registration_failure_is_propagated_and_short_circuits() {
+        let second_called = Arc::new(AtomicBool::new(false));
+        let second_flag = Arc::clone(&second_called);
+        let result = register_terminal_handlers(
+            || Err::<(), &'static str>("end registration failed"),
+            move || {
+                second_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        );
+        assert_eq!(result, Err("end registration failed"));
+        assert!(
+            !second_called.load(Ordering::SeqCst),
+            "registration must stop after the first lifecycle-listener failure"
+        );
+    }
+
+    #[test]
+    fn terminal_registration_success_control_calls_both_handlers() {
+        let end_called = Arc::new(AtomicBool::new(false));
+        let error_called = Arc::new(AtomicBool::new(false));
+        let end_flag = Arc::clone(&end_called);
+        let error_flag = Arc::clone(&error_called);
+        let result = register_terminal_handlers(
+            move || {
+                end_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            move || {
+                error_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(end_called.load(Ordering::SeqCst));
+        assert!(error_called.load(Ordering::SeqCst));
+    }
+
+    fn temp_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "serenya-stat-overflow-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn cleanup_db(path: &std::path::Path) {
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+    }
+
+    #[tokio::test]
+    async fn persisted_max_playback_stats_do_not_panic_or_wrap_on_new_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let manager = DatabaseManager::load(&path).await?;
+        manager
+            .update_guild_settings_mut(9001, |settings| {
+                settings.total_songs_played = u64::MAX;
+                settings.total_listening_seconds = u64::MAX;
+            })
+            .await;
+        manager.save().await?;
+
+        let reloaded = Arc::new(DatabaseManager::load(&path).await?);
+        let before = reloaded.get_guild_settings(9001).await;
+        assert_eq!(before.total_songs_played, u64::MAX);
+        assert_eq!(before.total_listening_seconds, u64::MAX);
+
+        let task_db = Arc::clone(&reloaded);
+        let outcome = tokio::spawn(async move {
+            record_guild_playback_stats(
+                task_db.as_ref(),
+                serenity::GuildId::new(9001),
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "provider/runtime playback stats must not panic when persisted counters are already at u64::MAX"
+        );
+
+        let after = reloaded.get_guild_settings(9001).await;
+        assert_eq!(after.total_songs_played, u64::MAX);
+        assert_eq!(after.total_listening_seconds, u64::MAX);
+        cleanup_db(&path).await;
+        Ok(())
     }
 }

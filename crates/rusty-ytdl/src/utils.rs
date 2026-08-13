@@ -1260,12 +1260,13 @@ pub fn make_absolute_url(base: &str, url: &str) -> Result<url::Url, VideoError> 
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn time_to_ms(duration: &str) -> usize {
-    let mut ms = 0;
+    let mut seconds = 0usize;
     for (i, curr) in duration.split(':').rev().enumerate() {
-        ms += curr.parse::<usize>().unwrap_or(0) * (u32::pow(60_u32, i as u32) as usize);
+        let component = curr.parse::<usize>().unwrap_or(0);
+        let multiplier = 60usize.saturating_pow(i as u32);
+        seconds = seconds.saturating_add(component.saturating_mul(multiplier));
     }
-    ms *= 1000;
-    ms
+    seconds.saturating_mul(1000)
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -1579,5 +1580,25 @@ pub(crate) fn get_user_agent_for_url(url: &str) -> &'static str {
         "Mozilla/5.0 (Chromecast; Google TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.225 Safari/537.36"
     } else {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Safari/537.36"
+    }
+}
+
+#[cfg(test)]
+mod provider_duration_power_overflow_tests {
+    use super::time_to_ms;
+
+    #[test]
+    fn seven_part_provider_duration_does_not_overflow_u32_power() {
+        let result = std::panic::catch_unwind(|| time_to_ms("1:1:1:1:1:1:1"));
+        assert!(
+            result.is_ok(),
+            "provider-controlled duration parsing must not panic when the base-60 exponent exceeds u32"
+        );
+        assert_eq!(result.unwrap(), 47_446_779_661_000usize);
+    }
+
+    #[test]
+    fn ordinary_provider_duration_is_preserved() {
+        assert_eq!(time_to_ms("1:02:03"), 3_723_000usize);
     }
 }

@@ -121,16 +121,34 @@ pub(crate) async fn seek_by_restart(
     let end_handler = crate::audio::events::TrackEndHandler {
         ctx: playback_ctx.clone(),
     };
-    let _ = handle.add_event(
-        songbird::Event::Track(songbird::TrackEvent::End),
-        end_handler,
-    );
-
     let error_handler = crate::audio::events::TrackErrorHandler { ctx: playback_ctx };
-    let _ = handle.add_event(
-        songbird::Event::Track(songbird::TrackEvent::Error),
-        error_handler,
-    );
+    if let Err(err) = crate::audio::events::register_terminal_handlers(
+        || {
+            handle.add_event(
+                songbird::Event::Track(songbird::TrackEvent::End),
+                end_handler,
+            )
+        },
+        || {
+            handle.add_event(
+                songbird::Event::Track(songbird::TrackEvent::Error),
+                error_handler,
+            )
+        },
+    ) {
+        let _ = handle.stop();
+        if let Some(ref old_handle) = old_handle_opt {
+            let _ = old_handle.stop();
+        }
+        let mut player = player_lock.write().await;
+        player.current_track_handle = None;
+        player.playback_status = crate::core::PlaybackStatus::Idle;
+        player.is_seeking = false;
+        return Err(SerenyaError::Voice(format!(
+            "Failed to register seek playback lifecycle handlers: {err}"
+        ))
+        .into());
+    }
 
     {
         let mut player = player_lock.write().await;
@@ -295,6 +313,18 @@ pub async fn rewind(
     Ok(())
 }
 
+pub(crate) async fn run_control_transition<RFut, TFut, E>(
+    reply: RFut,
+    transition: TFut,
+) -> Result<(), E>
+where
+    RFut: std::future::Future<Output = Result<(), E>>,
+    TFut: std::future::Future<Output = Result<(), E>>,
+{
+    transition.await?;
+    reply.await
+}
+
 /// Replay the current song, or play the previous one if idle.
 #[poise::command(
     slash_command,
@@ -332,18 +362,23 @@ pub async fn replay(ctx: Context<'_>) -> Result<(), Error> {
             &format!("Replaying previous track: **{}**", prev_title),
             0x5865F2,
         );
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
-        crate::audio::events::play_next(
-            crate::audio::events::PlaybackContext {
-                guild_id,
-                database: std::sync::Arc::clone(&ctx.data().database),
-                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-                http_client: ctx.data().http_client.clone(),
-                serenity_ctx: ctx.serenity_context().clone(),
-                config: std::sync::Arc::clone(&ctx.data().config),
+        let playback_ctx = crate::audio::events::PlaybackContext {
+            guild_id,
+            database: std::sync::Arc::clone(&ctx.data().database),
+            guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+            http_client: ctx.data().http_client.clone(),
+            serenity_ctx: ctx.serenity_context().clone(),
+            config: std::sync::Arc::clone(&ctx.data().config),
+        };
+        run_control_transition(
+            async {
+                ctx.send(poise::CreateReply::default().embed(embed)).await?;
+                Ok::<(), Error>(())
             },
-            None,
-            true,
+            async move {
+                crate::audio::events::play_next(playback_ctx, None, true).await?;
+                Ok::<(), Error>(())
+            },
         )
         .await?;
     } else {
@@ -402,25 +437,29 @@ pub async fn previous(ctx: Context<'_>) -> Result<(), Error> {
         &format!("Playing previous track: **{}**", prev.title),
         0x5865F2,
     );
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
-
-    if let Some(handle) = handle_opt {
-        let _ = handle.stop();
-    } else {
-        crate::audio::events::play_next(
-            crate::audio::events::PlaybackContext {
-                guild_id,
-                database: std::sync::Arc::clone(&ctx.data().database),
-                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-                http_client: ctx.data().http_client.clone(),
-                serenity_ctx: ctx.serenity_context().clone(),
-                config: std::sync::Arc::clone(&ctx.data().config),
-            },
-            None,
-            true,
-        )
-        .await?;
-    }
+    let playback_ctx = crate::audio::events::PlaybackContext {
+        guild_id,
+        database: std::sync::Arc::clone(&ctx.data().database),
+        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+        http_client: ctx.data().http_client.clone(),
+        serenity_ctx: ctx.serenity_context().clone(),
+        config: std::sync::Arc::clone(&ctx.data().config),
+    };
+    run_control_transition(
+        async {
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+            Ok::<(), Error>(())
+        },
+        async move {
+            if let Some(handle) = handle_opt {
+                let _ = handle.stop();
+            } else {
+                crate::audio::events::play_next(playback_ctx, None, true).await?;
+            }
+            Ok::<(), Error>(())
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -498,25 +537,29 @@ pub async fn jump(
         ),
         0x5865F2,
     );
-    ctx.send(poise::CreateReply::default().embed(embed)).await?;
-
-    if let Some(handle) = handle_opt {
-        let _ = handle.stop();
-    } else {
-        crate::audio::events::play_next(
-            crate::audio::events::PlaybackContext {
-                guild_id,
-                database: std::sync::Arc::clone(&ctx.data().database),
-                guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-                http_client: ctx.data().http_client.clone(),
-                serenity_ctx: ctx.serenity_context().clone(),
-                config: std::sync::Arc::clone(&ctx.data().config),
-            },
-            None,
-            true,
-        )
-        .await?;
-    }
+    let playback_ctx = crate::audio::events::PlaybackContext {
+        guild_id,
+        database: std::sync::Arc::clone(&ctx.data().database),
+        guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+        http_client: ctx.data().http_client.clone(),
+        serenity_ctx: ctx.serenity_context().clone(),
+        config: std::sync::Arc::clone(&ctx.data().config),
+    };
+    run_control_transition(
+        async {
+            ctx.send(poise::CreateReply::default().embed(embed)).await?;
+            Ok::<(), Error>(())
+        },
+        async move {
+            if let Some(handle) = handle_opt {
+                let _ = handle.stop();
+            } else {
+                crate::audio::events::play_next(playback_ctx, None, true).await?;
+            }
+            Ok::<(), Error>(())
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -665,5 +708,59 @@ mod seek_duration_overflow_tests {
                 .expect("ordinary duration addition should succeed"),
             Duration::from_secs(42)
         );
+    }
+}
+
+#[cfg(test)]
+mod control_transition_order_tests {
+    use super::run_control_transition;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn required_transition_runs_even_when_success_reply_fails() {
+        let transitioned = Arc::new(AtomicBool::new(false));
+        let transition_flag = Arc::clone(&transitioned);
+
+        let result = run_control_transition(
+            async { Err::<(), &'static str>("discord reply failed") },
+            async move {
+                transition_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("discord reply failed"));
+        assert!(
+            transitioned.load(Ordering::SeqCst),
+            "a fallible Discord success reply must not prevent the already-committed playback transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_transition_and_reply_each_run_once() {
+        let transitioned = Arc::new(AtomicBool::new(false));
+        let replied = Arc::new(AtomicBool::new(false));
+        let transition_flag = Arc::clone(&transitioned);
+        let reply_flag = Arc::clone(&replied);
+
+        let result = run_control_transition(
+            async move {
+                reply_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            async move {
+                transition_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(transitioned.load(Ordering::SeqCst));
+        assert!(replied.load(Ordering::SeqCst));
     }
 }

@@ -17,6 +17,24 @@ where
     reply().await
 }
 
+async fn leave_disconnect_then_cleanup<D, DFut, C, CFut, E>(
+    has_handler: bool,
+    disconnect: D,
+    cleanup: C,
+) -> Result<(), E>
+where
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    if has_handler {
+        disconnect().await?;
+    }
+    cleanup().await;
+    Ok(())
+}
+
 /// Join the user's voice channel.
 #[poise::command(slash_command, prefix_command, aliases("j"))]
 pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
@@ -81,34 +99,37 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
         .clone();
 
-    if let Some(player_lock) = ctx
-        .data()
-        .guild_players
-        .get(&guild_id)
-        .map(|r| r.value().clone())
-    {
-        crate::audio::events::finalize_interrupted_playback_stats(
-            ctx.data().database.as_ref(),
-            guild_id,
-            &player_lock,
-        )
-        .await;
-        let mut player = player_lock.write().await;
-        player.reset();
-        player.voice_channel = None;
-        player.announce_channel = None;
-        tracing::info!("Reset guild player state and dropped track handle");
-    }
-
-    tracing::info!("Removing guild player from map");
-    ctx.data().guild_players.remove(&guild_id);
-    tracing::info!("Guild player removed from map");
-
     tracing::info!("Voice disconnect start: leaving voice channel");
     let has_handler = manager.get(guild_id).is_some();
-    if has_handler {
-        manager.remove(guild_id).await?;
-    }
+    leave_disconnect_then_cleanup(
+        has_handler,
+        || async { manager.remove(guild_id).await },
+        || async {
+            if let Some(player_lock) = ctx
+                .data()
+                .guild_players
+                .get(&guild_id)
+                .map(|r| r.value().clone())
+            {
+                crate::audio::events::finalize_interrupted_playback_stats(
+                    ctx.data().database.as_ref(),
+                    guild_id,
+                    &player_lock,
+                )
+                .await;
+                let mut player = player_lock.write().await;
+                player.reset();
+                player.voice_channel = None;
+                player.announce_channel = None;
+                tracing::info!("Reset guild player state and dropped track handle");
+            }
+
+            tracing::info!("Removing guild player from map");
+            ctx.data().guild_players.remove(&guild_id);
+            tracing::info!("Guild player removed from map");
+        },
+    )
+    .await?;
     tracing::info!("Voice disconnect complete");
 
     crate::audio::runtime::cleanup_guild(guild_id.get());
@@ -159,5 +180,47 @@ mod lock_scope_tests {
             writer_acquired,
             "Discord reply await must not retain the guild player write lock"
         );
+    }
+}
+
+#[cfg(test)]
+mod leave_disconnect_failure_tests {
+    use super::leave_disconnect_then_cleanup;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn failed_leave_preserves_player_and_stats_state_for_retry() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = leave_disconnect_then_cleanup(
+            true,
+            || async { Err::<(), &'static str>("gateway unavailable") },
+            move || async move { cleanup_flag.store(true, Ordering::SeqCst) },
+        )
+        .await;
+
+        assert_eq!(result, Err("gateway unavailable"));
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "failed /leave must not finalize/reset/remove local playback state before Songbird can leave"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_leave_commits_destructive_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = leave_disconnect_then_cleanup(
+            true,
+            || async { Ok::<(), &'static str>(()) },
+            move || async move { cleanup_flag.store(true, Ordering::SeqCst) },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(cleaned.load(Ordering::SeqCst));
     }
 }

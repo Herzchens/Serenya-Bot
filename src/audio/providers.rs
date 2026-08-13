@@ -56,7 +56,7 @@ fn extract_meta(html: &str, property: &str) -> Option<String> {
     }
 }
 
-fn parse_simple_duration(s: &str) -> Option<Duration> {
+pub(crate) fn parse_simple_duration(s: &str) -> Option<Duration> {
     let parts: Vec<&str> = s.split(':').collect();
     let secs = if parts.len() == 2 {
         let mins = parts[0].parse::<u64>().ok()?;
