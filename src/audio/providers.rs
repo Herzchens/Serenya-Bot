@@ -58,19 +58,22 @@ fn extract_meta(html: &str, property: &str) -> Option<String> {
 
 fn parse_simple_duration(s: &str) -> Option<Duration> {
     let parts: Vec<&str> = s.split(':').collect();
-    let mut secs = 0u64;
-    if parts.len() == 2 {
+    let secs = if parts.len() == 2 {
         let mins = parts[0].parse::<u64>().ok()?;
-        let s = parts[1].parse::<u64>().ok()?;
-        secs = mins * 60 + s;
+        let seconds = parts[1].parse::<u64>().ok()?;
+        mins.checked_mul(60)?.checked_add(seconds)?
     } else if parts.len() == 3 {
         let hrs = parts[0].parse::<u64>().ok()?;
         let mins = parts[1].parse::<u64>().ok()?;
-        let s = parts[2].parse::<u64>().ok()?;
-        secs = hrs * 3600 + mins * 60 + s;
+        let seconds = parts[2].parse::<u64>().ok()?;
+        hrs.checked_mul(3600)?
+            .checked_add(mins.checked_mul(60)?)?
+            .checked_add(seconds)?
     } else if parts.len() == 1 {
-        secs = parts[0].parse::<u64>().ok()?;
-    }
+        parts[0].parse::<u64>().ok()?
+    } else {
+        return None;
+    };
     Some(Duration::from_secs(secs))
 }
 
@@ -137,6 +140,33 @@ static SPOTIFY_TOKEN_REFRESH_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::O
 
 fn spotify_token_is_fresh(token: &SpotifyToken, cookie_hash: u64, now: Instant) -> bool {
     token.cookie_hash == cookie_hash && token.expires_at > now + Duration::from_secs(60)
+}
+
+fn spotify_access_token_deadline(
+    now: Instant,
+    now_ms: i64,
+    token_json: &serde_json::Value,
+) -> Result<Instant, SerenyaError> {
+    let expires_after = if let Some(timestamp_ms) = token_json
+        .get("accessTokenExpirationTimestampMs")
+        .and_then(|value| value.as_u64())
+    {
+        let timestamp_ms = i64::try_from(timestamp_ms).map_err(|_| {
+            SerenyaError::Audio("Spotify access-token expiry is out of range.".into())
+        })?;
+        let delta_ms = timestamp_ms.saturating_sub(now_ms).max(0) as u64;
+        Duration::from_millis(delta_ms)
+    } else {
+        Duration::from_secs(
+            token_json
+                .get("expires_in")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(3600),
+        )
+    };
+
+    now.checked_add(expires_after)
+        .ok_or_else(|| SerenyaError::Audio("Spotify access-token expiry is out of range.".into()))
 }
 
 const SPOTIFY_WEB_TOKEN_URL: &str = "https://open.spotify.com/api/token";
@@ -268,23 +298,8 @@ pub(crate) async fn get_spotify_session_info(
         })?
         .to_owned();
 
-    let expires_at = token_json
-        .get("accessTokenExpirationTimestampMs")
-        .and_then(|value| value.as_u64())
-        .and_then(|timestamp_ms| {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let delta_ms = timestamp_ms as i64 - now_ms;
-            u64::try_from(delta_ms.max(0)).ok()
-        })
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| {
-            Duration::from_secs(
-                token_json
-                    .get("expires_in")
-                    .and_then(|value| value.as_u64())
-                    .unwrap_or(3600),
-            )
-        });
+    let expires_at =
+        spotify_access_token_deadline(now, chrono::Utc::now().timestamp_millis(), &token_json)?;
 
     crate::logging::set_rotating_secret_to_redact(
         crate::logging::RotatingSecretSlot::SpotifyAccessToken,
@@ -295,7 +310,7 @@ pub(crate) async fn get_spotify_session_info(
     *cache = Some(SpotifyToken {
         access_token: access_token.clone(),
         client_id: client_id.clone(),
-        expires_at: now + expires_at,
+        expires_at,
         cookie_hash,
     });
 
@@ -1885,5 +1900,81 @@ impl DirectUrlProvider {
             thumbnail: None,
             source_provider: std::sync::Arc::from("Direct Link"),
         }])
+    }
+}
+
+#[cfg(test)]
+mod provider_duration_overflow_tests {
+    use super::parse_simple_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn oversized_two_part_provider_duration_is_rejected_without_panicking() {
+        let result = std::panic::catch_unwind(|| parse_simple_duration("18446744073709551615:59"));
+        assert!(result.is_ok(), "malformed provider duration must not panic");
+        assert!(
+            result
+                .expect("duration parser should return normally")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn oversized_three_part_provider_duration_is_rejected_without_panicking() {
+        let result =
+            std::panic::catch_unwind(|| parse_simple_duration("18446744073709551615:59:59"));
+        assert!(result.is_ok(), "malformed provider hours must not panic");
+        assert!(
+            result
+                .expect("duration parser should return normally")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ordinary_provider_durations_are_preserved() {
+        assert_eq!(
+            parse_simple_duration("03:21"),
+            Some(Duration::from_secs(201))
+        );
+        assert_eq!(
+            parse_simple_duration("1:02:03"),
+            Some(Duration::from_secs(3723))
+        );
+    }
+}
+
+#[cfg(test)]
+mod spotify_expiry_boundary_tests {
+    use super::spotify_access_token_deadline;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn huge_relative_expiry_is_rejected_without_panicking() {
+        let now = Instant::now();
+        let token = serde_json::json!({ "expires_in": u64::MAX });
+        let result = std::panic::catch_unwind(|| {
+            spotify_access_token_deadline(now, 1_700_000_000_000, &token)
+        });
+        assert!(result.is_ok(), "provider expiry must not panic");
+        assert!(result.expect("expiry calculation should return").is_err());
+    }
+
+    #[test]
+    fn huge_absolute_expiry_does_not_wrap_through_i64() {
+        let now = Instant::now();
+        let token = serde_json::json!({
+            "accessTokenExpirationTimestampMs": u64::MAX
+        });
+        assert!(spotify_access_token_deadline(now, 1_700_000_000_000, &token).is_err());
+    }
+
+    #[test]
+    fn ordinary_relative_expiry_is_preserved() {
+        let now = Instant::now();
+        let token = serde_json::json!({ "expires_in": 60_u64 });
+        let deadline = spotify_access_token_deadline(now, 1_700_000_000_000, &token)
+            .expect("ordinary expiry should work");
+        assert!(deadline >= now + Duration::from_secs(59));
     }
 }

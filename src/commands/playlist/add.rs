@@ -4,6 +4,10 @@ use crate::audio::{ResolvedInput, resolve_input};
 use crate::core::Track;
 use crate::utils::{Context, Error, SerenyaError};
 
+fn tracks_counted_for_playlist_limit(resolved_tracks: usize, max_import: usize) -> usize {
+    resolved_tracks.min(max_import)
+}
+
 async fn save_tracks_to_playlist(
     db: &crate::database::DatabaseManager,
     user_id: u64,
@@ -196,7 +200,9 @@ async fn add_tracks_to_playlist(
         .ok_or_else(|| SerenyaError::NotFound(format!("Playlist '{}' not found.", name)))?;
 
     let max_tracks = config.playback.max_tracks_per_user_playlist;
-    if playlist.tracks.len() + all_tracks.len() > max_tracks {
+    let tracks_to_import =
+        tracks_counted_for_playlist_limit(all_tracks.len(), config.playback.max_playlist_import);
+    if playlist.tracks.len() + tracks_to_import > max_tracks {
         ctx.say(format!(
             "Playlist limit exceeded! Cannot add {} tracks (max {}). Current size: {}.",
             all_tracks.len(),
@@ -223,4 +229,23 @@ async fn add_tracks_to_playlist(
     ))
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod playlist_import_limit_tests {
+    use super::tracks_counted_for_playlist_limit;
+
+    #[test]
+    fn precheck_counts_only_tracks_that_can_actually_be_imported() {
+        assert_eq!(
+            tracks_counted_for_playlist_limit(400, 100),
+            100,
+            "capacity checks must match the later max_import truncation"
+        );
+    }
+
+    #[test]
+    fn precheck_preserves_small_imports() {
+        assert_eq!(tracks_counted_for_playlist_limit(50, 100), 50);
+    }
 }

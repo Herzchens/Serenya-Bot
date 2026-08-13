@@ -79,6 +79,22 @@ fn normalize_sigterm_registration<T, E>(result: Result<T, E>) -> Result<T, E> {
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStopOrigin {
+    ClientCompletion,
+    ExternalControl,
+}
+
+async fn quiesce_gateway_for_stop<F, Fut>(origin: GatewayStopOrigin, quiesce: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if origin == GatewayStopOrigin::ExternalControl {
+        quiesce().await;
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     installer::ensure_dependencies().await;
 
@@ -305,34 +321,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(unix))]
     let sigterm_future = std::future::pending::<Result<(), std::io::Error>>();
 
-    let run_error: Option<Box<dyn std::error::Error>> = tokio::select! {
+    let (run_error, gateway_stop_origin): (Option<Box<dyn std::error::Error>>, GatewayStopOrigin) = tokio::select! {
         result = client.start() => {
-            normalize_client_start_result(result)
-                .err()
-                .map(|err| Box::new(err) as Box<dyn std::error::Error>)
+            (
+                normalize_client_start_result(result)
+                    .err()
+                    .map(|err| Box::new(err) as Box<dyn std::error::Error>),
+                GatewayStopOrigin::ClientCompletion,
+            )
         }
         result = tokio::signal::ctrl_c() => {
             match normalize_shutdown_signal_result(result) {
                 Ok(()) => {
                     info!(target: "shutdown", "Shutdown signal received (ctrl+c)");
-                    None
+                    (None, GatewayStopOrigin::ExternalControl)
                 }
-                Err(err) => Some(Box::new(err)),
+                Err(err) => (Some(Box::new(err)), GatewayStopOrigin::ExternalControl),
             }
         }
         result = sigterm_future => {
             match result {
                 Ok(()) => {
                     info!(target: "shutdown", "Shutdown signal received (SIGTERM)");
-                    None
+                    (None, GatewayStopOrigin::ExternalControl)
                 }
                 Err(err) => {
                     error!(%err, "SIGTERM signal listener failed");
-                    Some(Box::new(err))
+                    (Some(Box::new(err)), GatewayStopOrigin::ExternalControl)
                 }
             }
         }
     };
+
+    let shard_manager = client.shard_manager.clone();
+    quiesce_gateway_for_stop(gateway_stop_origin, move || async move {
+        shard_manager.shutdown_all().await;
+    })
+    .await;
 
     // Always flush database/webhook state first, then surface any unexpected
     // client, signal-listener, or final persistence failure to the process.
@@ -1231,5 +1256,34 @@ mod empty_room_monitor_shutdown_tests {
 
         cleanup(&path).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gateway_shutdown_order_tests {
+    use super::{GatewayStopOrigin, quiesce_gateway_for_stop};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn external_control_stop_quiesces_gateway_before_persistence() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        quiesce_gateway_for_stop(GatewayStopOrigin::ExternalControl, move || async move {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_client_does_not_request_redundant_gateway_shutdown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        quiesce_gateway_for_stop(GatewayStopOrigin::ClientCompletion, move || async move {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

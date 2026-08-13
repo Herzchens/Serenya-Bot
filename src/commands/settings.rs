@@ -2,6 +2,19 @@ use crate::audio::quality::Quality;
 use crate::utils::{Context, Error, SerenyaError};
 use poise::serenity_prelude as serenity;
 
+async fn update_guild_setting_with_gate<F, Fut>(
+    db: &crate::database::DatabaseManager,
+    guild_id: u64,
+    before_write: Fut,
+    mutate: F,
+) where
+    F: FnOnce(&mut crate::database::models::GuildSettings),
+    Fut: std::future::Future<Output = ()>,
+{
+    before_write.await;
+    db.update_guild_settings_mut(guild_id, mutate).await;
+}
+
 pub async fn autocomplete_quality(_ctx: Context<'_>, partial: &str) -> Vec<String> {
     let choices = vec![
         "Performance".to_string(),
@@ -35,9 +48,10 @@ pub async fn announce_track(
         .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
 
     let db = &ctx.data().database;
-    let mut settings = db.get_guild_settings(guild_id.get()).await;
-    settings.announce_track = enable;
-    db.update_guild_settings(guild_id.get(), settings).await;
+    update_guild_setting_with_gate(db, guild_id.get(), std::future::ready(()), |settings| {
+        settings.announce_track = enable;
+    })
+    .await;
 
     let embed = serenity::CreateEmbed::new()
         .title("📢 Settings Updated")
@@ -100,9 +114,16 @@ pub async fn quality(
     }
 
     let db = &ctx.data().database;
-    let mut settings = db.get_guild_settings(guild_id.get()).await;
-    settings.quality = quality_mode.to_str().to_owned();
-    db.update_guild_settings(guild_id.get(), settings).await;
+    let stored_quality = quality_mode.to_str().to_owned();
+    update_guild_setting_with_gate(
+        db,
+        guild_id.get(),
+        std::future::ready(()),
+        move |settings| {
+            settings.quality = stored_quality;
+        },
+    )
+    .await;
 
     let raw_bitrate = quality_mode.to_bitrate();
     let max_tier_bitrate = match premium_tier {
@@ -208,9 +229,16 @@ pub async fn prefix(
             .into());
         }
 
-        let mut settings = db.get_guild_settings(guild_id.get()).await;
-        settings.prefix = Some(new_prefix.clone());
-        db.update_guild_settings(guild_id.get(), settings).await;
+        let stored_prefix = new_prefix.clone();
+        update_guild_setting_with_gate(
+            db,
+            guild_id.get(),
+            std::future::ready(()),
+            move |settings| {
+                settings.prefix = Some(stored_prefix);
+            },
+        )
+        .await;
 
         ctx.say(format!(
             "✅ Prefix has been changed to `{new_prefix}` for this server."
@@ -224,4 +252,103 @@ pub async fn prefix(
         ctx.say(format!("`[{current_prefix}]`")).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod concurrent_settings_update_tests {
+    use super::update_guild_setting_with_gate;
+    use crate::database::DatabaseManager;
+    use std::sync::Arc;
+
+    fn temp_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "serenya-settings-race-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn cleanup(path: &std::path::Path) {
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+    }
+
+    #[tokio::test]
+    async fn settings_update_does_not_overwrite_concurrent_playback_stats()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let db = Arc::new(DatabaseManager::load(&path).await?);
+        let guild_id = 7_700_020_u64;
+        let read_done = Arc::new(tokio::sync::Notify::new());
+        let allow_write = Arc::new(tokio::sync::Notify::new());
+
+        let task_db = Arc::clone(&db);
+        let task_read_done = Arc::clone(&read_done);
+        let task_allow_write = Arc::clone(&allow_write);
+        let setting_task = tokio::spawn(async move {
+            update_guild_setting_with_gate(
+                task_db.as_ref(),
+                guild_id,
+                async move {
+                    task_read_done.notify_one();
+                    task_allow_write.notified().await;
+                },
+                |settings| settings.announce_track = false,
+            )
+            .await;
+        });
+
+        read_done.notified().await;
+        db.update_guild_settings_mut(guild_id, |settings| {
+            settings.total_songs_played = 17;
+            settings.total_listening_seconds = 901;
+        })
+        .await;
+        allow_write.notify_one();
+        setting_task.await?;
+
+        let settings = db.get_guild_settings(guild_id).await;
+        assert!(
+            !settings.announce_track,
+            "the requested setting change must land"
+        );
+        assert_eq!(
+            settings.total_songs_played, 17,
+            "a stale whole-settings write must not erase concurrently recorded songs"
+        );
+        assert_eq!(
+            settings.total_listening_seconds, 901,
+            "a stale whole-settings write must not erase concurrently recorded listening time"
+        );
+
+        cleanup(&path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_settings_update_still_changes_only_requested_field()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let db = DatabaseManager::load(&path).await?;
+        let guild_id = 7_700_021_u64;
+        db.update_guild_settings_mut(guild_id, |settings| {
+            settings.total_songs_played = 3;
+        })
+        .await;
+
+        update_guild_setting_with_gate(&db, guild_id, std::future::ready(()), |settings| {
+            settings.quality = "quality".to_owned();
+        })
+        .await;
+
+        let settings = db.get_guild_settings(guild_id).await;
+        assert_eq!(settings.quality, "quality");
+        assert_eq!(settings.total_songs_played, 3);
+        cleanup(&path).await;
+        Ok(())
+    }
 }
