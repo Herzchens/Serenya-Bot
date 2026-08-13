@@ -15,6 +15,12 @@ fn format_seek_time(d: Duration) -> String {
     format!("{:02}:{:02}", mins, secs)
 }
 
+pub(crate) fn add_seek_duration(left: Duration, right: Duration) -> Result<Duration, SerenyaError> {
+    left.checked_add(right).ok_or_else(|| {
+        SerenyaError::Config("Seek target exceeds the supported duration range.".into())
+    })
+}
+
 pub(crate) async fn seek_by_restart(
     ctx: Context<'_>,
     guild_id: poise::serenity_prelude::GuildId,
@@ -217,7 +223,8 @@ pub async fn forward(
     };
 
     let info = handle.get_info().await?;
-    let new_pos = seek_offset + info.position + duration;
+    let elapsed = add_seek_duration(seek_offset, info.position)?;
+    let new_pos = add_seek_duration(elapsed, duration)?;
 
     seek_by_restart(ctx, guild_id, player_lock, new_pos).await?;
     let new_pos_fmt = format_seek_time(new_pos);
@@ -272,7 +279,7 @@ pub async fn rewind(
     };
 
     let info = handle.get_info().await?;
-    let total_elapsed = seek_offset + info.position;
+    let total_elapsed = add_seek_duration(seek_offset, info.position)?;
     let new_pos = total_elapsed
         .checked_sub(duration)
         .unwrap_or(Duration::from_secs(0));
@@ -606,5 +613,57 @@ mod jump_count_tests {
     fn jump_count_without_current_track_is_only_queue_prefix() {
         assert_eq!(jump_skipped_count(false, 0), 0);
         assert_eq!(jump_skipped_count(false, 2), 2);
+    }
+}
+
+#[cfg(test)]
+mod seek_duration_overflow_tests {
+    use super::add_seek_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn maximum_user_duration_does_not_panic_when_forwarding() {
+        let user_duration = crate::utils::time::parse_duration("18446744073709551615")
+            .expect("u64::MAX seconds is accepted by the duration parser");
+        assert_eq!(user_duration, Duration::from_secs(u64::MAX));
+
+        let result =
+            std::panic::catch_unwind(|| add_seek_duration(Duration::from_secs(1), user_duration));
+        assert!(
+            result.is_ok(),
+            "a syntactically valid /forward duration must not panic the command task"
+        );
+        assert!(
+            result
+                .expect("seek arithmetic should return normally")
+                .is_err(),
+            "overflowing forward targets must be rejected"
+        );
+    }
+
+    #[test]
+    fn maximum_seek_offset_does_not_panic_when_rewinding() {
+        let result = std::panic::catch_unwind(|| {
+            add_seek_duration(Duration::from_secs(u64::MAX), Duration::from_secs(1))
+        });
+        assert!(
+            result.is_ok(),
+            "rewind elapsed-position arithmetic must not panic after a very large seek offset"
+        );
+        assert!(
+            result
+                .expect("seek arithmetic should return normally")
+                .is_err(),
+            "overflowing accumulated seek positions must be rejected"
+        );
+    }
+
+    #[test]
+    fn ordinary_seek_duration_addition_is_preserved() {
+        assert_eq!(
+            add_seek_duration(Duration::from_secs(40), Duration::from_secs(2))
+                .expect("ordinary duration addition should succeed"),
+            Duration::from_secs(42)
+        );
     }
 }

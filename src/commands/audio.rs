@@ -52,7 +52,10 @@ pub async fn eight_d(
 
     let current_pos_opt = if let Some(ref handle) = current_track_handle {
         if let Ok(info) = handle.get_info().await {
-            Some(seek_offset + info.position)
+            Some(crate::commands::control::add_seek_duration(
+                seek_offset,
+                info.position,
+            )?)
         } else {
             None
         }

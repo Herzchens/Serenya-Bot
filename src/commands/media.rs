@@ -246,7 +246,7 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
     if let Some(ref handle) = current_track_handle
         && let Ok(info) = handle.get_info().await
     {
-        elapsed = seek_offset + info.position;
+        elapsed = crate::commands::control::add_seek_duration(seek_offset, info.position)?;
     }
 
     let loop_str = match loop_mode {
