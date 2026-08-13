@@ -1,5 +1,9 @@
 use crate::utils::{Context, Error, SerenyaError};
 
+fn displayed_queue_size(waiting_tracks: usize, has_active_track: bool) -> usize {
+    waiting_tracks.saturating_add(usize::from(has_active_track))
+}
+
 async fn get_memory_usage() -> String {
     #[cfg(target_os = "linux")]
     {
@@ -114,7 +118,7 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
 
     if let Some(player_lock) = player_lock_opt {
         let player = player_lock.read().await;
-        queue_size = player.queue.len();
+        queue_size = displayed_queue_size(player.queue.len(), player.now_playing.is_some());
 
         if let Some(vc_channel_id) = player.voice_channel
             && let Some(guild) = ctx.guild()
@@ -159,4 +163,24 @@ pub async fn stats(ctx: Context<'_>) -> Result<(), Error> {
 
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::displayed_queue_size;
+
+    #[test]
+    fn active_track_counts_as_one_when_waiting_queue_is_empty() {
+        assert_eq!(displayed_queue_size(0, true), 1);
+    }
+
+    #[test]
+    fn active_track_and_waiting_tracks_are_all_counted() {
+        assert_eq!(displayed_queue_size(2, true), 3);
+    }
+
+    #[test]
+    fn idle_empty_queue_is_zero() {
+        assert_eq!(displayed_queue_size(0, false), 0);
+    }
 }
