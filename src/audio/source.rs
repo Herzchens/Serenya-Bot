@@ -845,8 +845,7 @@ async fn resolve_youtube_stream_native(
         && let Some(url) = resolve_via_invidious_or_piped(video_id, http_client).await
     {
         if is_direct_stream_url(&url) {
-            tracing::debug!(track_url, stream_url = %url, "invidious/piped resolved direct stream");
-            return Some(youtube_resolver::ResolvedStream {
+            let stream = youtube_resolver::ResolvedStream {
                 url,
                 client_kind: "WEB".to_string(),
                 user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36".to_string(),
@@ -854,9 +853,38 @@ async fn resolve_youtube_stream_native(
                 mime_type: None,
                 bitrate: None,
                 resolve_source: "invidious".to_string(),
-            });
+            };
+
+            match youtube_resolver::probe_resolved_stream_health(
+                http_client,
+                &stream,
+                102_400,
+                50.0,
+            )
+            .await
+            {
+                Ok(_) => {
+                    tracing::debug!(
+                        track_url,
+                        source = %stream.resolve_source,
+                        "invidious/piped direct stream passed strict access validation"
+                    );
+                    return Some(stream);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        source = %stream.resolve_source,
+                        error = %err,
+                        "rejecting invidious/piped stream that failed strict access validation"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                url = %url,
+                "rejecting non-direct stream URL from proxies"
+            );
         }
-        tracing::debug!(url = %url, "rejecting non-direct stream URL from proxies");
     }
 
     None

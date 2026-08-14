@@ -64,6 +64,23 @@ pub fn create_tvhtml5_client(version: Option<String>) -> BaseInnerTubeClient {
     )
 }
 
+pub fn create_visionos_client() -> BaseInnerTubeClient {
+    BaseInnerTubeClient::new(
+        "VISIONOS",
+        "VISIONOS",
+        "1.02".to_string(),
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15".to_string(),
+        "101".to_string(),
+        Some(json!({
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471"
+        })),
+        None,
+    )
+}
+
 pub fn create_ios_client(version: Option<String>) -> BaseInnerTubeClient {
     let version = version.unwrap_or_else(|| "21.02.3".to_string());
     BaseInnerTubeClient::new(

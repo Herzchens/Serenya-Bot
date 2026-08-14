@@ -14,7 +14,7 @@ mod types;
 
 pub use clients::{
     create_android_client, create_android_vr_client, create_ios_client, create_tvhtml5_client,
-    create_web_safari_client,
+    create_visionos_client, create_web_safari_client,
 };
 pub use innertube::{BaseInnerTubeClient, InnerTubeClient};
 pub use resolver_api::{
@@ -44,6 +44,19 @@ mod tests {
         assert_eq!(client.name(), "WEB_SAFARI");
         assert_eq!(client.client_name(), "WEB");
         assert!(client.user_agent().contains("Safari"));
+    }
+
+    #[test]
+    fn visionos_client_identity_is_explicit() {
+        let client = create_visionos_client();
+
+        assert_eq!(client.name(), "VISIONOS");
+        assert_eq!(client.client_name(), "VISIONOS");
+        assert_eq!(client.client_version(), "1.02");
+        assert!(
+            client.user_agent().contains("Safari"),
+            "VISIONOS client must retain its Safari-style user agent"
+        );
     }
 
     #[cfg(feature = "live-tests")]
