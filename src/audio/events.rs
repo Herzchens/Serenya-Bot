@@ -724,7 +724,10 @@ pub fn play_next(
             match handle.await {
                 Ok(Ok(url)) => {
                     if !crate::audio::source::is_verified_stream_domain(&url.url) {
-                        tracing::warn!("Stream resolution returned unverified domain: {}", url.url);
+                        tracing::warn!(
+                            stream_host = %crate::audio::source::stream_log_location(&url.url),
+                            "Stream resolution returned unverified domain"
+                        );
                         Err(SerenyaError::Audio(
                             "Stream resolution returned unverified domain".into(),
                         ))
@@ -1055,7 +1058,11 @@ pub async fn trigger_prefetch_with_context(
                     track.resolved_url = Some(Arc::new(resolved_url));
                     tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
                 } else {
-                    tracing::warn!(guild_id = %guild_id, url = %resolved_url.url, "Prefetch rejected due to unverified domain");
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        stream_host = %crate::audio::source::stream_log_location(&resolved_url.url),
+                        "Prefetch rejected due to unverified domain"
+                    );
                 }
             }
         }

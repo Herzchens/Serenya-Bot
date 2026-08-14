@@ -95,9 +95,19 @@ pub async fn cache_invalidate_stream(url: &str) {
     SOUNDCLOUD_STREAM_CACHE.load().invalidate(url).await;
 }
 
+pub(crate) fn stream_log_location(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<invalid-url>".to_owned())
+}
+
 pub async fn cache_set_stream(url: String, stream: &youtube_resolver::ResolvedStream) {
     if !is_verified_stream_domain(&stream.url) {
-        tracing::warn!(stream_url = %stream.url, "Refused to cache stream URL: unverified domain");
+        tracing::warn!(
+            stream_host = %stream_log_location(&stream.url),
+            "Refused to cache stream URL: unverified domain"
+        );
         return;
     }
     STREAM_CACHE
@@ -116,6 +126,12 @@ pub fn is_verified_stream_domain(url: &str) -> bool {
     let Some(host) = parsed.host_str() else {
         return false;
     };
+
+    // SoundCloud's current AAC HLS playback endpoint.
+    // Keep this exact instead of trusting the entire soundcloud.cloud suffix.
+    if host == "playback.media-streaming.soundcloud.cloud" {
+        return true;
+    }
 
     let allowlist = [
         "googlevideo.com",
@@ -407,7 +423,10 @@ async fn resolve_soundcloud_stream_url(
     })?;
 
     let transcoding_url = transcoding.url.clone();
-    tracing::debug!(transcoding_url, "Selected SoundCloud transcoding");
+    tracing::debug!(
+        transcoding_host = %stream_log_location(&transcoding_url),
+        "Selected SoundCloud transcoding"
+    );
 
     let stream_url = fetch_stream_url_with_backoff(&transcoding_url, http_client).await?;
 
@@ -428,7 +447,10 @@ async fn resolve_soundcloud_stream_url(
             .insert(track_url.to_owned(), Arc::new(stream.clone()))
             .await;
     } else {
-        tracing::warn!(stream_url = %stream.url, "Refused to cache SoundCloud stream URL: unverified domain");
+        tracing::warn!(
+            stream_host = %stream_log_location(&stream.url),
+            "Refused to cache SoundCloud stream URL: unverified domain"
+        );
     }
 
     Ok(stream)
@@ -709,7 +731,13 @@ async fn resolve_stream_uncached(
         if let Some(stream) =
             resolve_youtube_stream_native(track_url, http_client, excluded_client_kind).await
         {
-            tracing::info!(track_url, stream_url = %stream.url, "native stream resolution succeeded");
+            tracing::info!(
+                track_url,
+                stream_host = %stream_log_location(&stream.url),
+                client = %stream.client_kind,
+                source = %stream.resolve_source,
+                "native stream resolution succeeded"
+            );
             cache_set_stream(track_url.to_owned(), &stream).await;
             return Ok(stream);
         }
@@ -748,7 +776,13 @@ async fn resolve_stream_uncached(
 
     let res = run_ytdlp_stream_resolution(track_url, youtube_url).await;
     if let Ok(ref stream) = res {
-        tracing::info!(track_url, stream_url = %stream.url, "yt-dlp stream resolution succeeded");
+        tracing::info!(
+            track_url,
+            stream_host = %stream_log_location(&stream.url),
+            client = %stream.client_kind,
+            source = %stream.resolve_source,
+            "yt-dlp stream resolution succeeded"
+        );
         cache_set_stream(track_url.to_owned(), stream).await;
     }
     res
@@ -762,7 +796,13 @@ async fn extract_stream_url_inner(
 ) -> Result<youtube_resolver::ResolvedStream, SerenyaError> {
     if let Some(stream) = cache_get_stream(track_url).await {
         if excluded_client_kind != Some(stream.client_kind.as_str()) {
-            tracing::debug!(track_url, stream_url = %stream.url, "stream cache hit");
+            tracing::debug!(
+                track_url,
+                stream_host = %stream_log_location(&stream.url),
+                client = %stream.client_kind,
+                source = %stream.resolve_source,
+                "stream cache hit"
+            );
             return Ok(stream);
         }
         tracing::debug!(
@@ -828,10 +868,19 @@ async fn resolve_youtube_stream_native(
         );
         if let Ok(Ok(stream)) = tokio::time::timeout(timeout_duration, resolver_future).await {
             if is_direct_stream_url(&stream.url) {
-                tracing::debug!(track_url, stream_url = %stream.url, "youtube_resolver resolved direct stream");
+                tracing::debug!(
+                    track_url,
+                    stream_host = %stream_log_location(&stream.url),
+                    client = %stream.client_kind,
+                    source = %stream.resolve_source,
+                    "youtube_resolver resolved direct stream"
+                );
                 return Some(stream);
             }
-            tracing::debug!(url = %stream.url, "rejecting non-direct stream URL from youtube_resolver");
+            tracing::debug!(
+                stream_host = %stream_log_location(&stream.url),
+                "rejecting non-direct stream URL from youtube_resolver"
+            );
         } else {
             tracing::debug!(
                 track_url,
@@ -881,7 +930,7 @@ async fn resolve_youtube_stream_native(
             }
         } else {
             tracing::debug!(
-                url = %url,
+                stream_host = %stream_log_location(&url),
                 "rejecting non-direct stream URL from proxies"
             );
         }
@@ -1380,5 +1429,66 @@ mod direct_stream_domain_validation_tests {
         assert!(is_direct_stream_url(
             "https://redirector.googleusercontent.com/media?id=control"
         ));
+    }
+}
+
+#[cfg(test)]
+mod soundcloud_stream_domain_tests {
+    use super::is_verified_stream_domain;
+
+    #[test]
+    fn modern_soundcloud_aac_hls_host_is_verified() {
+        assert!(
+            is_verified_stream_domain(
+                "https://playback.media-streaming.soundcloud.cloud/test/aac_160k/test/playlist.m3u8"
+            ),
+            "official SoundCloud AAC HLS playback host must be accepted"
+        );
+    }
+
+    #[test]
+    fn soundcloud_playback_host_lookalike_is_rejected() {
+        assert!(
+            !is_verified_stream_domain(
+                "https://playback.media-streaming.soundcloud.cloud.attacker.example/playlist.m3u8"
+            ),
+            "lookalike host must not cross the SoundCloud trust boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stream_log_privacy_tests {
+    use super::stream_log_location;
+
+    #[test]
+    fn signed_playback_url_log_value_contains_only_host() {
+        let logged = stream_log_location(
+            "https://rr1.example.googlevideo.com/videoplayback?sig=DO_NOT_LOG&ip=203.0.113.9#fragment",
+        );
+
+        assert_eq!(logged, "rr1.example.googlevideo.com");
+        assert!(!logged.contains("DO_NOT_LOG"));
+        assert!(!logged.contains("203.0.113.9"));
+        assert!(!logged.contains("videoplayback"));
+    }
+
+    #[test]
+    fn soundcloud_playback_log_value_contains_only_host() {
+        let logged = stream_log_location(
+            "https://playback.media-streaming.soundcloud.cloud/private/path.m3u8?token=DO_NOT_LOG",
+        );
+
+        assert_eq!(logged, "playback.media-streaming.soundcloud.cloud");
+        assert!(!logged.contains("DO_NOT_LOG"));
+        assert!(!logged.contains("private"));
+    }
+
+    #[test]
+    fn malformed_sensitive_url_is_not_echoed_back() {
+        let logged = stream_log_location("not a URL DO_NOT_LOG");
+
+        assert_eq!(logged, "<invalid-url>");
+        assert!(!logged.contains("DO_NOT_LOG"));
     }
 }
