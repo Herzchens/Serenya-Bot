@@ -1,4 +1,3 @@
-#[ignore]
 #[tokio::test]
 async fn ffmpeg_download_test() {
     #[cfg(feature = "ffmpeg")]

@@ -78,6 +78,10 @@ fn candidate_to_meta(candidate: &TrackCandidate) -> ExternalTrackMeta {
     }
 }
 
+fn spotify_duration_seconds_to_millis(seconds: u64) -> Option<u64> {
+    seconds.checked_mul(1000)
+}
+
 fn metadata_provider_boost(source: &str) -> f64 {
     match source {
         "Deezer" => 0.08,
@@ -605,6 +609,10 @@ async fn run_provider_batch(
     Ok(all_scored)
 }
 
+fn direct_url_is_allowed(input: &str) -> bool {
+    crate::audio::source::is_verified_stream_domain(input)
+}
+
 /// Orchestrates track resolution, mirroring, and search ranking.
 pub async fn resolve_input(
     query: &str,
@@ -844,6 +852,11 @@ pub async fn resolve_input(
                 ))
             }
         } else if direct_provider.supports(query_trimmed) {
+            if !direct_url_is_allowed(query_trimmed) {
+                return Err(SerenyaError::Audio(
+                    "Direct URLs are restricted to supported HTTPS streaming hosts.".to_owned(),
+                ));
+            }
             let mut tracks = direct_provider.load(query_trimmed, user_id).await?;
             if !tracks.is_empty() {
                 let mut track = tracks.remove(0);
@@ -1498,7 +1511,7 @@ async fn resolve_spotify_playlist_api(
                     track_val
                         .pointer("/consumptionExperienceTrait/duration/seconds")
                         .and_then(|v| v.as_u64())
-                        .map(|s| s * 1000)
+                        .and_then(spotify_duration_seconds_to_millis)
                 })
                 .unwrap_or(0);
 
@@ -2319,21 +2332,8 @@ fn recursive_find_tracks(
 
             if !vid.is_empty() && seen_ids.insert(vid.to_string()) {
                 let duration_str = video["lengthText"]["simpleText"].as_str();
-                let duration = duration_str.and_then(|s| {
-                    let parts: Vec<&str> = s.split(':').collect();
-                    let mut secs = 0u64;
-                    if parts.len() == 2 {
-                        let mins = parts[0].parse::<u64>().ok()?;
-                        let s = parts[1].parse::<u64>().ok()?;
-                        secs = mins * 60 + s;
-                    } else if parts.len() == 3 {
-                        let hrs = parts[0].parse::<u64>().ok()?;
-                        let mins = parts[1].parse::<u64>().ok()?;
-                        let s = parts[2].parse::<u64>().ok()?;
-                        secs = hrs * 3600 + mins * 60 + s;
-                    }
-                    Some(Duration::from_secs(secs))
-                });
+                let duration =
+                    duration_str.and_then(crate::audio::providers::parse_simple_duration);
 
                 tracks.push(Track {
                     title: title.into(),
@@ -2581,6 +2581,7 @@ mod tests {
         assert_eq!(&*tracks[1].source_provider, "YouTube");
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_live_youtube_album_resolution() {
         let url =
@@ -2698,12 +2699,9 @@ mod tests {
         assert_eq!(tracks[0].duration, Some(1000));
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_spotify_playlist_resolution() -> Result<(), Box<dyn std::error::Error>> {
-        if !std::path::Path::new("config.yml").exists() {
-            println!("Skipping test: config.yml not found");
-            return Ok(());
-        }
         let config = crate::config::load_config("config.yml").await?;
         crate::audio::runtime::configure(
             &config.resolver,
@@ -2759,12 +2757,9 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_spotify_track_resolution() -> Result<(), Box<dyn std::error::Error>> {
-        if !std::path::Path::new("config.yml").exists() {
-            println!("Skipping test: config.yml not found");
-            return Ok(());
-        }
         let config = crate::config::load_config("config.yml").await?;
         crate::audio::runtime::configure(
             &config.resolver,
@@ -2788,5 +2783,92 @@ mod tests {
         );
         assert!(artist.contains("r.tee") || artist.contains("pubg"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod direct_url_policy_tests {
+    use super::direct_url_is_allowed;
+
+    #[test]
+    fn direct_url_policy_rejects_arbitrary_local_spoofed_and_non_https_hosts() {
+        assert!(!direct_url_is_allowed("http://127.0.0.1:8080/audio.mp3"));
+        assert!(!direct_url_is_allowed("https://localhost/audio.mp3"));
+        assert!(!direct_url_is_allowed("https://example.com/audio.mp3"));
+        assert!(!direct_url_is_allowed(
+            "https://googlevideo.com.evil.example/audio"
+        ));
+        assert!(!direct_url_is_allowed("file://googlevideo.com/etc/passwd"));
+        assert!(!direct_url_is_allowed("ftp://rr1.googlevideo.com/audio"));
+    }
+
+    #[test]
+    fn direct_url_policy_accepts_supported_https_stream_hosts() {
+        assert!(direct_url_is_allowed(
+            "https://rr1.googlevideo.com/videoplayback"
+        ));
+        assert!(direct_url_is_allowed("https://cf-media.sndcdn.com/stream"));
+    }
+}
+
+#[cfg(test)]
+mod final_provider_duration_boundary_tests {
+    use super::{recursive_find_tracks, spotify_duration_seconds_to_millis};
+    use std::time::Duration;
+
+    #[test]
+    fn spotify_seconds_to_millis_rejects_overflow_without_panicking() {
+        let result = std::panic::catch_unwind(|| spotify_duration_seconds_to_millis(u64::MAX));
+        assert!(result.is_ok(), "provider-controlled seconds must not panic");
+        assert_eq!(
+            result.expect("conversion should return normally"),
+            None,
+            "seconds that cannot fit in milliseconds must be rejected"
+        );
+        assert_eq!(spotify_duration_seconds_to_millis(123), Some(123_000));
+    }
+
+    #[test]
+    fn youtube_playlist_fallback_rejects_oversized_duration_without_panicking() {
+        let result = std::panic::catch_unwind(|| {
+            let json_data = serde_json::json!({
+                "playlistVideoRenderer": {
+                    "videoId": "overflow-duration",
+                    "title": { "runs": [{ "text": "Overflow Probe" }] },
+                    "lengthText": { "simpleText": "18446744073709551615:59" }
+                }
+            });
+            let mut tracks = Vec::new();
+            let mut seen_ids = std::collections::HashSet::new();
+            recursive_find_tracks(&json_data, &mut tracks, &mut seen_ids, 10, 12345, "YouTube");
+            tracks
+        });
+
+        assert!(
+            result.is_ok(),
+            "malformed provider duration must not panic the playlist resolver"
+        );
+        let tracks = result.expect("playlist parsing should return normally");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].duration, None,
+            "overflowing provider duration must be treated as unavailable"
+        );
+    }
+
+    #[test]
+    fn ordinary_youtube_playlist_duration_remains_intact() {
+        let json_data = serde_json::json!({
+            "playlistVideoRenderer": {
+                "videoId": "normal-duration",
+                "title": { "runs": [{ "text": "Normal Probe" }] },
+                "lengthText": { "simpleText": "3:45" }
+            }
+        });
+        let mut tracks = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        recursive_find_tracks(&json_data, &mut tracks, &mut seen_ids, 10, 12345, "YouTube");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].duration, Some(Duration::from_secs(225)));
     }
 }

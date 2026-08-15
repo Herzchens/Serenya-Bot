@@ -22,6 +22,9 @@ use dashmap::DashMap;
 use poise::serenity_prelude as serenity;
 use songbird::SerenityInit;
 use tokio_util::sync::CancellationToken;
+
+#[cfg(not(panic = "unwind"))]
+compile_error!("Serenya requires panic=unwind so resolver task panics remain containable");
 use tracing::{error, info};
 
 use crate::config::BotConfig;
@@ -29,7 +32,7 @@ use crate::database::DatabaseManager;
 
 /// Shared application state accessible from all command handlers.
 pub struct Data {
-    pub config: arc_swap::ArcSwap<BotConfig>,
+    pub config: Arc<arc_swap::ArcSwap<BotConfig>>,
     pub database: Arc<DatabaseManager>,
     pub guild_players: Arc<DashMap<serenity::GuildId, Arc<tokio::sync::RwLock<core::GuildPlayer>>>>,
     pub http_client: reqwest::Client,
@@ -51,10 +54,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Runtime::new()?.block_on(run())
 }
 
+fn normalize_client_start_result<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Client exited with error");
+            Err(err)
+        }
+    }
+}
+
+fn normalize_shutdown_signal_result<E: std::fmt::Display>(result: Result<(), E>) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Shutdown signal listener failed");
+            Err(err)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn normalize_sigterm_registration<T, E>(result: Result<T, E>) -> Result<T, E> {
+    result
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GatewayStopOrigin {
+    ClientCompletion,
+    ExternalControl,
+}
+
+async fn quiesce_gateway_for_stop<F, Fut>(origin: GatewayStopOrigin, quiesce: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if origin == GatewayStopOrigin::ExternalControl {
+        quiesce().await;
+    }
+}
+
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     installer::ensure_dependencies().await;
 
     let config = Arc::new(config::load_config("config.yml").await?);
+    let live_config = Arc::new(arc_swap::ArcSwap::new(config.clone()));
 
     // Register secrets for redaction
     logging::register_secret_to_redact(&config.bot.token);
@@ -93,8 +138,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let start_time = std::time::Instant::now();
 
-    let config_clone = Arc::clone(&config);
+    let live_config_clone = Arc::clone(&live_config);
     let database_clone = Arc::clone(&database);
+    let empty_room_monitor_handle = Arc::new(tokio::sync::Mutex::new(None));
+    let empty_room_monitor_handle_for_setup = Arc::clone(&empty_room_monitor_handle);
+    let empty_room_monitor_cancel = cancel_token.clone();
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -149,6 +197,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         serenity::FullEvent::GuildDelete { incomplete, .. } => {
                             let guild_id = incomplete.id;
+                            if let Some(player_lock) = data
+                                .guild_players
+                                .get(&guild_id)
+                                .map(|entry| entry.value().clone())
+                            {
+                                audio::events::finalize_interrupted_playback_stats(
+                                    data.database.as_ref(),
+                                    guild_id,
+                                    &player_lock,
+                                )
+                                .await;
+                            }
                             audio::runtime::cleanup_guild(guild_id.get());
                             data.guild_players.remove(&guild_id);
                             info!(guild_id = %guild_id, "Guild removed — cleaned up runtime state");
@@ -207,15 +267,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let guild_players = Arc::new(DashMap::new());
 
-                start_empty_room_monitor(
+                let monitor_handle = start_empty_room_monitor(
                     guild_players.clone(),
                     ctx.http.clone(),
-                    config_clone.clone(),
+                    live_config_clone.clone(),
+                    Arc::clone(&database_clone),
                     ctx.clone(),
+                    empty_room_monitor_cancel.clone(),
                 );
+                *empty_room_monitor_handle_for_setup.lock().await = Some(monitor_handle);
 
                 Ok(Data {
-                    config: arc_swap::ArcSwap::new(config_clone),
+                    config: live_config_clone,
                     database: database_clone,
                     guild_players,
                     http_client,
@@ -249,70 +312,121 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     let sigterm_future = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .unwrap()
-            .recv()
-            .await;
+        let mut signal = normalize_sigterm_registration(tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ))?;
+        signal.recv().await;
+        Ok::<(), std::io::Error>(())
     };
     #[cfg(not(unix))]
-    let sigterm_future = std::future::pending::<()>();
+    let sigterm_future = std::future::pending::<Result<(), std::io::Error>>();
 
-    tokio::select! {
+    let (run_error, gateway_stop_origin): (Option<Box<dyn std::error::Error>>, GatewayStopOrigin) = tokio::select! {
         result = client.start() => {
-            if let Err(err) = result {
-                error!(%err, "Client exited with error");
+            (
+                normalize_client_start_result(result)
+                    .err()
+                    .map(|err| Box::new(err) as Box<dyn std::error::Error>),
+                GatewayStopOrigin::ClientCompletion,
+            )
+        }
+        result = tokio::signal::ctrl_c() => {
+            match normalize_shutdown_signal_result(result) {
+                Ok(()) => {
+                    info!(target: "shutdown", "Shutdown signal received (ctrl+c)");
+                    (None, GatewayStopOrigin::ExternalControl)
+                }
+                Err(err) => (Some(Box::new(err)), GatewayStopOrigin::ExternalControl),
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!(target: "shutdown", "Shutdown signal received (ctrl+c)");
+        result = sigterm_future => {
+            match result {
+                Ok(()) => {
+                    info!(target: "shutdown", "Shutdown signal received (SIGTERM)");
+                    (None, GatewayStopOrigin::ExternalControl)
+                }
+                Err(err) => {
+                    error!(%err, "SIGTERM signal listener failed");
+                    (Some(Box::new(err)), GatewayStopOrigin::ExternalControl)
+                }
+            }
         }
-        _ = sigterm_future => {
-            info!(target: "shutdown", "Shutdown signal received (SIGTERM)");
+    };
+
+    let shard_manager = client.shard_manager.clone();
+    quiesce_gateway_for_stop(gateway_stop_origin, move || async move {
+        shard_manager.shutdown_all().await;
+    })
+    .await;
+
+    // Always flush database/webhook state first, then surface any unexpected
+    // client, signal-listener, or final persistence failure to the process.
+    let shutdown_result = shutdown(
+        cancel_token,
+        auto_save_handle,
+        &database,
+        empty_room_monitor_handle,
+    )
+    .await;
+    if let Some(err) = run_error {
+        if let Err(shutdown_err) = &shutdown_result {
+            error!(%shutdown_err, "Final database save also failed while handling a prior runtime error");
+        }
+        return Err(err);
+    }
+    shutdown_result?;
+    Ok(())
+}
+
+fn normalize_final_database_shutdown_result<E: std::fmt::Display>(
+    result: Result<(), E>,
+) -> Result<(), E> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            error!(%err, "Failed to save database during shutdown");
+            Err(err)
         }
     }
+}
 
-    shutdown(cancel_token, auto_save_handle, &database).await;
-    Ok(())
+async fn synchronize_empty_room_monitor(handle: tokio::task::JoinHandle<()>) {
+    if let Err(err) = handle.await {
+        error!(%err, "Empty-room monitor task panicked during shutdown");
+    }
 }
 
 async fn shutdown(
     cancel_token: CancellationToken,
     auto_save_handle: tokio::task::JoinHandle<()>,
     database: &DatabaseManager,
-) {
+    empty_room_monitor_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+) -> Result<(), utils::error::SerenyaError> {
     info!(target: "shutdown", "Initiating graceful shutdown...");
 
     cancel_token.cancel();
+
+    if let Some(handle) = empty_room_monitor_handle.lock().await.take() {
+        synchronize_empty_room_monitor(handle).await;
+    }
 
     if let Err(err) = auto_save_handle.await {
         error!(%err, "Auto-save task panicked during shutdown");
     }
 
-    if let Err(err) = database.shutdown().await {
-        error!(%err, "Failed to save database during shutdown");
+    let database_result = normalize_final_database_shutdown_result(database.shutdown().await);
+    if database_result.is_ok() {
+        info!(target: "shutdown", "Serenya shut down gracefully");
     }
 
-    info!(target: "shutdown", "Serenya shut down gracefully");
-
+    // Flush observability regardless of whether the final database save succeeded.
     logging::webhook::shutdown().await;
+    database_result
 }
 
-/// Appends the `bin/` subdirectory (relative to CWD) to the process PATH.
+/// Prepends the dependency directory to PATH before auto-install runs.
 fn configure_path() {
-    if let Ok(cwd) = std::env::current_dir() {
-        let bin_dir = cwd.join("bin");
-        if bin_dir.exists() {
-            let mut paths = vec![bin_dir];
-            if let Some(path_var) = std::env::var_os("PATH") {
-                paths.extend(std::env::split_paths(&path_var));
-            }
-            if let Ok(new_path) = std::env::join_paths(paths) {
-                unsafe {
-                    std::env::set_var("PATH", new_path);
-                }
-            }
-        }
-    }
+    installer::configure_dependency_path();
 }
 
 fn init_tracing(logging: &config::LoggingSection) {
@@ -370,7 +484,11 @@ fn init_tracing(logging: &config::LoggingSection) {
 async fn on_error(error: poise::FrameworkError<'_, Data, utils::Error>) {
     match error {
         poise::FrameworkError::Command { error, ctx, .. } => {
-            error!(%error, command = ctx.command().name, "Command error");
+            let error_class = error
+                .downcast_ref::<utils::error::SerenyaError>()
+                .map(utils::error::SerenyaError::class)
+                .unwrap_or("Other");
+            error!(%error, command = ctx.command().name, error_class, "Command error");
             let message =
                 if let Some(serenya_err) = error.downcast_ref::<utils::error::SerenyaError>() {
                     match serenya_err {
@@ -413,16 +531,54 @@ async fn on_error(error: poise::FrameworkError<'_, Data, utils::Error>) {
     }
 }
 
+fn should_cleanup_empty_room(
+    empty_since: Option<std::time::Instant>,
+    now: std::time::Instant,
+    stay_in_voice: bool,
+    queue_is_empty: bool,
+    playback_status: core::PlaybackStatus,
+) -> bool {
+    let Some(empty_since) = empty_since else {
+        return false;
+    };
+    if now.duration_since(empty_since) < std::time::Duration::from_secs(3 * 60 * 60) {
+        return false;
+    }
+    !stay_in_voice || !queue_is_empty || playback_status != core::PlaybackStatus::Idle
+}
+
+async fn empty_room_disconnect_then_cleanup<D, DFut, C, CFut, T, E>(
+    stay_in_voice: bool,
+    disconnect: D,
+    cleanup: C,
+) -> Result<T, E>
+where
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = T>,
+{
+    if !stay_in_voice {
+        disconnect().await?;
+    }
+    Ok(cleanup().await)
+}
+
 fn start_empty_room_monitor(
     guild_players: Arc<DashMap<serenity::GuildId, Arc<tokio::sync::RwLock<core::GuildPlayer>>>>,
     http: Arc<serenity::Http>,
-    config: Arc<BotConfig>,
+    config: Arc<arc_swap::ArcSwap<BotConfig>>,
+    database: Arc<DatabaseManager>,
     serenity_ctx: serenity::Context,
-) {
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let now = std::time::Instant::now();
             // Phase 1: Collect guild IDs without holding the shard-lock across .await
             let guild_ids: Vec<_> = guild_players.iter().map(|e| *e.key()).collect();
@@ -435,64 +591,230 @@ fn start_empty_room_monitor(
                     None => continue,
                 };
                 let player = player_lock.read().await;
-                if let Some(empty_since) = player.empty_since
-                    && now.duration_since(empty_since).as_secs() >= 10800
-                    && (!player.queue.is_empty()
-                        || player.playback_status != core::PlaybackStatus::Idle)
-                {
-                    to_clear.push((guild_id, player.announce_channel));
+                let stay = config.load().playback.stay_in_voice;
+                if should_cleanup_empty_room(
+                    player.empty_since,
+                    now,
+                    stay,
+                    player.queue.is_empty(),
+                    player.playback_status,
+                ) {
+                    to_clear.push(guild_id);
                 }
             }
 
-            for (guild_id, announce_channel) in to_clear {
+            for guild_id in to_clear {
                 let player_lock_opt = guild_players.get(&guild_id).map(|p| p.value().clone());
                 if let Some(player_lock) = player_lock_opt {
-                    let stay = config.playback.stay_in_voice;
-
-                    {
-                        let mut player = player_lock.write().await;
-                        player.reset();
-                        if !stay {
-                            player.voice_channel = None;
-                            player.announce_channel = None;
-                        } else {
-                            // Keep voice_channel/announce_channel but mark empty_since
-                            // so we don't re-trigger until someone joins again
-                            player.empty_since = Some(now);
-                        }
+                    let (handle_uuid, still_due) = {
+                        let player = player_lock.read().await;
+                        let stay = config.load().playback.stay_in_voice;
+                        (
+                            player
+                                .current_track_handle
+                                .as_ref()
+                                .map(|handle| handle.uuid()),
+                            should_cleanup_empty_room(
+                                player.empty_since,
+                                std::time::Instant::now(),
+                                stay,
+                                player.queue.is_empty(),
+                                player.playback_status,
+                            ),
+                        )
+                    };
+                    if !still_due {
+                        continue;
                     }
 
-                    if stay {
-                        // stay_in_voice = true: only clear queue, keep the voice connection
-                        audio::runtime::cleanup_guild(guild_id.get());
-                        info!(guild_id = %guild_id, "Cleared queue after 3 hours of empty room (staying in voice)");
+                    let interrupted_play_time = if let Some(handle_uuid) = handle_uuid {
+                        audio::events::interrupted_play_time_for_handle(&player_lock, handle_uuid)
+                            .await
                     } else {
-                        // stay_in_voice = false: fully disconnect
-                        guild_players.remove(&guild_id);
-                        if let Some(manager) = songbird::get(&serenity_ctx).await {
-                            let _ = manager.remove(guild_id).await;
-                        }
-                        audio::runtime::cleanup_guild(guild_id.get());
-                        info!(guild_id = %guild_id, "Disconnected after 3 hours of empty room");
+                        None
+                    };
+
+                    let stay = config.load().playback.stay_in_voice;
+                    let still_due_before_disconnect = {
+                        let player = player_lock.read().await;
+                        should_cleanup_empty_room(
+                            player.empty_since,
+                            std::time::Instant::now(),
+                            stay,
+                            player.queue.is_empty(),
+                            player.playback_status,
+                        ) && player
+                            .current_track_handle
+                            .as_ref()
+                            .map(|handle| handle.uuid())
+                            == handle_uuid
+                    };
+                    if !still_due_before_disconnect {
+                        continue;
                     }
 
-                    if let Some(channel) = announce_channel {
-                        let description = if stay {
-                            "Đã 3 tiếng không có ai trong phòng, hàng chờ (queue) đã tự động được dọn dẹp để tiết kiệm tài nguyên."
-                        } else {
-                            "Đã 3 tiếng không có ai trong phòng, bot đã tự động rời kênh thoại để tiết kiệm tài nguyên."
-                        };
-                        let embed = serenity::CreateEmbed::new()
-                            .description(description)
-                            .color(0xED4245);
-                        let _ = channel
-                            .send_message(&http, serenity::CreateMessage::new().embed(embed))
-                            .await;
+                    let cleanup_player = Arc::clone(&player_lock);
+                    let cleanup_players = Arc::clone(&guild_players);
+                    let cleanup_database = Arc::clone(&database);
+                    let cleanup_http = Arc::clone(&http);
+                    let disconnect_ctx = serenity_ctx.clone();
+                    let result = empty_room_disconnect_then_cleanup(
+                        stay,
+                        || async {
+                            if let Some(manager) = songbird::get(&disconnect_ctx).await {
+                                manager
+                                    .remove(guild_id)
+                                    .await
+                                    .map_err(|err| err.to_string())
+                            } else {
+                                Ok::<(), String>(())
+                            }
+                        },
+                        move || async move {
+                            let (announce_channel, record_play_time) = {
+                                let mut player = cleanup_player.write().await;
+                                if !should_cleanup_empty_room(
+                                    player.empty_since,
+                                    std::time::Instant::now(),
+                                    stay,
+                                    player.queue.is_empty(),
+                                    player.playback_status,
+                                ) || player
+                                    .current_track_handle
+                                    .as_ref()
+                                    .map(|handle| handle.uuid())
+                                    != handle_uuid
+                                {
+                                    return None;
+                                }
+
+                                let record_play_time = match (handle_uuid, interrupted_play_time) {
+                                    (Some(handle_uuid), Some(play_time))
+                                        if player.failure_state.claim_terminal(handle_uuid) =>
+                                    {
+                                        Some(play_time)
+                                    }
+                                    _ => None,
+                                };
+                                let announce_channel = player.announce_channel;
+                                player.reset();
+                                if !stay {
+                                    player.voice_channel = None;
+                                    player.announce_channel = None;
+                                } else {
+                                    player.empty_since = Some(std::time::Instant::now());
+                                }
+                                (announce_channel, record_play_time)
+                            };
+
+                            if let Some(play_time) = record_play_time {
+                                audio::events::record_guild_playback_stats(
+                                    cleanup_database.as_ref(),
+                                    guild_id,
+                                    play_time,
+                                    false,
+                                )
+                                .await;
+                            }
+
+                            if stay {
+                                audio::runtime::cleanup_guild(guild_id.get());
+                            } else {
+                                cleanup_players.remove(&guild_id);
+                                audio::runtime::cleanup_guild(guild_id.get());
+                            }
+
+                            Some(announce_channel)
+                        },
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Some(announce_channel)) => {
+                            if stay {
+                                info!(guild_id = %guild_id, "Cleared queue after 3 hours of empty room (staying in voice)");
+                            } else {
+                                info!(guild_id = %guild_id, "Disconnected after 3 hours of empty room");
+                            }
+
+                            if let Some(channel) = announce_channel {
+                                let description = if stay {
+                                    "Đã 3 tiếng không có ai trong phòng, hàng chờ (queue) đã tự động được dọn dẹp để tiết kiệm tài nguyên."
+                                } else {
+                                    "Đã 3 tiếng không có ai trong phòng, bot đã tự động rời kênh thoại để tiết kiệm tài nguyên."
+                                };
+                                let embed = serenity::CreateEmbed::new()
+                                    .description(description)
+                                    .color(0xED4245);
+                                let _ = channel
+                                    .send_message(
+                                        &cleanup_http,
+                                        serenity::CreateMessage::new().embed(embed),
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                guild_id = %guild_id,
+                                error = %err,
+                                "Empty-room voice disconnect failed"
+                            );
+                        }
                     }
                 }
             }
         }
-    });
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BotVoiceUpdate {
+    Unchanged,
+    Connected(serenity::ChannelId),
+    Disconnected,
+}
+
+fn classify_bot_voice_update(
+    event_user: serenity::UserId,
+    bot_user: serenity::UserId,
+    channel_id: Option<serenity::ChannelId>,
+) -> BotVoiceUpdate {
+    if event_user != bot_user {
+        BotVoiceUpdate::Unchanged
+    } else if let Some(channel_id) = channel_id {
+        BotVoiceUpdate::Connected(channel_id)
+    } else {
+        BotVoiceUpdate::Disconnected
+    }
+}
+
+fn bot_voice_update_is_current(player: &core::GuildPlayer, expected_generation: u64) -> bool {
+    player.bot_voice_generation == expected_generation
+}
+
+fn apply_bot_voice_update_state(player: &mut core::GuildPlayer, update: BotVoiceUpdate) -> bool {
+    match update {
+        BotVoiceUpdate::Unchanged => false,
+        BotVoiceUpdate::Connected(channel_id) => {
+            player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
+            player.voice_channel = Some(channel_id);
+            player.empty_since = None;
+            false
+        }
+        BotVoiceUpdate::Disconnected => {
+            player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
+            player.reset();
+            player.voice_channel = None;
+            player.announce_channel = None;
+            true
+        }
+    }
+}
+
+fn voice_room_is_empty(cached_human_count: Option<usize>) -> Option<bool> {
+    cached_human_count.map(|human_count| human_count == 0)
 }
 
 async fn handle_voice_state_update(
@@ -506,10 +828,117 @@ async fn handle_voice_state_update(
         None => return Ok(()),
     };
 
+    let bot_id = ctx.cache.current_user().id;
+    let bot_update = classify_bot_voice_update(new.user_id, bot_id, new.channel_id);
     let player_lock = match data.guild_players.get(&guild_id) {
         Some(p) => p.value().clone(),
+        None if matches!(bot_update, BotVoiceUpdate::Connected(_)) => data
+            .guild_players
+            .entry(guild_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(core::GuildPlayer::new())))
+            .clone(),
         None => return Ok(()),
     };
+    if bot_update != BotVoiceUpdate::Unchanged {
+        let (expected_generation, interrupted_handle_uuid) = {
+            let player = player_lock.read().await;
+            (
+                player.bot_voice_generation,
+                player
+                    .current_track_handle
+                    .as_ref()
+                    .map(|handle| handle.uuid()),
+            )
+        };
+        let interrupted_play_time = if bot_update == BotVoiceUpdate::Disconnected {
+            if let Some(handle_uuid) = interrupted_handle_uuid {
+                audio::events::interrupted_play_time_for_handle(&player_lock, handle_uuid).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let state_change = {
+            let mut player = player_lock.write().await;
+            if bot_update == BotVoiceUpdate::Disconnected
+                && !bot_voice_update_is_current(&player, expected_generation)
+            {
+                None
+            } else {
+                let record_play_time = match (interrupted_handle_uuid, interrupted_play_time) {
+                    (Some(handle_uuid), Some(play_time))
+                        if player
+                            .current_track_handle
+                            .as_ref()
+                            .map(|handle| handle.uuid())
+                            == Some(handle_uuid)
+                            && player.failure_state.claim_terminal(handle_uuid) =>
+                    {
+                        Some(play_time)
+                    }
+                    _ => None,
+                };
+                let previous_channel = player.voice_channel;
+                let disconnected = apply_bot_voice_update_state(&mut player, bot_update);
+                Some((
+                    previous_channel,
+                    disconnected,
+                    record_play_time,
+                    player.bot_voice_generation,
+                ))
+            }
+        };
+
+        let Some((previous_channel, disconnected, record_play_time, applied_generation)) =
+            state_change
+        else {
+            tracing::debug!(
+                guild_id = %guild_id,
+                "Ignored stale bot voice disconnect after a newer voice update"
+            );
+            return Ok(());
+        };
+
+        if let Some(play_time) = record_play_time {
+            audio::events::record_guild_playback_stats(
+                data.database.as_ref(),
+                guild_id,
+                play_time,
+                false,
+            )
+            .await;
+        }
+
+        if disconnected {
+            let still_disconnected = {
+                let player = player_lock.read().await;
+                player.bot_voice_generation == applied_generation && player.voice_channel.is_none()
+            };
+            if still_disconnected {
+                data.guild_players.remove(&guild_id);
+                audio::runtime::cleanup_guild(guild_id.get());
+                if let Some(manager) = songbird::get(ctx).await {
+                    let _ = manager.remove(guild_id).await;
+                }
+                info!(guild_id = %guild_id, "Bot left voice; removed stale GuildPlayer state");
+                return Ok(());
+            }
+        }
+
+        if let BotVoiceUpdate::Connected(channel_id) = bot_update {
+            data.guild_players.insert(guild_id, player_lock.clone());
+            if previous_channel != Some(channel_id) {
+                info!(
+                    guild_id = %guild_id,
+                    previous_channel = ?previous_channel,
+                    channel_id = %channel_id,
+                    "Synchronized GuildPlayer after external bot voice-channel move"
+                );
+            }
+        }
+    }
 
     // Read necessary info first under read lock
     let (bot_channel_id, queue_is_empty, playback_status, has_empty_since) = {
@@ -538,11 +967,9 @@ async fn handle_voice_state_update(
         }
     };
 
-    let bot_id = ctx.cache.current_user().id;
-
     // 5. Count human members in the voice channel (without holding lock)
-    let mut human_count = 0;
-    if let Some(guild) = ctx.cache.guild(guild_id) {
+    let cached_human_count = ctx.cache.guild(guild_id).map(|guild| {
+        let mut human_count = 0;
         for state in guild.voice_states.values() {
             if state.channel_id == Some(bot_channel_id) && state.user_id != bot_id {
                 let is_bot = if let Some(user) = ctx.cache.user(state.user_id) {
@@ -558,10 +985,12 @@ async fn handle_voice_state_update(
                 }
             }
         }
-    }
+        human_count
+    });
 
     // 6. Update empty_since and auto-pause if playing (acquire write lock ONLY when needed)
-    if human_count == 0 {
+    let room_is_empty = voice_room_is_empty(cached_human_count);
+    if room_is_empty == Some(true) {
         let mut player = player_lock.write().await;
         if player.empty_since.is_none() {
             player.empty_since = Some(std::time::Instant::now());
@@ -595,12 +1024,396 @@ async fn handle_voice_state_update(
                     .await;
             }
         }
-    } else {
-        if has_empty_since {
-            let mut player = player_lock.write().await;
-            player.empty_since = None;
-        }
+    } else if room_is_empty == Some(false) && has_empty_since {
+        let mut player = player_lock.write().await;
+        player.empty_since = None;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod multiguild_tests {
+    use super::{
+        BotVoiceUpdate, apply_bot_voice_update_state, classify_bot_voice_update,
+        should_cleanup_empty_room,
+    };
+    use crate::core::{GuildPlayer, PlaybackStatus};
+    use poise::serenity_prelude::{ChannelId, UserId};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn external_bot_move_updates_player_channel_and_recomputes_empty_state() {
+        let mut player = GuildPlayer::new();
+        player.voice_channel = Some(ChannelId::new(11));
+        player.empty_since = Some(Instant::now());
+        let update =
+            classify_bot_voice_update(UserId::new(9), UserId::new(9), Some(ChannelId::new(22)));
+        assert_eq!(update, BotVoiceUpdate::Connected(ChannelId::new(22)));
+        assert!(!apply_bot_voice_update_state(&mut player, update));
+        assert_eq!(player.voice_channel, Some(ChannelId::new(22)));
+        assert!(player.empty_since.is_none());
+    }
+
+    #[test]
+    fn external_bot_disconnect_resets_player_and_requests_runtime_cleanup() {
+        let mut player = GuildPlayer::new();
+        player.voice_channel = Some(ChannelId::new(11));
+        player.announce_channel = Some(ChannelId::new(33));
+        player.playback_status = PlaybackStatus::Paused;
+        let update = classify_bot_voice_update(UserId::new(9), UserId::new(9), None);
+        assert_eq!(update, BotVoiceUpdate::Disconnected);
+        assert!(apply_bot_voice_update_state(&mut player, update));
+        assert_eq!(player.voice_channel, None);
+        assert_eq!(player.announce_channel, None);
+        assert_eq!(player.playback_status, PlaybackStatus::Idle);
+    }
+
+    #[test]
+    fn another_users_voice_event_does_not_mutate_bot_state() {
+        let mut player = GuildPlayer::new();
+        player.voice_channel = Some(ChannelId::new(11));
+        let update =
+            classify_bot_voice_update(UserId::new(8), UserId::new(9), Some(ChannelId::new(22)));
+        assert_eq!(update, BotVoiceUpdate::Unchanged);
+        assert!(!apply_bot_voice_update_state(&mut player, update));
+        assert_eq!(player.voice_channel, Some(ChannelId::new(11)));
+    }
+
+    #[test]
+    fn idle_empty_player_disconnects_when_stay_is_disabled() {
+        let now = Instant::now();
+        assert!(should_cleanup_empty_room(
+            Some(now - Duration::from_secs(10800)),
+            now,
+            false,
+            true,
+            PlaybackStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn idle_empty_player_stays_when_stay_is_enabled() {
+        let now = Instant::now();
+        assert!(!should_cleanup_empty_room(
+            Some(now - Duration::from_secs(10800)),
+            now,
+            true,
+            true,
+            PlaybackStatus::Idle
+        ));
+    }
+
+    #[test]
+    fn active_state_is_cleaned_when_staying_connected() {
+        let now = Instant::now();
+        assert!(should_cleanup_empty_room(
+            Some(now - Duration::from_secs(10800)),
+            now,
+            true,
+            false,
+            PlaybackStatus::Paused
+        ));
+    }
+
+    #[test]
+    fn empty_room_timeout_does_not_fire_early() {
+        let now = Instant::now();
+        assert!(!should_cleanup_empty_room(
+            Some(now - Duration::from_secs(10799)),
+            now,
+            false,
+            true,
+            PlaybackStatus::Idle
+        ));
+    }
+}
+
+#[cfg(test)]
+mod panic_strategy_tests {
+    #[tokio::test]
+    async fn spawned_task_panic_is_reported_as_join_error() {
+        let result = tokio::spawn(async { panic!("intentional panic isolation test") }).await;
+        let error = result.expect_err("task panic should become JoinError");
+        assert!(error.is_panic());
+    }
+}
+
+#[cfg(test)]
+mod voice_lifecycle_generation_tests {
+    use super::{
+        BotVoiceUpdate, apply_bot_voice_update_state, bot_voice_update_is_current,
+        should_cleanup_empty_room,
+    };
+    use crate::core::{GuildPlayer, PlaybackStatus};
+    use poise::serenity_prelude as serenity;
+
+    #[test]
+    fn newer_connected_update_invalidates_stale_disconnect_generation() {
+        let mut player = GuildPlayer::new();
+        let stale_generation = player.bot_voice_generation;
+        apply_bot_voice_update_state(
+            &mut player,
+            BotVoiceUpdate::Connected(serenity::ChannelId::new(77)),
+        );
+        assert!(!bot_voice_update_is_current(&player, stale_generation));
+        assert_eq!(player.voice_channel, Some(serenity::ChannelId::new(77)));
+    }
+
+    #[test]
+    fn listener_return_cancels_a_previously_due_empty_room_cleanup() {
+        let now = std::time::Instant::now();
+        let old = now - std::time::Duration::from_secs(3 * 60 * 60 + 1);
+        assert!(should_cleanup_empty_room(
+            Some(old),
+            now,
+            false,
+            true,
+            PlaybackStatus::Playing,
+        ));
+        assert!(!should_cleanup_empty_room(
+            None,
+            now,
+            false,
+            true,
+            PlaybackStatus::Playing,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod voice_room_cache_tests {
+    use super::voice_room_is_empty;
+
+    #[test]
+    fn missing_guild_cache_is_not_treated_as_empty_room() {
+        assert_eq!(voice_room_is_empty(None), None);
+    }
+
+    #[test]
+    fn cached_room_without_humans_is_empty() {
+        assert_eq!(voice_room_is_empty(Some(0)), Some(true));
+    }
+
+    #[test]
+    fn cached_room_with_humans_is_occupied() {
+        assert_eq!(voice_room_is_empty(Some(2)), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod client_exit_status_tests {
+    use super::normalize_client_start_result;
+
+    #[test]
+    fn client_start_error_reaches_run_outcome() {
+        let result = normalize_client_start_result::<&'static str>(Err("gateway failed"));
+        assert_eq!(
+            result,
+            Err("gateway failed"),
+            "an unexpected Discord client shutdown must not be converted into a successful process outcome"
+        );
+    }
+
+    #[test]
+    fn clean_client_completion_remains_successful() {
+        assert_eq!(
+            normalize_client_start_result::<&'static str>(Ok(())),
+            Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_signal_error_tests {
+    use super::normalize_shutdown_signal_result;
+
+    #[test]
+    fn ctrl_c_listener_error_reaches_run_outcome() {
+        let result = normalize_shutdown_signal_result::<&'static str>(Err("listener failed"));
+        assert_eq!(
+            result,
+            Err("listener failed"),
+            "a ctrl_c listener error must not be mistaken for a graceful shutdown signal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_registration_error_is_propagated_without_panicking() {
+        let outcome = std::panic::catch_unwind(|| {
+            super::normalize_sigterm_registration::<(), &'static str>(Err("registration failed"))
+        });
+        assert!(
+            outcome.is_ok(),
+            "SIGTERM listener registration failure must be returned, not panic"
+        );
+        assert_eq!(outcome.unwrap(), Err("registration failed"));
+    }
+}
+
+#[cfg(test)]
+mod final_database_shutdown_error_tests {
+    use super::normalize_final_database_shutdown_result;
+
+    #[test]
+    fn final_database_save_error_reaches_process_outcome() {
+        let result = normalize_final_database_shutdown_result::<&'static str>(Err("disk full"));
+        assert_eq!(
+            result,
+            Err("disk full"),
+            "a failed final database save must not be converted into a successful process shutdown"
+        );
+    }
+
+    #[test]
+    fn successful_final_database_save_remains_successful() {
+        assert_eq!(
+            normalize_final_database_shutdown_result::<&'static str>(Ok(())),
+            Ok(())
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_room_monitor_shutdown_tests {
+    use super::{DatabaseManager, synchronize_empty_room_monitor};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn temp_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "serenya-monitor-shutdown-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn cleanup(path: &std::path::Path) {
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_write_cannot_land_after_final_database_save()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let manager = Arc::new(DatabaseManager::load(&path).await?);
+        let writer = Arc::clone(&manager);
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let mut settings = writer.get_guild_settings(4242).await;
+            settings.quality = "late-monitor-write".to_owned();
+            writer.update_guild_settings(4242, settings).await;
+        });
+
+        synchronize_empty_room_monitor(handle).await;
+        manager.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let reloaded = DatabaseManager::load(&path).await?;
+        let persisted = reloaded.get_guild_settings(4242).await;
+        assert_eq!(
+            persisted.quality, "late-monitor-write",
+            "shutdown must quiesce an in-flight monitor before the final database save"
+        );
+
+        cleanup(&path).await;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gateway_shutdown_order_tests {
+    use super::{GatewayStopOrigin, quiesce_gateway_for_stop};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn external_control_stop_quiesces_gateway_before_persistence() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        quiesce_gateway_for_stop(GatewayStopOrigin::ExternalControl, move || async move {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_client_does_not_request_redundant_gateway_shutdown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        quiesce_gateway_for_stop(GatewayStopOrigin::ClientCompletion, move || async move {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod empty_room_disconnect_order_tests {
+    use super::empty_room_disconnect_then_cleanup;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn failed_empty_room_leave_does_not_commit_destructive_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = empty_room_disconnect_then_cleanup(
+            false,
+            || async { Err::<(), &'static str>("gateway unavailable") },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("gateway unavailable"));
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "empty-room cleanup/stat state must remain retryable when Songbird leave fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_empty_room_leave_commits_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+        let result = empty_room_disconnect_then_cleanup(
+            false,
+            || async { Ok::<(), &'static str>(()) },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stay_in_voice_cleanup_does_not_attempt_disconnect() {
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let disconnect_flag = Arc::clone(&disconnected);
+        let result = empty_room_disconnect_then_cleanup(
+            true,
+            move || async move {
+                disconnect_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            || async {},
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(!disconnected.load(Ordering::SeqCst));
+    }
 }

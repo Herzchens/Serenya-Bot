@@ -5,7 +5,7 @@ mod runtime;
 pub use cache::{get_or_fetch_player_functions, sha1_hash};
 pub use runtime::{decrypt_format_url, solve_n_throttle, solve_signature};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "live-tests"))]
 mod tests {
     use super::*;
     use std::time::Duration;

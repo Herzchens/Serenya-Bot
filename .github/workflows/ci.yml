@@ -12,8 +12,8 @@ env:
 jobs:
   build_and_test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
-      checks: write
       contents: read
     steps:
       - uses: actions/checkout@v4
@@ -32,25 +32,42 @@ jobs:
       - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Remove target-cpu=native config for CI
-        run: rm -rf .cargo
+      - name: Remove local target-cpu override
+        run: rm -f .cargo/config.toml
 
-      - name: Check Formatting
-        run: cargo fmt --check
+      - name: Check formatting
+        run: cargo fmt --all --check
 
-      - name: Cargo Check
-        run: cargo check
+      - name: Cargo check
+        run: cargo check --workspace --locked
 
-      - name: Cargo Clippy
-        run: cargo clippy -- -D warnings
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Cargo Test
-        run: cargo test
+      - name: Cargo test
+        run: cargo test --workspace --locked
 
-      - name: Cargo Audit
-        uses: actions-rust-lang/audit@v1
-        continue-on-error: true
+      - name: DHAT redactor retention
+        run: >-
+          cargo test -p serenya --bin serenya --locked --features dhat-heap
+          logging::redact::tests::rotating_history_retained_heap_stays_bounded_after_ten_thousand_unique_rotations
+          -- --exact --test-threads=1
 
-      - name: Check dependency tree duplicates
-        run: cargo tree -d || true
+      - name: Cargo build release
+        run: cargo build --workspace --release --locked
 
+      - name: Cargo test release
+        run: cargo test --workspace --release --locked
+
+      - name: Install pinned cargo-audit
+        shell: bash
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1 || [[ "$(cargo audit --version 2>/dev/null)" != "cargo-audit 0.22.2" ]]; then
+            cargo install cargo-audit --version 0.22.2 --locked --force
+          fi
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Inspect dependency tree duplicates
+        run: cargo tree -d --locked

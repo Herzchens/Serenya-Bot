@@ -45,7 +45,7 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
 
     let elapsed = if let Some(ref handle) = current_track_handle {
         match handle.get_info().await {
-            Ok(info) => seek_offset + info.position,
+            Ok(info) => crate::commands::control::add_seek_duration(seek_offset, info.position)?,
             Err(_) => Duration::from_secs(0),
         }
     } else {

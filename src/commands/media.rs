@@ -134,16 +134,41 @@ async fn fetch_lyrics(
 }
 
 fn chunk_lyrics(lyrics: &str) -> Vec<String> {
+    const PAGE_LIMIT: usize = 1800;
+    const CONTENT_LIMIT: usize = PAGE_LIMIT - 1;
+
     let mut pages = Vec::new();
     let mut current_page = String::new();
+    let mut current_chars = 0usize;
+
     for line in lyrics.lines() {
-        if current_page.len() + line.len() + 1 > 1800 {
-            pages.push(current_page.clone());
-            current_page.clear();
+        let line_chars = line.chars().count();
+        if line_chars <= CONTENT_LIMIT {
+            let needed = line_chars + 1;
+            if current_chars + needed > PAGE_LIMIT && !current_page.is_empty() {
+                pages.push(std::mem::take(&mut current_page));
+                current_chars = 0;
+            }
+            current_page.push_str(line);
+            current_page.push('\n');
+            current_chars += needed;
+            continue;
         }
-        current_page.push_str(line);
-        current_page.push('\n');
+
+        if !current_page.is_empty() {
+            pages.push(std::mem::take(&mut current_page));
+            current_chars = 0;
+        }
+
+        let chars: Vec<char> = line.chars().collect();
+        for chunk in chars.chunks(CONTENT_LIMIT) {
+            let mut page = String::with_capacity(chunk.len() + 1);
+            page.extend(chunk.iter().copied());
+            page.push('\n');
+            pages.push(page);
+        }
     }
+
     if !current_page.is_empty() {
         pages.push(current_page);
     }
@@ -246,7 +271,7 @@ pub async fn songinfo(ctx: Context<'_>) -> Result<(), Error> {
     if let Some(ref handle) = current_track_handle
         && let Ok(info) = handle.get_info().await
     {
-        elapsed = seek_offset + info.position;
+        elapsed = crate::commands::control::add_seek_duration(seek_offset, info.position)?;
     }
 
     let loop_str = match loop_mode {
@@ -345,5 +370,34 @@ mod tests {
             matched.is_none(),
             "Should reject Kaisoul lyrics when Monstar was requested"
         );
+    }
+}
+
+#[cfg(test)]
+mod lyrics_page_boundary_tests {
+    use super::chunk_lyrics;
+
+    #[test]
+    fn oversized_single_line_is_split_without_empty_pages() {
+        let lyrics = "a".repeat(5000);
+        let pages = chunk_lyrics(&lyrics);
+        assert!(!pages.is_empty());
+        assert!(pages.iter().all(|page| !page.is_empty()));
+        assert!(pages.iter().all(|page| page.chars().count() <= 1800));
+        assert_eq!(pages.concat().replace('\n', ""), lyrics);
+    }
+
+    #[test]
+    fn oversized_unicode_line_is_split_on_character_boundaries() {
+        let lyrics = "界".repeat(2500);
+        let pages = chunk_lyrics(&lyrics);
+        assert!(pages.iter().all(|page| !page.is_empty()));
+        assert!(pages.iter().all(|page| page.chars().count() <= 1800));
+        assert_eq!(pages.concat().replace('\n', ""), lyrics);
+    }
+
+    #[test]
+    fn ordinary_lyrics_lines_still_share_one_page() {
+        assert_eq!(chunk_lyrics("first\nsecond"), vec!["first\nsecond\n"]);
     }
 }

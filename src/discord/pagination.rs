@@ -1,5 +1,4 @@
-use crate::core::Track;
-use crate::discord::embeds::queue_embed;
+use crate::discord::embeds::{QueueTrackSnapshot, queue_embed};
 use crate::utils::{Context, Error};
 use poise::serenity_prelude as serenity;
 
@@ -140,7 +139,11 @@ fn make_disabled_components(
     rows
 }
 
-fn get_page_slice(tracks: &[Track], page: usize, page_size: usize) -> &[Track] {
+fn get_page_slice(
+    tracks: &[QueueTrackSnapshot],
+    page: usize,
+    page_size: usize,
+) -> &[QueueTrackSnapshot] {
     let start_idx = page * page_size;
     let end_idx = (start_idx + page_size).min(tracks.len());
     &tracks[start_idx..end_idx]
@@ -166,7 +169,11 @@ async fn disable_buttons(
 }
 
 /// Paginate a list of tracks with next/prev buttons.
-pub async fn paginate_queue(ctx: Context<'_>, tracks: &[Track], title: &str) -> Result<(), Error> {
+pub async fn paginate_queue(
+    ctx: Context<'_>,
+    tracks: &[QueueTrackSnapshot],
+    title: &str,
+) -> Result<(), Error> {
     let page_size = 10;
     let total_pages = tracks.len().div_ceil(page_size).max(1);
     let mut current_page: usize = 0;

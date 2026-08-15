@@ -28,12 +28,12 @@ use crate::{
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn get_html5player(body: &str) -> Option<String> {
     static HTML5PLAYER_RES: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"<script\s+src="([^"]+)"(?:\s+type="text\\//javascript")?\s+name="player_ias\\//base"\s*>|"jsUrl":"([^"]+)""#).unwrap()
+        Regex::new(r#"<script\s+src="([^"]+)"(?:\s+type="text/javascript")?\s+name="player_ias/base"\s*>|"jsUrl":"([^"]+)""#).unwrap()
     });
 
     let caps = HTML5PLAYER_RES.captures(body)?;
-    caps.get(2)
-        .or_else(|| caps.get(3))
+    caps.get(1)
+        .or_else(|| caps.get(2))
         .map(|cap| cap.as_str().to_string())
 }
 
@@ -406,7 +406,10 @@ fn decipher(
     let args: serde_json::value::Map<String, serde_json::Value> = {
         #[cfg(feature = "performance_analysis")]
         let _guard = flame::start_guard("serde_qs::from_str");
-        serde_qs::from_str(url).unwrap()
+        match serde_qs::from_str(url) {
+            Ok(args) => args,
+            Err(_) => return url.to_owned(),
+        }
     };
 
     let get_url_string = || {
@@ -1257,12 +1260,13 @@ pub fn make_absolute_url(base: &str, url: &str) -> Result<url::Url, VideoError> 
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
 pub fn time_to_ms(duration: &str) -> usize {
-    let mut ms = 0;
+    let mut seconds = 0usize;
     for (i, curr) in duration.split(':').rev().enumerate() {
-        ms += curr.parse::<usize>().unwrap_or(0) * (u32::pow(60_u32, i as u32) as usize);
+        let component = curr.parse::<usize>().unwrap_or(0);
+        let multiplier = 60usize.saturating_pow(i as u32);
+        seconds = seconds.saturating_add(component.saturating_mul(multiplier));
     }
-    ms *= 1000;
-    ms
+    seconds.saturating_mul(1000)
 }
 
 #[cfg_attr(feature = "performance_analysis", flamer::flame)]
@@ -1347,18 +1351,28 @@ pub fn cut_after_js(mixed_json: &str) -> Option<&str> {
             // Skip strings
             b'"' | b'\'' | b'`' => {
                 index += 1;
-                while bytes[index] != char {
+                while index < bytes.len() && bytes[index] != char {
                     if bytes[index] == b'\\' {
                         index += 1;
+                        if index >= bytes.len() {
+                            return None;
+                        }
                     }
                     index += 1;
                 }
+                if index >= bytes.len() {
+                    return None;
+                }
             }
             // Skip comments
-            b'/' if bytes[index + 1] == b'*' => {
+            b'/' if index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
                 index += 2;
-                while !(bytes[index] == b'*' && bytes[index + 1] == b'/') {
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
                     index += 1;
+                }
+                if index + 1 >= bytes.len() {
+                    return None;
                 }
                 index += 2;
                 continue;
@@ -1370,11 +1384,17 @@ pub fn cut_after_js(mixed_json: &str) -> Option<&str> {
                 .unwrap_or(false) =>
             {
                 index += 1;
-                while bytes[index] != char {
+                while index < bytes.len() && bytes[index] != char {
                     if bytes[index] == b'\\' {
                         index += 1;
+                        if index >= bytes.len() {
+                            return None;
+                        }
                     }
                     index += 1;
+                }
+                if index >= bytes.len() {
+                    return None;
                 }
             }
             // Save the last significant character for the regex check
@@ -1505,6 +1525,50 @@ mod tests {
         assert!(cut_after_js(r#"{"a": 1,{ "b": 1}"#).is_none());
         println!("[PASSED] test_returns_error_when_missing_closing_bracket");
     }
+
+    #[test]
+    fn html5player_extracts_jsurl_control_branch() {
+        assert_eq!(
+            get_html5player(r#"{"jsUrl":"/s/player/json/base.js"}"#).as_deref(),
+            Some("/s/player/json/base.js")
+        );
+    }
+
+    #[test]
+    fn html5player_extracts_script_src_fallback_branch() {
+        assert_eq!(
+            get_html5player(r#"<script src="/s/player/script/base.js" name="player_ias/base">"#)
+                .as_deref(),
+            Some("/s/player/script/base.js")
+        );
+    }
+
+    #[test]
+    fn malformed_cipher_query_falls_back_without_panicking() {
+        let mut cipher_cache = None;
+        let result = decipher("%ZZ-not-a-valid-query", ("", ""), &mut cipher_cache, None);
+        assert_eq!(result, "%ZZ-not-a-valid-query");
+    }
+
+    #[test]
+    fn truncated_js_string_returns_none_without_panicking() {
+        assert!(cut_after_js("{\"").is_none());
+    }
+
+    #[test]
+    fn trailing_slash_returns_none_without_panicking() {
+        assert!(cut_after_js("{/").is_none());
+    }
+
+    #[test]
+    fn unterminated_block_comment_returns_none_without_panicking() {
+        assert!(cut_after_js("{/*").is_none());
+    }
+
+    #[test]
+    fn unterminated_regex_returns_none_without_panicking() {
+        assert!(cut_after_js("{=/").is_none());
+    }
 }
 
 pub(crate) fn get_user_agent_for_url(url: &str) -> &'static str {
@@ -1516,5 +1580,25 @@ pub(crate) fn get_user_agent_for_url(url: &str) -> &'static str {
         "Mozilla/5.0 (Chromecast; Google TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.225 Safari/537.36"
     } else {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Safari/537.36"
+    }
+}
+
+#[cfg(test)]
+mod provider_duration_power_overflow_tests {
+    use super::time_to_ms;
+
+    #[test]
+    fn seven_part_provider_duration_does_not_overflow_u32_power() {
+        let result = std::panic::catch_unwind(|| time_to_ms("1:1:1:1:1:1:1"));
+        assert!(
+            result.is_ok(),
+            "provider-controlled duration parsing must not panic when the base-60 exponent exceeds u32"
+        );
+        assert_eq!(result.unwrap(), 47_446_779_661_000usize);
+    }
+
+    #[test]
+    fn ordinary_provider_duration_is_preserved() {
+        assert_eq!(time_to_ms("1:02:03"), 3_723_000usize);
     }
 }

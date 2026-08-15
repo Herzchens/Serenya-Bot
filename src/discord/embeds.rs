@@ -2,7 +2,25 @@
 use crate::config::BotConfig;
 use crate::core::Track;
 use poise::serenity_prelude as serenity;
+use std::sync::Arc;
 use std::time::Duration;
+
+#[derive(Debug, Clone)]
+pub(crate) struct QueueTrackSnapshot {
+    pub(crate) title: Box<str>,
+    pub(crate) duration: Option<Duration>,
+    pub(crate) requester_name: Option<Arc<str>>,
+}
+
+impl From<&Track> for QueueTrackSnapshot {
+    fn from(track: &Track) -> Self {
+        Self {
+            title: track.title.clone(),
+            duration: track.duration,
+            requester_name: track.requester_name.clone(),
+        }
+    }
+}
 
 /// Helper to format a duration into a human-readable HH:MM:SS or MM:SS string.
 pub fn format_duration(duration: Duration) -> String {
@@ -186,7 +204,7 @@ pub fn track_added_embed(
 
 /// Creates a paginated queue embed.
 pub fn queue_embed(
-    tracks: &[Track],
+    tracks: &[QueueTrackSnapshot],
     page: usize,
     total_pages: usize,
     total_tracks: usize,

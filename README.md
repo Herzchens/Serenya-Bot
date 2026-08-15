@@ -16,7 +16,7 @@ Serenya Bot is a Rust-based Discord music bot built for stable playback, low lat
 
 - Slash commands and prefix commands.
 - Per-guild queue, player state, settings, and playlists.
-- Playback from YouTube, YouTube Music, Spotify, Deezer, Apple Music, SoundCloud, and direct audio URLs.
+- Playback from YouTube, YouTube Music, Spotify, Deezer, Apple Music, SoundCloud, and direct HTTPS stream URLs from supported streaming hosts.
 - Spotify track, playlist, album, and artist top-track imports.
 - User-owned playlists stored in `database.yml`.
 - Queue controls: skip, previous, jump, move, remove, clear, shuffle, and loop.
@@ -37,10 +37,10 @@ Serenya includes the internal `youtube_resolver` crate as the native replacement
 - Calls the Innertube player API through anonymous clients.
 - Rotates clients in this order:
   1. `ANDROID_VR`
-  2. `WEB_SAFARI`
-  3. `IOS`
-  4. `ANDROID`
-  5. `TVHTML5`
+  2. `TVHTML5`
+  3. `WEB_SAFARI`
+  4. `IOS`
+  5. `ANDROID`
 - Implements a custom `format_selector` for selecting audio formats.
 - Prefers audio-only, non-DRM WebM Opus before M4A/AAC.
 - Uses `rquickjs` in `js_solver` to handle signature deciphering and `n`-parameter throttling when required.
@@ -55,7 +55,7 @@ Serenya includes the internal `youtube_resolver` crate as the native replacement
 - It does not send `serviceIntegrityDimensions`.
 - It does not fall back to Python `yt-dlp` for YouTube stream playback.
 
-`yt-dlp` still exists in the project for the installer and for non-YouTube URL fallback. The YouTube playback path intentionally uses the native resolver and direct public stream fallback instead of Python `yt-dlp`.
+`yt-dlp` still exists in the project for the installer and for supported non-YouTube URL fallback. Arbitrary user-supplied hosts and non-HTTPS stream schemes are rejected before yt-dlp is invoked. The YouTube playback path intentionally uses the native resolver and direct public stream fallback instead of Python `yt-dlp`.
 
 ## Audio Architecture
 
@@ -256,7 +256,7 @@ chmod +x build-pgo.sh
 | `/quality <mode>` | Changes audio quality. |
 | `/announce_track <on/off>` | Toggles now-playing announcements. |
 | `/prefix <new_prefix>` | Changes the guild prefix. |
-| `/cleanup` | Resets player state if the bot gets stuck. |
+| `/cleanup` | Deletes recent bot and command messages in the current channel. |
 | `/stats` | Shows runtime statistics. |
 | `/ping` | Checks latency. |
 | `/about` | Shows bot information. |
@@ -298,7 +298,7 @@ The Spotify integration test needs stable network access and valid Spotify confi
 - Check that the bot has Connect and Speak permissions in the voice channel.
 - Check that FFmpeg is available in `PATH`.
 - Check gateway intents and the bot token.
-- Run `/cleanup` if guild player state is stuck.
+- Use `/stop` or `/leave` to reset playback state. `/cleanup` only removes recent bot/command messages from the current text channel.
 
 ### YouTube Streams Fail With 403
 

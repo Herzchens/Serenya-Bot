@@ -1,0 +1,133 @@
+name: Fix Validation
+
+on:
+  push:
+    branches:
+      - fix/playback-multiguild-stability
+
+concurrency:
+  group: fix-playback-multiguild-stability
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev cmake build-essential pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Remove local target-cpu override
+        run: rm -f .cargo/config.toml
+
+      - name: Apply candidate
+        id: candidate
+        shell: bash
+        run: |
+          if [[ -f .ci/candidate.py ]]; then
+            python3 .ci/candidate.py
+            if [[ -f .ci/post_candidate.py ]]; then
+              python3 .ci/post_candidate.py
+            fi
+            cargo fmt --all
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Reject candidate workflow mutations
+        if: steps.candidate.outputs.present == 'true'
+        shell: bash
+        run: |
+          if ! git diff --quiet -- .github/workflows; then
+            echo "validated candidates must not mutate workflow files" >&2
+            git diff --name-only -- .github/workflows >&2
+            exit 1
+          fi
+
+      - name: Check diff integrity
+        run: git diff --check
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Cargo check
+        run: cargo check --workspace --locked
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --workspace --locked
+
+      - name: DHAT redactor retention
+        run: >-
+          cargo test -p serenya --bin serenya --locked --features dhat-heap
+          logging::redact::tests::rotating_history_retained_heap_stays_bounded_after_ten_thousand_unique_rotations
+          -- --exact --test-threads=1
+
+      - name: Cargo build release
+        run: cargo build --workspace --release --locked
+
+      - name: Cargo test release
+        run: cargo test --workspace --release --locked
+
+      - name: Install pinned cargo-audit
+        shell: bash
+        run: |
+          if ! command -v cargo-audit >/dev/null 2>&1 || [[ "$(cargo audit --version 2>/dev/null)" != "cargo-audit 0.22.2" ]]; then
+            cargo install cargo-audit --version 0.22.2 --locked --force
+          fi
+
+      - name: Cargo audit
+        run: cargo audit
+
+      - name: Inspect dependency tree duplicates
+        run: cargo tree -d --locked
+
+      - name: Materialize validated candidate
+        if: steps.candidate.outputs.present == 'true'
+        shell: bash
+        run: |
+          message="$(cat .ci/commit-message 2>/dev/null || echo 'fix: materialize validated candidate')"
+          rm -f .ci/candidate.py .ci/post_candidate.py .ci/commit-message
+          git restore --source=HEAD --worktree .github/workflows
+          git restore --source=HEAD --worktree .cargo/config.toml
+          git config user.name "Serenya Validation"
+          git config user.email "166841132+Herzchens@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet -- .github/workflows; then
+            echo "validated candidates must not auto-materialize workflow changes" >&2
+            git diff --cached --name-only -- .github/workflows >&2
+            exit 1
+          fi
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "validated candidate produced no material changes" >&2
+            exit 1
+          fi
+          git commit -m "$message [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}

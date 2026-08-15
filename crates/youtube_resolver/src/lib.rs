@@ -14,7 +14,7 @@ mod types;
 
 pub use clients::{
     create_android_client, create_android_vr_client, create_ios_client, create_tvhtml5_client,
-    create_web_safari_client,
+    create_visionos_client, create_web_safari_client,
 };
 pub use innertube::{BaseInnerTubeClient, InnerTubeClient};
 pub use resolver_api::{
@@ -28,6 +28,7 @@ pub use types::{ResolveContext, ResolveError, ResolvedStream, SessionData};
 mod tests {
     use super::*;
 
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_android_vr_resolve() {
         let client = create_android_vr_client();
@@ -37,20 +38,28 @@ mod tests {
         assert!(res.unwrap().streaming_data.is_some());
     }
 
-    #[tokio::test]
-    async fn test_web_safari_resolve() {
+    #[test]
+    fn web_safari_client_identity_is_explicit() {
         let client = create_web_safari_client();
-        let ctx = ResolveContext::default();
-        let res = client.player("dQw4w9WgXcQ", &ctx).await;
-        match res {
-            Ok(player_res) => assert!(player_res.streaming_data.is_some()),
-            Err(e) => println!(
-                "Web Safari player API returned error in anonymous context: {:?}",
-                e
-            ),
-        }
+        assert_eq!(client.name(), "WEB_SAFARI");
+        assert_eq!(client.client_name(), "WEB");
+        assert!(client.user_agent().contains("Safari"));
     }
 
+    #[test]
+    fn visionos_client_identity_is_explicit() {
+        let client = create_visionos_client();
+
+        assert_eq!(client.name(), "VISIONOS");
+        assert_eq!(client.client_name(), "VISIONOS");
+        assert_eq!(client.client_version(), "1.02");
+        assert!(
+            client.user_agent().contains("Safari"),
+            "VISIONOS client must retain its Safari-style user agent"
+        );
+    }
+
+    #[cfg(feature = "live-tests")]
     #[tokio::test]
     async fn test_resolve_best_audio_stream() {
         let ctx = ResolveContext::default();

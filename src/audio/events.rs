@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::guild_player::{PlaybackFailureAction, PlaybackFailureState};
 use crate::database::DatabaseManager;
 use crate::discord::embeds::now_playing_announce_embed;
 use crate::utils::SerenyaError;
@@ -18,7 +19,273 @@ pub struct PlaybackContext {
     >,
     pub http_client: reqwest::Client,
     pub serenity_ctx: serenity::Context,
-    pub config: Arc<crate::config::BotConfig>,
+    pub config: Arc<arc_swap::ArcSwap<crate::config::BotConfig>>,
+}
+
+fn stay_in_voice(config: &Arc<arc_swap::ArcSwap<crate::config::BotConfig>>) -> bool {
+    config.load().playback.stay_in_voice
+}
+
+async fn automatic_disconnect_then_cleanup<D, DFut, C, CFut, E>(
+    disconnect: D,
+    cleanup: C,
+) -> Result<(), E>
+where
+    D: FnOnce() -> DFut,
+    DFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = ()>,
+{
+    disconnect().await?;
+    cleanup().await;
+    Ok(())
+}
+
+pub(crate) fn register_terminal_handlers<End, Error, E>(end: End, error: Error) -> Result<(), E>
+where
+    End: FnOnce() -> Result<(), E>,
+    Error: FnOnce() -> Result<(), E>,
+{
+    end()?;
+    error()?;
+    Ok(())
+}
+
+fn playback_stat_delta(play_time: Duration, completed: bool) -> (u64, u64) {
+    (u64::from(completed), play_time.as_secs())
+}
+
+fn retry_client_for_track(track: Option<&crate::core::Track>) -> Option<String> {
+    track
+        .and_then(|track| track.resolved_url.as_ref())
+        .filter(|stream| stream.resolve_source.starts_with("api_client_"))
+        .map(|stream| stream.client_kind.clone())
+}
+
+fn is_suspicious_early_end(
+    play_time: Duration,
+    expected_duration: Option<Duration>,
+    was_skipped: bool,
+) -> bool {
+    if was_skipped || play_time >= Duration::from_secs(2) {
+        return false;
+    }
+
+    matches!(
+        expected_duration,
+        Some(duration) if duration > Duration::from_secs(2)
+    )
+}
+
+pub(crate) async fn record_guild_playback_stats(
+    database: &DatabaseManager,
+    guild_id: serenity::GuildId,
+    play_time: Duration,
+    completed: bool,
+) {
+    let (songs_played, listening_seconds) = playback_stat_delta(play_time, completed);
+    database
+        .update_guild_settings_mut(guild_id.get(), |settings| {
+            settings.total_songs_played = settings.total_songs_played.saturating_add(songs_played);
+            settings.total_listening_seconds = settings
+                .total_listening_seconds
+                .saturating_add(listening_seconds);
+        })
+        .await;
+}
+
+async fn record_playback_stats(ctx: &PlaybackContext, play_time: Duration, completed: bool) {
+    record_guild_playback_stats(ctx.database.as_ref(), ctx.guild_id, play_time, completed).await;
+}
+
+fn claim_interrupted_terminal(
+    failure_state: &mut PlaybackFailureState,
+    current_handle_uuid: Option<uuid::Uuid>,
+    observed_handle_uuid: uuid::Uuid,
+) -> bool {
+    current_handle_uuid == Some(observed_handle_uuid)
+        && failure_state.claim_terminal(observed_handle_uuid)
+}
+
+pub(crate) async fn finalize_interrupted_playback_stats(
+    database: &DatabaseManager,
+    guild_id: serenity::GuildId,
+    player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+) {
+    let handle_uuid = {
+        let player = player_lock.read().await;
+        player
+            .current_track_handle
+            .as_ref()
+            .map(|handle| handle.uuid())
+    };
+    if let Some(handle_uuid) = handle_uuid {
+        finalize_interrupted_playback_stats_for_handle(
+            database,
+            guild_id,
+            player_lock,
+            handle_uuid,
+        )
+        .await;
+    }
+}
+
+pub(crate) async fn interrupted_play_time_for_handle(
+    player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    handle_uuid: uuid::Uuid,
+) -> Option<Duration> {
+    let handle = {
+        let player = player_lock.read().await;
+        player
+            .current_track_handle
+            .as_ref()
+            .filter(|handle| handle.uuid() == handle_uuid)
+            .cloned()
+    }?;
+
+    match handle.get_info().await {
+        Ok(state) => Some(state.play_time),
+        Err(err) => {
+            tracing::debug!(
+                ?handle_uuid,
+                error = %err,
+                "Could not read interrupted track state for listening statistics"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) async fn finalize_interrupted_playback_stats_for_handle(
+    database: &DatabaseManager,
+    guild_id: serenity::GuildId,
+    player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    handle_uuid: uuid::Uuid,
+) {
+    let Some(play_time) = interrupted_play_time_for_handle(player_lock, handle_uuid).await else {
+        return;
+    };
+
+    let claimed = {
+        let mut player = player_lock.write().await;
+        let current_handle_uuid = player
+            .current_track_handle
+            .as_ref()
+            .map(|handle| handle.uuid());
+        claim_interrupted_terminal(&mut player.failure_state, current_handle_uuid, handle_uuid)
+    };
+
+    if claimed {
+        record_guild_playback_stats(database, guild_id, play_time, false).await;
+        tracing::debug!(
+            guild_id = %guild_id,
+            ?handle_uuid,
+            listening_seconds = play_time.as_secs(),
+            "Recorded interrupted playback listening time"
+        );
+    }
+}
+
+async fn apply_failure_action(
+    ctx: &PlaybackContext,
+    player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
+    action: PlaybackFailureAction,
+    ended_uuid: Option<uuid::Uuid>,
+    track_title: &str,
+    announce_channel: Option<serenity::ChannelId>,
+) {
+    match action {
+        PlaybackFailureAction::RetryCurrent => {
+            tracing::warn!(
+                guild_id = %ctx.guild_id,
+                track = track_title,
+                "Retrying current track after playback failure"
+            );
+            let ctx_clone = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = play_next(ctx_clone.clone(), None, false).await {
+                    tracing::error!(
+                        guild_id = %ctx_clone.guild_id,
+                        "Failed to retry current track: {:?}",
+                        err
+                    );
+                }
+            });
+        }
+        PlaybackFailureAction::Advance => {
+            if let Some(channel) = announce_channel {
+                let serenity_ctx = ctx.serenity_ctx.clone();
+                let title = track_title.to_owned();
+                tokio::spawn(async move {
+                    let embed = crate::discord::embeds::playback_status_embed(
+                        "⚠️ Warning",
+                        &format!("Could not play **{}**. Trying the next track.", title),
+                        0xFEE75C,
+                    );
+                    let _ = channel
+                        .send_message(
+                            &serenity_ctx.http,
+                            serenity::CreateMessage::new().embed(embed),
+                        )
+                        .await;
+                });
+            }
+
+            let ctx_clone = ctx.clone();
+            tokio::spawn(async move {
+                if let Err(err) = play_next(ctx_clone.clone(), ended_uuid, true).await {
+                    tracing::error!(
+                        guild_id = %ctx_clone.guild_id,
+                        "Failed to advance after playback failure: {:?}",
+                        err
+                    );
+                }
+            });
+        }
+        PlaybackFailureAction::Abort => {
+            {
+                let mut player = player_lock.write().await;
+                player.cancel_prefetch();
+                if let Some(mut failed_track) = player.now_playing.take() {
+                    failed_track.resolved_url = None;
+                    player.previous_track = Some(failed_track);
+                }
+                player.current_track_handle = None;
+                player.playback_status = crate::core::PlaybackStatus::Idle;
+                player.skip_forced = false;
+                player.seek_offset = Duration::ZERO;
+                player.is_seeking = false;
+                player.clear_skip_votes();
+                player.failure_state.reset();
+            }
+
+            if let Some(manager) = songbird::get(&ctx.serenity_ctx).await
+                && let Some(call_lock) = manager.get(ctx.guild_id)
+            {
+                let mut call = call_lock.lock().await;
+                call.stop();
+            }
+
+            tracing::error!(
+                guild_id = %ctx.guild_id,
+                "Playback stopped after three consecutive tracks failed"
+            );
+            if let Some(channel) = announce_channel {
+                let serenity_ctx = ctx.serenity_ctx.clone();
+                tokio::spawn(async move {
+                    let embed = crate::discord::embeds::error_embed(
+                        "Dừng phát nhạc vì ba bài liên tiếp không thể phát. Hàng chờ chưa thử vẫn được giữ lại.",
+                    );
+                    let _ = channel
+                        .send_message(
+                            &serenity_ctx.http,
+                            serenity::CreateMessage::new().embed(embed),
+                        )
+                        .await;
+                });
+            }
+        }
+    }
 }
 
 pub struct TrackEndHandler {
@@ -28,91 +295,111 @@ pub struct TrackEndHandler {
 #[async_trait]
 impl EventHandler for TrackEndHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let (ended_uuid, was_skipped, play_time, is_stale) =
-            if let EventContext::Track(track_events) = ctx {
-                if let Some((state, handle)) = track_events.first() {
-                    let ended = handle.uuid();
-                    let (skip_forced, is_stale) = if let Some(player_lock_ref) =
-                        self.ctx.guild_players.get(&self.ctx.guild_id)
-                    {
-                        let player_lock = player_lock_ref.value().clone();
-                        drop(player_lock_ref);
-                        let player = player_lock.read().await;
-                        let is_stale = if let Some(ref current_handle) = player.current_track_handle
-                        {
-                            current_handle.uuid() != ended
-                        } else {
-                            true
-                        };
-                        (player.skip_forced, is_stale)
-                    } else {
-                        (false, true)
-                    };
-                    (Some(ended), skip_forced, state.play_time, is_stale)
-                } else {
-                    (None, false, Duration::from_secs(0), true)
-                }
-            } else {
-                (None, false, Duration::from_secs(0), true)
-            };
+        let (ended, play_time) = if let EventContext::Track(track_events) = ctx {
+            let (state, handle) = track_events.first()?;
+            (handle.uuid(), state.play_time)
+        } else {
+            return None;
+        };
 
-        if is_stale {
-            if let Some(ended) = ended_uuid {
+        let player_lock = match self.ctx.guild_players.get(&self.ctx.guild_id) {
+            Some(entry) => entry.value().clone(),
+            None => return None,
+        };
+
+        let (was_skipped, expected_duration, claimed) = {
+            let mut player = player_lock.write().await;
+            if !player.failure_state.matches_active(ended) {
                 tracing::info!(
-                    "Ignoring TrackEnd event from stale or stopped track handle: {:?}",
-                    ended
+                    guild_id = %self.ctx.guild_id,
+                    ?ended,
+                    "Ignoring TrackEnd event from stale or stopped track handle"
                 );
+                return None;
             }
+            let claimed = player.failure_state.claim_terminal(ended);
+            (
+                player.skip_forced,
+                player.now_playing.as_ref().and_then(|track| track.duration),
+                claimed,
+            )
+        };
+
+        if !claimed {
+            tracing::debug!(
+                guild_id = %self.ctx.guild_id,
+                ?ended,
+                "Ignoring duplicate terminal event"
+            );
             return None;
         }
-        if let Some(ended) = ended_uuid {
-            let mut retry_current = false;
-            if play_time < Duration::from_secs(2) && !was_skipped {
-                tracing::warn!(
-                    guild_id = %self.ctx.guild_id,
-                    ?play_time,
-                    "Track ended too quickly without being skipped, incrementing consecutive errors"
-                );
-                if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
-                    let player_lock = player_lock_ref.value().clone();
-                    drop(player_lock_ref);
-                    let mut player = player_lock.write().await;
-                    player.consecutive_errors += 1;
-                    let consecutive_errors = player.consecutive_errors;
-                    retry_current = true;
 
-                    let url_opt = player.now_playing.as_ref().map(|np| np.url.clone());
-                    if let Some(ref mut np) = player.now_playing {
-                        np.resolved_url = None;
-                    }
-                    drop(player);
-
-                    if let Some(url) = url_opt {
-                        crate::audio::source::cache_invalidate_stream(&url).await;
-                    }
-
-                    tracing::warn!(
-                        guild_id = %self.ctx.guild_id,
-                        consecutive_errors,
-                        "Consecutive errors count: {}",
-                        consecutive_errors
-                    );
+        if is_suspicious_early_end(play_time, expected_duration, was_skipped) {
+            let (action, url, title, announce_channel) = {
+                let mut player = player_lock.write().await;
+                let retry_client = retry_client_for_track(player.now_playing.as_ref());
+                let action = player.failure_state.register_failure();
+                if action == PlaybackFailureAction::RetryCurrent {
+                    player.failure_state.set_retry_excluded_client(retry_client);
                 }
+                if action == PlaybackFailureAction::Advance {
+                    player.skip_forced = true;
+                }
+                let url = player.now_playing.as_ref().map(|track| track.url.clone());
+                let title = player
+                    .now_playing
+                    .as_ref()
+                    .map(|track| track.title.to_string())
+                    .unwrap_or_else(|| "current track".to_owned());
+                if let Some(ref mut track) = player.now_playing {
+                    track.resolved_url = None;
+                }
+                player.current_track_handle = None;
+                player.playback_status = crate::core::PlaybackStatus::Idle;
+                (action, url, title, player.announce_channel)
+            };
+
+            if let Some(url) = url {
+                crate::audio::source::cache_invalidate_stream(&url).await;
             }
-
-            let ctx_clone = self.ctx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = play_next(
-                    ctx_clone,
-                    if retry_current { None } else { Some(ended) },
-                    !retry_current,
-                )
-                .await
-                {
-                    tracing::error!("Error in play_next during event handling: {:?}", e);
-                }
-            });
+            tracing::warn!(
+                guild_id = %self.ctx.guild_id,
+                ?play_time,
+                ?expected_duration,
+                ?action,
+                "Track ended suspiciously early"
+            );
+            record_playback_stats(&self.ctx, play_time, false).await;
+            apply_failure_action(
+                &self.ctx,
+                &player_lock,
+                action,
+                Some(ended),
+                &title,
+                announce_channel,
+            )
+            .await;
+            return None;
         }
+
+        record_playback_stats(&self.ctx, play_time, !was_skipped).await;
+        {
+            let mut player = player_lock.write().await;
+            player.failure_state.mark_completed(ended);
+            player.current_track_handle = None;
+            player.playback_status = crate::core::PlaybackStatus::Idle;
+        }
+
+        let ctx_clone = self.ctx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = play_next(ctx_clone.clone(), Some(ended), true).await {
+                tracing::error!(
+                    guild_id = %ctx_clone.guild_id,
+                    "Error in play_next during TrackEnd handling: {:?}",
+                    err
+                );
+            }
+        });
         None
     }
 }
@@ -124,138 +411,119 @@ pub struct TrackErrorHandler {
 #[async_trait]
 impl EventHandler for TrackErrorHandler {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track(track_events) = ctx
-            && let Some((_, handle)) = track_events.first()
-        {
-            let ended = handle.uuid();
-            let is_stale =
-                if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
-                    let player_lock = player_lock_ref.value().clone();
-                    drop(player_lock_ref);
-                    let player = player_lock.read().await;
-                    if let Some(ref current_handle) = player.current_track_handle {
-                        current_handle.uuid() != ended
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                };
+        let (ended, play_time) = if let EventContext::Track(track_events) = ctx {
+            let (state, handle) = track_events.first()?;
+            (handle.uuid(), state.play_time)
+        } else {
+            return None;
+        };
 
-            if is_stale {
+        let player_lock = match self.ctx.guild_players.get(&self.ctx.guild_id) {
+            Some(entry) => entry.value().clone(),
+            None => return None,
+        };
+
+        let (action, url, title, announce_channel) = {
+            let mut player = player_lock.write().await;
+            if !player.failure_state.matches_active(ended) {
                 tracing::info!(
-                    "Ignoring TrackError event from stale or stopped track handle: {:?}",
-                    ended
+                    guild_id = %self.ctx.guild_id,
+                    ?ended,
+                    "Ignoring TrackError event from stale or stopped track handle"
+                );
+                return None;
+            }
+            if !player.failure_state.claim_terminal(ended) {
+                tracing::debug!(
+                    guild_id = %self.ctx.guild_id,
+                    ?ended,
+                    "Ignoring duplicate terminal event"
                 );
                 return None;
             }
 
-            tracing::error!(guild_id = %self.ctx.guild_id, "Track errored (End handler will advance queue)");
-            if let Some(player_lock_ref) = self.ctx.guild_players.get(&self.ctx.guild_id) {
-                let player_lock = player_lock_ref.value().clone();
-                drop(player_lock_ref);
-                let mut player = player_lock.write().await;
-                player.consecutive_errors += 1;
-                let consecutive_errors = player.consecutive_errors;
-                let url_opt = player.now_playing.as_ref().map(|np| np.url.clone());
-                drop(player);
-
-                tracing::warn!(
-                    guild_id = %self.ctx.guild_id,
-                    consecutive_errors,
-                    "Track errored: consecutive errors count: {}",
-                    consecutive_errors
-                );
-
-                if let Some(url) = url_opt {
-                    crate::audio::source::cache_invalidate_stream(&url).await;
-                }
+            let retry_client = retry_client_for_track(player.now_playing.as_ref());
+            let action = player.failure_state.register_failure();
+            if action == PlaybackFailureAction::RetryCurrent {
+                player.failure_state.set_retry_excluded_client(retry_client);
             }
+            if action == PlaybackFailureAction::Advance {
+                player.skip_forced = true;
+            }
+            let url = player.now_playing.as_ref().map(|track| track.url.clone());
+            let title = player
+                .now_playing
+                .as_ref()
+                .map(|track| track.title.to_string())
+                .unwrap_or_else(|| "current track".to_owned());
+            if let Some(ref mut track) = player.now_playing {
+                track.resolved_url = None;
+            }
+            player.current_track_handle = None;
+            player.playback_status = crate::core::PlaybackStatus::Idle;
+            (action, url, title, player.announce_channel)
+        };
+
+        if let Some(url) = url {
+            crate::audio::source::cache_invalidate_stream(&url).await;
         }
+        record_playback_stats(&self.ctx, play_time, false).await;
+        tracing::error!(
+            guild_id = %self.ctx.guild_id,
+            ?action,
+            "Track playback error"
+        );
+        apply_failure_action(
+            &self.ctx,
+            &player_lock,
+            action,
+            Some(ended),
+            &title,
+            announce_channel,
+        )
+        .await;
         None
     }
 }
 
-async fn fail_and_maybe_advance(
+pub(crate) async fn fail_and_maybe_advance(
     ctx: &PlaybackContext,
     player_lock: &Arc<tokio::sync::RwLock<crate::core::GuildPlayer>>,
-    call_lock: &Arc<tokio::sync::Mutex<songbird::Call>>,
+    _call_lock: &Arc<tokio::sync::Mutex<songbird::Call>>,
     track_url: &str,
     track_title: &str,
     announce_channel: Option<serenity::ChannelId>,
 ) -> Result<(), SerenyaError> {
-    let (consecutive_errors, url_opt) = {
+    let action = {
         let mut player = player_lock.write().await;
-        player.consecutive_errors += 1;
-
+        let retry_client = retry_client_for_track(player.now_playing.as_ref());
+        let action = player.failure_state.register_failure();
+        if action == PlaybackFailureAction::RetryCurrent {
+            player.failure_state.set_retry_excluded_client(retry_client);
+        }
+        if action == PlaybackFailureAction::Advance {
+            player.skip_forced = true;
+        }
         if player.now_playing.as_ref().map(|current| &*current.url) == Some(track_url) {
-            player.now_playing = None;
+            if let Some(ref mut current) = player.now_playing {
+                current.resolved_url = None;
+            }
             player.current_track_handle = None;
             player.playback_status = crate::core::PlaybackStatus::Idle;
         }
-        (player.consecutive_errors, Some(track_url.to_string()))
+        action
     };
 
-    if let Some(url) = url_opt {
-        crate::audio::source::cache_invalidate_stream(&url).await;
-    }
-
-    if consecutive_errors >= 3 {
-        tracing::error!(
-            "Aborting play_next: too many consecutive errors ({})",
-            consecutive_errors
-        );
-        {
-            let mut call = call_lock.lock().await;
-            call.stop();
-        }
-        {
-            let mut player = player_lock.write().await;
-            player.reset();
-        }
-        if let Some(channel) = announce_channel {
-            let ctx_clone = ctx.serenity_ctx.clone();
-            tokio::spawn(async move {
-                let embed = crate::discord::embeds::error_embed(
-                    "Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.",
-                );
-                let _ = channel
-                    .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
-                    .await;
-            });
-        }
-        return Ok(());
-    }
-
-    if let Some(channel) = announce_channel {
-        let ctx_clone = ctx.serenity_ctx.clone();
-        let title_clone = track_title.to_owned();
-        tokio::spawn(async move {
-            let embed = crate::discord::embeds::playback_status_embed(
-                "⚠️ Warning",
-                &format!(
-                    "Could not resolve **{}**. Trying the next track.",
-                    title_clone
-                ),
-                0xFEE75C,
-            );
-            let _ = channel
-                .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
-                .await;
-        });
-    }
-
-    let ctx_clone = ctx.clone();
-    tokio::spawn(async move {
-        if let Err(next_err) = play_next(ctx_clone.clone(), None, true).await {
-            tracing::error!(
-                guild_id = %ctx_clone.guild_id,
-                "Failed to continue in play_next after stream resolution error: {:?}",
-                next_err
-            );
-        }
-    });
-
+    crate::audio::source::cache_invalidate_stream(track_url).await;
+    apply_failure_action(
+        ctx,
+        player_lock,
+        action,
+        None,
+        track_title,
+        announce_channel,
+    )
+    .await;
     Ok(())
 }
 
@@ -277,9 +545,7 @@ pub fn play_next(
                 tracing::info!("Ignoring End/Error event because player is seeking");
                 return Ok(());
             }
-            if let Some(ref current_handle) = player.current_track_handle
-                && current_handle.uuid() != ended
-            {
+            if !player.failure_state.matches_active(ended) {
                 tracing::info!("Ignoring End/Error event from stale track handle");
                 return Ok(());
             }
@@ -294,62 +560,15 @@ pub fn play_next(
             .get(ctx.guild_id)
             .ok_or_else(|| SerenyaError::Voice("Not connected to a voice channel".into()))?;
 
-        let finished_track = {
-            let player = player_lock.read().await;
-            player.now_playing.clone()
-        };
-
         let guild_settings = ctx.database.get_guild_settings(ctx.guild_id.get()).await;
 
-        if let Some(track) = finished_track {
-            ctx.database
-                .update_guild_settings_mut(ctx.guild_id.get(), |settings| {
-                    settings.total_songs_played += 1;
-                    if let Some(dur) = track.duration {
-                        settings.total_listening_seconds += dur.as_secs();
-                    }
-                })
-                .await;
-        }
-
-        let (track, announce_channel, consecutive_errors) = {
+        let (track, announce_channel) = {
             let mut player = player_lock.write().await;
             if advance {
                 player.advance_queue();
             }
-            (
-                player.now_playing.clone(),
-                player.announce_channel,
-                player.consecutive_errors,
-            )
+            (player.now_playing.clone(), player.announce_channel)
         };
-
-        if consecutive_errors >= 3 {
-            tracing::error!(
-                "Aborting play_next: too many consecutive errors ({})",
-                consecutive_errors
-            );
-            {
-                let mut call = call_lock.lock().await;
-                call.stop();
-            }
-            {
-                let mut player = player_lock.write().await;
-                player.reset();
-            }
-            if let Some(channel) = announce_channel {
-                let ctx_clone = ctx.serenity_ctx.clone();
-                tokio::spawn(async move {
-                    let embed = crate::discord::embeds::error_embed(
-                        "Dừng phát nhạc do quá nhiều lỗi liên tiếp. Vui lòng kiểm tra lại nguồn phát hoặc thử lại sau.",
-                    );
-                    let _ = channel
-                        .send_message(&ctx_clone.http, serenity::CreateMessage::new().embed(embed))
-                        .await;
-                });
-            }
-            return Ok(());
-        }
 
         let Some(mut track) = track else {
             {
@@ -375,20 +594,35 @@ pub fn play_next(
             }
 
             // If stay_in_voice is disabled, disconnect and reclaim resources
-            if !ctx.config.playback.stay_in_voice {
+            if !stay_in_voice(&ctx.config) {
                 tracing::info!(
                     guild_id = %ctx.guild_id,
                     "Queue finished and stay_in_voice=false, disconnecting"
                 );
+                let cleanup_player = Arc::clone(&player_lock);
+                let cleanup_players = Arc::clone(&ctx.guild_players);
+                let guild_id = ctx.guild_id;
+                if let Err(err) = automatic_disconnect_then_cleanup(
+                    || songbird_manager.remove(guild_id),
+                    move || async move {
+                        {
+                            let mut player = cleanup_player.write().await;
+                            player.reset();
+                            player.voice_channel = None;
+                            player.announce_channel = None;
+                        }
+                        cleanup_players.remove(&guild_id);
+                        crate::audio::runtime::cleanup_guild(guild_id.get());
+                    },
+                )
+                .await
                 {
-                    let mut player = player_lock.write().await;
-                    player.reset();
-                    player.voice_channel = None;
-                    player.announce_channel = None;
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        error = %err,
+                        "Automatic queue-finished voice disconnect failed; preserving local state for retry"
+                    );
                 }
-                ctx.guild_players.remove(&ctx.guild_id);
-                let _ = songbird_manager.remove(ctx.guild_id).await;
-                crate::audio::runtime::cleanup_guild(ctx.guild_id.get());
             }
 
             return Ok(());
@@ -445,49 +679,68 @@ pub fn play_next(
             }
         }
 
-        let resolved_res = match track.resolved_url.clone() {
-            Some(url) => {
-                if !crate::audio::source::is_verified_stream_domain(&url.url) {
-                    Err(SerenyaError::Audio(
-                        "Cached stream returned unverified domain".into(),
-                    ))
-                } else {
-                    Ok(url)
-                }
+        let cached_resolved = match track.resolved_url.clone() {
+            Some(url)
+                if crate::audio::source::cached_resolved_stream_is_current(&track.url, &url)
+                    .await =>
+            {
+                Some(url)
             }
-            None => {
-                let guild_id = ctx.guild_id.get();
-                let url = track.url.clone();
-                let client = ctx.http_client.clone();
-                let handle = tokio::spawn(async move {
-                    crate::audio::source::extract_stream_url_for_guild(guild_id, &url, &client)
-                        .await
-                });
+            Some(_) => {
+                tracing::debug!(guild_id = %ctx.guild_id, track = %track.title, "Discarding stale prefetched stream URL");
+                None
+            }
+            None => None,
+        };
 
-                match handle.await {
-                    Ok(Ok(url)) => {
-                        if !crate::audio::source::is_verified_stream_domain(&url.url) {
-                            tracing::warn!(
-                                "Stream resolution returned unverified domain: {}",
-                                url.url
-                            );
-                            Err(SerenyaError::Audio(
-                                "Stream resolution returned unverified domain".into(),
-                            ))
-                        } else {
-                            Ok(Arc::new(url))
-                        }
-                    }
-                    Ok(Err(e)) => Err(e),
-                    Err(join_err) => {
-                        tracing::error!(
-                            "Stream resolution task panicked or aborted: {:?}",
-                            join_err
+        let resolved_res = if let Some(url) = cached_resolved {
+            if !crate::audio::source::is_verified_stream_domain(&url.url) {
+                Err(SerenyaError::Audio(
+                    "Cached stream returned unverified domain".into(),
+                ))
+            } else {
+                Ok(url)
+            }
+        } else {
+            let guild_id = ctx.guild_id.get();
+            let url = track.url.clone();
+            let client = ctx.http_client.clone();
+            let excluded_client = {
+                let player = player_lock.read().await;
+                player
+                    .failure_state
+                    .retry_excluded_client()
+                    .map(str::to_owned)
+            };
+            let handle = tokio::spawn(async move {
+                crate::audio::source::extract_stream_url_for_guild_excluding(
+                    guild_id,
+                    &url,
+                    &client,
+                    excluded_client.as_deref(),
+                )
+                .await
+            });
+            match handle.await {
+                Ok(Ok(url)) => {
+                    if !crate::audio::source::is_verified_stream_domain(&url.url) {
+                        tracing::warn!(
+                            stream_host = %crate::audio::source::stream_log_location(&url.url),
+                            "Stream resolution returned unverified domain"
                         );
                         Err(SerenyaError::Audio(
-                            "Stream resolution task panicked or aborted".into(),
+                            "Stream resolution returned unverified domain".into(),
                         ))
+                    } else {
+                        Ok(Arc::new(url))
                     }
+                }
+                Ok(Err(e)) => Err(e),
+                Err(join_err) => {
+                    tracing::error!("Stream resolution task panicked or aborted: {:?}", join_err);
+                    Err(SerenyaError::Audio(
+                        "Stream resolution task panicked or aborted".into(),
+                    ))
                 }
             }
         };
@@ -556,14 +809,36 @@ pub fn play_next(
             call.play_input(source)
         };
 
-        let _ = handle.add_event(
-            Event::Track(songbird::TrackEvent::End),
-            TrackEndHandler { ctx: ctx.clone() },
-        );
-        let _ = handle.add_event(
-            Event::Track(songbird::TrackEvent::Error),
-            TrackErrorHandler { ctx: ctx.clone() },
-        );
+        if let Err(err) = register_terminal_handlers(
+            || {
+                handle.add_event(
+                    Event::Track(songbird::TrackEvent::End),
+                    TrackEndHandler { ctx: ctx.clone() },
+                )
+            },
+            || {
+                handle.add_event(
+                    Event::Track(songbird::TrackEvent::Error),
+                    TrackErrorHandler { ctx: ctx.clone() },
+                )
+            },
+        ) {
+            let _ = handle.stop();
+            tracing::error!(
+                guild_id = %ctx.guild_id,
+                error = %err,
+                "Failed to register playback terminal handlers"
+            );
+            return fail_and_maybe_advance(
+                &ctx,
+                &player_lock,
+                &call_lock,
+                &track.url,
+                &track.title,
+                announce_channel,
+            )
+            .await;
+        }
 
         {
             let mut player = player_lock.write().await;
@@ -572,6 +847,7 @@ pub fn play_next(
                     np.resolved_url = Some(resolved);
                 }
                 player.current_track_handle = Some(handle.clone());
+                player.failure_state.begin_attempt(handle.uuid());
                 player.playback_status = crate::core::PlaybackStatus::Playing;
 
                 let player_lock_clone = player_lock.clone();
@@ -582,9 +858,9 @@ pub fn play_next(
                     if let Some(ref current_handle) = player.current_track_handle
                         && current_handle.uuid() == track_uuid
                     {
-                        player.consecutive_errors = 0;
+                        player.failure_state.mark_stable_success(track_uuid);
                         tracing::debug!(
-                            "Reset consecutive errors to 0 after 5 seconds of successful playback"
+                            "Reset playback failure streak after 5 seconds of successful playback"
                         );
                     }
                 });
@@ -608,7 +884,7 @@ pub fn play_next(
             && let Some(channel) = announce_channel
         {
             let ctx_clone = ctx.serenity_ctx.clone();
-            let config_clone = ctx.config.clone();
+            let config_clone = ctx.config.load_full();
             tokio::spawn(async move {
                 let embed = now_playing_announce_embed(&track, &config_clone);
                 let _ = channel
@@ -782,7 +1058,11 @@ pub async fn trigger_prefetch_with_context(
                     track.resolved_url = Some(Arc::new(resolved_url));
                     tracing::debug!(guild_id = %guild_id, "Prefetch successful for: {}", track.title);
                 } else {
-                    tracing::warn!(guild_id = %guild_id, url = %resolved_url.url, "Prefetch rejected due to unverified domain");
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        stream_host = %crate::audio::source::stream_log_location(&resolved_url.url),
+                        "Prefetch rejected due to unverified domain"
+                    );
                 }
             }
         }
@@ -838,4 +1118,319 @@ pub fn schedule_prefetch(
         trigger_prefetch_with_context(guild_id, gp_clone, http_client_clone, token, generation)
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_suspicious_early_end;
+    use std::time::Duration;
+
+    #[test]
+    fn legitimate_short_track_is_not_classified_as_failure() {
+        assert!(!is_suspicious_early_end(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn long_track_ending_immediately_is_classified_as_failure() {
+        assert!(is_suspicious_early_end(
+            Duration::from_secs(1),
+            Some(Duration::from_secs(180)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn unknown_duration_is_not_guessed_to_be_a_failure() {
+        assert!(!is_suspicious_early_end(
+            Duration::from_millis(500),
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn manual_skip_is_never_classified_as_early_failure() {
+        assert!(!is_suspicious_early_end(
+            Duration::from_millis(100),
+            Some(Duration::from_secs(180)),
+            true,
+        ));
+    }
+
+    #[test]
+    fn playback_past_early_window_is_not_classified_as_failure() {
+        assert!(!is_suspicious_early_end(
+            Duration::from_secs(2),
+            Some(Duration::from_secs(180)),
+            false,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod live_config_and_stats_tests {
+    use super::{playback_stat_delta, stay_in_voice};
+    use crate::config::BotConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn example_config() -> BotConfig {
+        serde_saphyr::from_str(include_str!("../../config.example.yml")).unwrap()
+    }
+
+    #[test]
+    fn active_playback_reads_latest_stay_in_voice_value() {
+        let mut initial = example_config();
+        initial.playback.stay_in_voice = true;
+        let live = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
+        assert!(stay_in_voice(&live));
+
+        let mut reloaded = example_config();
+        reloaded.playback.stay_in_voice = false;
+        live.store(Arc::new(reloaded));
+        assert!(!stay_in_voice(&live));
+    }
+
+    #[test]
+    fn skipped_tracks_add_listening_time_but_not_completed_count() {
+        assert_eq!(playback_stat_delta(Duration::from_secs(37), false), (0, 37));
+        assert_eq!(playback_stat_delta(Duration::from_secs(37), true), (1, 37));
+    }
+}
+
+#[cfg(test)]
+mod retry_client_source_tests {
+    use super::retry_client_for_track;
+    use crate::core::{SourceType, Track};
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+
+    fn track_with_stream(resolve_source: &str, client_kind: &str) -> Track {
+        Track {
+            title: "test".into(),
+            url: "https://www.youtube.com/watch?v=test".into(),
+            duration: None,
+            requester_id: serenity::UserId::new(1),
+            requester_name: None,
+            source_type: SourceType::Url,
+            resolved_url: Some(Arc::new(youtube_resolver::ResolvedStream {
+                url: "https://rr1.googlevideo.com/test".to_owned(),
+                client_kind: client_kind.to_owned(),
+                user_agent: "test".to_owned(),
+                expires_at: None,
+                mime_type: None,
+                bitrate: None,
+                resolve_source: resolve_source.to_owned(),
+            })),
+            thumbnail: None,
+            source_provider: Arc::from("test"),
+        }
+    }
+
+    #[test]
+    fn native_api_stream_client_is_excluded_for_retry() {
+        let track = track_with_stream("api_client_android_vr", "ANDROID_VR");
+        assert_eq!(
+            retry_client_for_track(Some(&track)).as_deref(),
+            Some("ANDROID_VR")
+        );
+    }
+
+    #[test]
+    fn non_api_stream_sources_are_not_client_excluded() {
+        let track = track_with_stream("invidious", "WEB");
+        assert_eq!(retry_client_for_track(Some(&track)), None);
+    }
+}
+
+#[cfg(test)]
+mod interrupted_stats_tests {
+    use super::claim_interrupted_terminal;
+    use crate::core::guild_player::PlaybackFailureState;
+
+    #[test]
+    fn interrupted_terminal_is_claimed_once_for_the_current_handle() {
+        let mut state = PlaybackFailureState::default();
+        let handle = uuid::Uuid::from_u128(401);
+        state.begin_attempt(handle);
+        assert!(claim_interrupted_terminal(&mut state, Some(handle), handle));
+        assert!(!claim_interrupted_terminal(
+            &mut state,
+            Some(handle),
+            handle
+        ));
+    }
+
+    #[test]
+    fn interrupted_terminal_does_not_claim_a_replaced_handle() {
+        let mut state = PlaybackFailureState::default();
+        let observed = uuid::Uuid::from_u128(402);
+        let replacement = uuid::Uuid::from_u128(403);
+        state.begin_attempt(observed);
+        assert!(!claim_interrupted_terminal(
+            &mut state,
+            Some(replacement),
+            observed,
+        ));
+        assert!(claim_interrupted_terminal(
+            &mut state,
+            Some(observed),
+            observed,
+        ));
+    }
+}
+
+#[cfg(test)]
+mod automatic_disconnect_cleanup_tests {
+    use super::automatic_disconnect_then_cleanup;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn failed_gateway_leave_does_not_commit_local_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = automatic_disconnect_then_cleanup(
+            || async { Err::<(), &'static str>("gateway unavailable") },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("gateway unavailable"));
+        assert!(
+            !cleaned.load(Ordering::SeqCst),
+            "local GuildPlayer/runtime state must remain available when Songbird says leave must be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_gateway_leave_commits_local_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleanup_flag = Arc::clone(&cleaned);
+
+        let result = automatic_disconnect_then_cleanup(
+            || async { Ok::<(), &'static str>(()) },
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod final_boundary_regression_tests {
+    use super::{record_guild_playback_stats, register_terminal_handlers};
+    use crate::database::DatabaseManager;
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_registration_failure_is_propagated_and_short_circuits() {
+        let second_called = Arc::new(AtomicBool::new(false));
+        let second_flag = Arc::clone(&second_called);
+        let result = register_terminal_handlers(
+            || Err::<(), &'static str>("end registration failed"),
+            move || {
+                second_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        );
+        assert_eq!(result, Err("end registration failed"));
+        assert!(
+            !second_called.load(Ordering::SeqCst),
+            "registration must stop after the first lifecycle-listener failure"
+        );
+    }
+
+    #[test]
+    fn terminal_registration_success_control_calls_both_handlers() {
+        let end_called = Arc::new(AtomicBool::new(false));
+        let error_called = Arc::new(AtomicBool::new(false));
+        let end_flag = Arc::clone(&end_called);
+        let error_flag = Arc::clone(&error_called);
+        let result = register_terminal_handlers(
+            move || {
+                end_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            move || {
+                error_flag.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert!(end_called.load(Ordering::SeqCst));
+        assert!(error_called.load(Ordering::SeqCst));
+    }
+
+    fn temp_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "serenya-stat-overflow-{}-{}.yml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn cleanup_db(path: &std::path::Path) {
+        let _ = tokio::fs::remove_file(path).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.tmp")).await;
+        let _ = tokio::fs::remove_file(path.with_extension("yml.bak")).await;
+    }
+
+    #[tokio::test]
+    async fn persisted_max_playback_stats_do_not_panic_or_wrap_on_new_delta()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temp_db_path();
+        let manager = DatabaseManager::load(&path).await?;
+        manager
+            .update_guild_settings_mut(9001, |settings| {
+                settings.total_songs_played = u64::MAX;
+                settings.total_listening_seconds = u64::MAX;
+            })
+            .await;
+        manager.save().await?;
+
+        let reloaded = Arc::new(DatabaseManager::load(&path).await?);
+        let before = reloaded.get_guild_settings(9001).await;
+        assert_eq!(before.total_songs_played, u64::MAX);
+        assert_eq!(before.total_listening_seconds, u64::MAX);
+
+        let task_db = Arc::clone(&reloaded);
+        let outcome = tokio::spawn(async move {
+            record_guild_playback_stats(
+                task_db.as_ref(),
+                serenity::GuildId::new(9001),
+                Duration::from_secs(1),
+                true,
+            )
+            .await;
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "provider/runtime playback stats must not panic when persisted counters are already at u64::MAX"
+        );
+
+        let after = reloaded.get_guild_settings(9001).await;
+        assert_eq!(after.total_songs_played, u64::MAX);
+        assert_eq!(after.total_listening_seconds, u64::MAX);
+        cleanup_db(&path).await;
+        Ok(())
+    }
 }

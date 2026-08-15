@@ -115,7 +115,7 @@ pub fn parse_related_video(
     if !first(&short_view_count) {
         let rvs_details_index = rvs_params
             .iter()
-            .map(|x| serde_qs::from_str::<QueryParams>(x).unwrap())
+            .filter_map(|x| serde_qs::from_str::<QueryParams>(x).ok())
             .position(|r| {
                 r.id == *details
                     .get("videoId")
@@ -845,4 +845,35 @@ pub fn get_chapters(info: &Value) -> Option<Vec<Chapter>> {
             })
             .collect::<Vec<Chapter>>(),
     )
+}
+
+#[cfg(test)]
+mod related_video_args_tests {
+    use super::parse_related_video;
+    use serde_json::json;
+
+    fn details() -> serde_json::Map<String, serde_json::Value> {
+        json!({
+            "videoId": "abc123",
+            "title": {"simpleText": "Example"},
+            "viewCountText": {"simpleText": "No views"},
+            "shortViewCountText": {"simpleText": "No views"}
+        })
+        .as_object()
+        .expect("fixture must be an object")
+        .clone()
+    }
+
+    #[test]
+    fn valid_related_video_args_control_is_parsed() {
+        let params = ["id=abc123&short_view_count_text=17%20views&length_seconds=42"];
+        let video = parse_related_video(&details(), &params).expect("valid fixture should parse");
+        assert_eq!(video.short_view_count_text, "17");
+    }
+
+    #[test]
+    fn malformed_related_video_args_do_not_panic() {
+        let params = ["id=abc123"];
+        assert!(parse_related_video(&details(), &params).is_some());
+    }
 }

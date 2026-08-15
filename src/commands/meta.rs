@@ -116,101 +116,93 @@ pub async fn help(
     Ok(())
 }
 
-/// Reload the configuration and clear all caches.
+/// Reload settings that are safe to change without replacing process-global runtime state.
 #[poise::command(slash_command, prefix_command)]
 pub async fn reload(ctx: Context<'_>) -> Result<(), Error> {
-    let owner_id = {
-        let config = ctx.data().config.load();
-        config.bot.owner
-    };
-
-    let author_id = ctx.author().id.get();
-    let mut is_allowed = author_id == owner_id;
-
-    if !is_allowed
-        && let Some(guild_id) = ctx.guild_id()
-        && let Ok(member) = guild_id.member(ctx, ctx.author().id).await
-        && let Some(guild) = ctx.guild()
-    {
-        let permissions = guild.member_permissions(&member);
-        if permissions.administrator() {
-            is_allowed = true;
-        }
-    }
-
-    if !is_allowed {
+    let current = ctx.data().config();
+    if !reload_authorized(ctx.author().id.get(), current.bot.owner) {
         return Err(crate::utils::SerenyaError::Permission(
-            "This command is restricted to the bot owner or server administrators.".into(),
-        )
-        .into());
+            "This command is restricted to the bot owner because it changes process-wide configuration.".into(),
+        ).into());
     }
 
     ctx.defer().await?;
-
-    let new_config = std::sync::Arc::new(crate::config::load_config("config.yml").await?);
-    let old_prefix = {
-        let current = ctx.data().config.load();
-        current.bot.prefix.clone()
-    };
-    let new_prefix = new_config.bot.prefix.clone();
-    tracing::info!(
-        "config_reload old_prefix={} new_prefix={}",
-        old_prefix,
-        new_prefix
-    );
-
-    crate::logging::register_secret_to_redact(&new_config.bot.token);
-    if let Some(ref cookie) = new_config.spotify.sp_dc {
-        crate::logging::register_secret_to_redact(cookie);
-    }
-    if let Some(ref url) = new_config.logging.webhook_url {
-        crate::logging::register_secret_to_redact(url);
-    }
-    if let Some(ref url) = new_config.bot.log_webhook_url {
-        crate::logging::register_secret_to_redact(url);
-    }
-
-    let resolver_config = new_config.resolver.clone();
-    let token_changed = {
-        let current = ctx.data().config.load();
-        current.bot.token != new_config.bot.token
-    };
-
-    {
-        ctx.data().config.store(new_config.clone());
-    }
-
-    crate::audio::runtime::configure(
-        &resolver_config,
-        &new_config.spotify,
-        new_config.playback.max_playlist_import,
-    );
-    let (metadata_len, stream_len) = crate::audio::source::clear_caches();
-
-    let restart_note = if token_changed {
-        "Changed bot.token value requires a process restart."
-    } else {
-        "No restart-only bot fields changed (prefix updated dynamically)."
-    };
+    let requested = crate::config::load_config("config.yml").await?;
+    let applied = std::sync::Arc::new(build_hot_reload_config(&current, requested));
+    let old_prefix = current.bot.prefix.clone();
+    let new_prefix = applied.bot.prefix.clone();
+    ctx.data().config.store(applied);
+    tracing::info!(old_prefix, new_prefix, "Applied safe hot-reload settings");
 
     let embed = poise::serenity_prelude::CreateEmbed::new()
         .title("🔄 System Reload Complete")
-        .description("`config.yml` has been hot reloaded and resolver settings were applied.")
-        .field("Config File", "`config.yml` reloaded", true)
-        .field("Resolver Runtime", "Limits and timeouts applied", true)
-        .field(
-            "Metadata Cache",
-            format!("Cleared **{}** entries", metadata_len),
-            true,
-        )
-        .field(
-            "Stream URL Cache",
-            format!("Cleared **{}** entries", stream_len),
-            true,
-        )
-        .field("Restart Note", restart_note, false)
+        .description("Safe runtime settings were applied. Resolver, Spotify, logging, token, and resolver-backed playlist limits remain unchanged until restart.")
+        .field("Live", "Prefix, voice retention, queue limits, announcements, metadata", false)
+        .field("Restart required", "Bot token, logging, Spotify, resolver limits/timeouts/caches, playlist import runtime", false)
         .color(0x3498DB);
-
     ctx.send(poise::CreateReply::default().embed(embed)).await?;
     Ok(())
+}
+
+fn reload_authorized(author_id: u64, owner_id: u64) -> bool {
+    author_id == owner_id
+}
+
+fn build_hot_reload_config(
+    current: &crate::config::BotConfig,
+    mut requested: crate::config::BotConfig,
+) -> crate::config::BotConfig {
+    requested.bot.token = current.bot.token.clone();
+    requested.bot.log_webhook_url = current.bot.log_webhook_url.clone();
+    requested.logging = current.logging.clone();
+    requested.spotify = current.spotify.clone();
+    requested.resolver = current.resolver.clone();
+    requested.playback.max_playlist_import = current.playback.max_playlist_import;
+    requested
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::{build_hot_reload_config, reload_authorized};
+    use crate::config::BotConfig;
+
+    fn example_config() -> BotConfig {
+        serde_saphyr::from_str(include_str!("../../config.example.yml")).unwrap()
+    }
+
+    #[test]
+    fn only_bot_owner_can_hot_reload_process_configuration() {
+        assert!(reload_authorized(10, 10));
+        assert!(!reload_authorized(11, 10));
+    }
+
+    #[test]
+    fn hot_reload_preserves_restart_only_sections() {
+        let current = example_config();
+        let mut requested = current.clone();
+        requested.bot.prefix = "new!".to_owned();
+        requested.bot.token = "different-token".to_owned();
+        requested.playback.stay_in_voice = !current.playback.stay_in_voice;
+        requested.playback.max_playlist_import = current.playback.max_playlist_import + 10;
+        requested.resolver.max_concurrent_ytdlp = current.resolver.max_concurrent_ytdlp + 10;
+        requested.spotify.market = "ZZ".to_owned();
+        requested.logging.level = "trace".to_owned();
+        let applied = build_hot_reload_config(&current, requested);
+        assert_eq!(applied.bot.prefix, "new!");
+        assert_ne!(
+            applied.playback.stay_in_voice,
+            current.playback.stay_in_voice
+        );
+        assert_eq!(applied.bot.token, current.bot.token);
+        assert_eq!(
+            applied.playback.max_playlist_import,
+            current.playback.max_playlist_import
+        );
+        assert_eq!(
+            applied.resolver.max_concurrent_ytdlp,
+            current.resolver.max_concurrent_ytdlp
+        );
+        assert_eq!(applied.spotify.market, current.spotify.market);
+        assert_eq!(applied.logging.level, current.logging.level);
+    }
 }

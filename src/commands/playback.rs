@@ -1,7 +1,8 @@
 use poise::serenity_prelude as serenity;
 
-use crate::audio::{ResolvedInput, TrackEndHandler, TrackErrorHandler, resolve_input};
+use crate::audio::{ResolvedInput, resolve_input};
 use crate::core::{GuildPlayer, PlaybackStatus, Track};
+use crate::discord::embeds::QueueTrackSnapshot;
 use crate::utils::{Context, Error, SerenyaError};
 
 /// Play a song or playlist.
@@ -13,12 +14,11 @@ pub async fn play(
     #[rest]
     query: String,
 ) -> Result<(), Error> {
-    tracing::info!("Play invoked: query={:?}", query);
+    tracing::info!(query = %query, "Play invoked");
     let guild_id = ctx
         .guild_id()
         .ok_or_else(|| SerenyaError::Config("This command can only be used in a server.".into()))?;
 
-    // 1. Defer immediately to prevent Discord interaction timeout (3s deadline)
     ctx.defer().await?;
 
     let user_channel_id = {
@@ -34,43 +34,23 @@ pub async fn play(
             })?
     };
 
-    let manager = songbird::get(ctx.serenity_context())
-        .await
-        .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
-        .clone();
-
-    // 3. Resolve input + auto-join voice channel in parallel
     let user_id = ctx.author().id.get();
-    let db_ref = &ctx.data().database;
-    let http_ref = &ctx.data().http_client;
-    tracing::info!("Joining voice channel: {:?}", user_channel_id);
-    let (call_result, resolved) = tokio::join!(
-        async {
-            if let Some(call) = manager.get(guild_id) {
-                tracing::info!("Already connected to voice");
-                Ok::<_, SerenyaError>(call)
-            } else {
-                tracing::info!("Voice connect start: joining channel {:?}", user_channel_id);
-                let call = manager.join(guild_id, user_channel_id).await.map_err(|e| {
-                    SerenyaError::Voice(format!("Failed to join voice channel: {}", e))
-                })?;
-                tracing::info!("Voice connect complete: channel {:?}", user_channel_id);
-                let _ = crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await;
-                Ok(call)
-            }
-        },
-        resolve_input(&query, user_id, db_ref, http_ref)
-    );
-    let call_lock = call_result?;
-    let resolved = resolved?;
+    let resolved = resolve_input(
+        &query,
+        user_id,
+        &ctx.data().database,
+        &ctx.data().http_client,
+    )
+    .await?;
 
     match resolved {
         ResolvedInput::Playlist(tracks) => {
-            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, tracks).await?;
+            ensure_play_voice(ctx, guild_id, user_channel_id).await?;
+            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, tracks).await?;
         }
         ResolvedInput::Track(track) => {
-            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, vec![*track])
-                .await?;
+            ensure_play_voice(ctx, guild_id, user_channel_id).await?;
+            enqueue_and_play_resolved(ctx, guild_id, user_channel_id, vec![*track]).await?;
         }
         ResolvedInput::SearchResults(mut candidates) => {
             let select_menu = crate::commands::info::build_search_menu(ctx.id(), &candidates);
@@ -97,10 +77,12 @@ pub async fn play(
                 let selected_idx: usize = selected_idx_str
                     .parse()
                     .map_err(|_| SerenyaError::Audio("Invalid selection index.".into()))?;
+                if selected_idx >= candidates.len() {
+                    return Err(SerenyaError::Audio("Selection index out of range.".into()).into());
+                }
 
                 let selected_track = candidates.remove(selected_idx);
-
-                let _ = interaction
+                interaction
                     .create_response(
                         &ctx.serenity_context().http,
                         serenity::CreateInteractionResponse::UpdateMessage(
@@ -109,7 +91,7 @@ pub async fn play(
                                 .components(vec![]),
                         ),
                     )
-                    .await;
+                    .await?;
 
                 let tracks = if is_metadata_search_option(&selected_track) {
                     resolve_input(
@@ -124,22 +106,97 @@ pub async fn play(
                     vec![selected_track]
                 };
 
-                enqueue_and_play_resolved(ctx, guild_id, user_channel_id, call_lock, tracks)
-                    .await?;
+                ensure_play_voice(ctx, guild_id, user_channel_id).await?;
+                enqueue_and_play_resolved(ctx, guild_id, user_channel_id, tracks).await?;
             } else {
-                let _ = msg_inner
+                msg_inner
                     .edit(
                         &ctx.serenity_context().http,
                         serenity::EditMessage::new()
                             .content("⏱️ Play selection timed out.")
                             .components(vec![]),
                     )
-                    .await;
+                    .await?;
             }
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingVoiceAction {
+    Join,
+    Reuse,
+    RejectDifferentChannel,
+}
+
+fn existing_voice_action(bot_channel: Option<u64>, user_channel: u64) -> ExistingVoiceAction {
+    match bot_channel {
+        None => ExistingVoiceAction::Join,
+        Some(channel) if channel == user_channel => ExistingVoiceAction::Reuse,
+        Some(_) => ExistingVoiceAction::RejectDifferentChannel,
+    }
+}
+
+async fn join_then_configure_voice<J, JFut, C, CFut, E>(join: J, configure: C) -> Result<(), E>
+where
+    J: FnOnce() -> JFut,
+    JFut: std::future::Future<Output = Result<(), E>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    join().await?;
+    if let Err(err) = configure().await {
+        tracing::warn!(%err, "Failed to apply voice bitrate after successful join");
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_play_voice(
+    ctx: Context<'_>,
+    guild_id: serenity::GuildId,
+    user_channel_id: serenity::ChannelId,
+) -> Result<(), Error> {
+    let manager = songbird::get(ctx.serenity_context())
+        .await
+        .ok_or_else(|| SerenyaError::Voice("Songbird manager not initialized.".into()))?
+        .clone();
+
+    let existing_channel = if let Some(call_lock) = manager.get(guild_id) {
+        let call = call_lock.lock().await;
+        call.current_channel().map(|channel| channel.0.get())
+    } else {
+        None
+    };
+
+    match existing_voice_action(existing_channel, user_channel_id.get()) {
+        ExistingVoiceAction::Reuse => Ok(()),
+        ExistingVoiceAction::RejectDifferentChannel => Err(SerenyaError::Voice(
+            "Bot is already connected to a different voice channel in this server. Use /join from your channel to move it explicitly."
+                .into(),
+        )
+        .into()),
+        ExistingVoiceAction::Join => {
+            let join_manager = manager.clone();
+            join_then_configure_voice(
+                move || async move {
+                    join_manager
+                        .join(guild_id, user_channel_id)
+                        .await
+                        .map(|_| ())
+                        .map_err(|err| -> Error {
+                            SerenyaError::Voice(format!("Failed to join voice channel: {err}")).into()
+                        })
+                },
+                move || async move {
+                    crate::audio::quality::apply_bitrate(ctx, guild_id, user_channel_id).await
+                },
+            )
+            .await
+        }
+    }
 }
 
 fn is_metadata_search_option(track: &Track) -> bool {
@@ -148,20 +205,68 @@ fn is_metadata_search_option(track: &Track) -> bool {
         || track.source_provider.starts_with("Apple Music")
 }
 
+#[derive(Debug)]
+struct EnqueuePreparation {
+    start_playback: bool,
+    added_to_queue: usize,
+    first_track: Track,
+}
+
+fn prepare_enqueue(
+    player: &mut GuildPlayer,
+    mut tracks: Vec<Track>,
+    max_queue_size: usize,
+    requester_name: std::sync::Arc<str>,
+) -> Result<EnqueuePreparation, SerenyaError> {
+    if tracks.is_empty() {
+        return Err(SerenyaError::Queue("No tracks found to enqueue.".into()));
+    }
+
+    for track in &mut tracks {
+        track.requester_name = Some(requester_name.clone());
+    }
+
+    let can_start = player.now_playing.is_none()
+        && matches!(
+            player.playback_status,
+            PlaybackStatus::Idle | PlaybackStatus::Stopped
+        );
+
+    if can_start {
+        let first_track = tracks.remove(0);
+        player.now_playing = Some(first_track.clone());
+        player.current_track_handle = None;
+        player.playback_status = PlaybackStatus::Idle;
+        let added_to_queue = player.queue.push_batch(tracks, max_queue_size)?;
+        Ok(EnqueuePreparation {
+            start_playback: true,
+            added_to_queue,
+            first_track,
+        })
+    } else {
+        let first_track = tracks[0].clone();
+        let added_to_queue = player.queue.push_batch(tracks, max_queue_size)?;
+        Ok(EnqueuePreparation {
+            start_playback: false,
+            added_to_queue,
+            first_track,
+        })
+    }
+}
+
 pub(crate) async fn enqueue_and_play_resolved(
     ctx: Context<'_>,
     guild_id: serenity::GuildId,
     user_channel_id: serenity::ChannelId,
-    call_lock: std::sync::Arc<tokio::sync::Mutex<songbird::Call>>,
-    mut tracks: Vec<Track>,
+    tracks: Vec<Track>,
 ) -> Result<(), Error> {
     if tracks.is_empty() {
         ctx.say("No tracks found to play.").await?;
         return Ok(());
     }
+
     let requested_track_count = tracks.len();
     let show_queue_after_enqueue = requested_track_count > 1;
-
     let player_lock = ctx
         .data()
         .guild_players
@@ -169,325 +274,45 @@ pub(crate) async fn enqueue_and_play_resolved(
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(GuildPlayer::new())))
         .clone();
 
-    tracing::info!("Getting guild player write lock");
-    let mut player = player_lock.write().await;
-    tracing::info!("Guild player write lock acquired");
-    player.voice_channel = Some(user_channel_id);
-    player.announce_channel = Some(ctx.channel_id());
-
-    let config = ctx.data().config();
-    let max_queue_size = config.playback.max_queue_size;
-
-    let can_play = player.now_playing.is_none()
-        && (player.playback_status == PlaybackStatus::Idle
-            || player.playback_status == PlaybackStatus::Stopped);
-    if can_play {
-        let mut first_track = tracks.remove(0);
+    let preparation = {
+        let mut player = player_lock.write().await;
+        player.voice_channel = Some(user_channel_id);
+        player.announce_channel = Some(ctx.channel_id());
         let requester_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
-        first_track.requester_name = Some(requester_name.clone());
+        prepare_enqueue(
+            &mut player,
+            tracks,
+            ctx.data().config().playback.max_queue_size,
+            requester_name,
+        )?
+    };
 
-        // Fix: set requester_name for all remaining tracks before queuing
-        for t in &mut tracks {
-            t.requester_name = Some(requester_name.clone());
-        }
-
-        player.now_playing = Some(first_track.clone());
-        player.playback_status = PlaybackStatus::Playing;
-
-        let added = player.queue.push_batch(tracks, max_queue_size)?;
-
-        // Spawn background play resolution task
-        let player_lock_clone = player_lock.clone();
-        let call_lock_clone = call_lock.clone();
-        let http_client_clone = ctx.data().http_client.clone();
-        let database_clone = ctx.data().database.clone();
-        let guild_players_clone = ctx.data().guild_players.clone();
-        let serenity_ctx_clone = ctx.serenity_context().clone();
-        let config_clone = ctx.data().config();
-        let first_track_clone = first_track.clone();
-
+    if preparation.start_playback {
+        let playback_ctx = crate::audio::events::PlaybackContext {
+            guild_id,
+            database: std::sync::Arc::clone(&ctx.data().database),
+            guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+            http_client: ctx.data().http_client.clone(),
+            serenity_ctx: ctx.serenity_context().clone(),
+            config: std::sync::Arc::clone(&ctx.data().config),
+        };
+        let player_lock_for_error = player_lock.clone();
         tokio::spawn(async move {
-            let original_url = first_track_clone.url.clone();
-            let mut current_track = first_track_clone;
-
-            if current_track.url.starts_with("ytsearch1:") {
-                if let Err(e) = crate::audio::resolver::resolve_ytsearch_track(
-                    &mut current_track,
-                    &http_client_clone,
-                )
-                .await
+            if let Err(err) = crate::audio::events::play_next(playback_ctx, None, false).await {
+                tracing::error!(guild_id = %guild_id, %err, "Failed to start playback");
+                let mut player = player_lock_for_error.write().await;
+                if player.current_track_handle.is_none()
+                    && player.playback_status == PlaybackStatus::Idle
                 {
-                    tracing::error!("Failed to resolve Spotify track search: {:?}", e);
-                } else {
-                    let mut player = player_lock_clone.write().await;
-                    if player.playback_status == PlaybackStatus::Playing
-                        && let Some(ref mut np) = player.now_playing
-                        && np.url == original_url
-                    {
-                        *np = current_track.clone();
+                    if let Some(mut failed) = player.now_playing.take() {
+                        failed.resolved_url = None;
+                        player.previous_track = Some(failed);
                     }
+                    player.failure_state.reset();
                 }
             }
-
-            let stream_res = crate::audio::extract_stream_url_for_guild(
-                guild_id.get(),
-                &current_track.url,
-                &http_client_clone,
-            )
-            .await;
-
-            // 2. Race condition check: check if player was reset/stopped/skipped while resolving
-            {
-                let player = player_lock_clone.read().await;
-                if player.playback_status == PlaybackStatus::Idle || player.now_playing.is_none() {
-                    tracing::info!(
-                        "Player was stopped or reset while resolving stream URL, aborting playback"
-                    );
-                    return;
-                }
-                if let Some(ref current) = player.now_playing
-                    && current.url != current_track.url
-                    && current.url != original_url
-                {
-                    tracing::info!(
-                        "Track was skipped or changed while resolving stream URL, aborting playback"
-                    );
-                    return;
-                }
-            }
-
-            let resolved_url = match stream_res {
-                Ok(resolved_url) => resolved_url,
-                Err(e) => {
-                    tracing::warn!(
-                        guild_id = %guild_id,
-                        track = %current_track.title,
-                        "Failed to resolve stream URL: {:?}",
-                        e
-                    );
-
-                    let announce_channel = {
-                        let mut player = player_lock_clone.write().await;
-                        player.consecutive_errors += 1;
-                        if player.now_playing.as_ref().map(|current| &*current.url)
-                            == Some(&*current_track.url)
-                        {
-                            player.now_playing = None;
-                            player.current_track_handle = None;
-                            player.playback_status = PlaybackStatus::Idle;
-                        }
-                        player.announce_channel
-                    };
-
-                    if let Some(channel) = announce_channel {
-                        let _ = channel
-                            .say(
-                                &serenity_ctx_clone.http,
-                                format!(
-                                    "⚠️ Could not resolve **{}**. Trying the next track.",
-                                    current_track.title
-                                ),
-                            )
-                            .await;
-                    }
-
-                    if let Err(next_err) = crate::audio::events::play_next(
-                        crate::audio::events::PlaybackContext {
-                            guild_id,
-                            database: std::sync::Arc::clone(&database_clone),
-                            guild_players: std::sync::Arc::clone(&guild_players_clone),
-                            http_client: http_client_clone.clone(),
-                            serenity_ctx: serenity_ctx_clone.clone(),
-                            config: config_clone.clone(),
-                        },
-                        None,
-                        true,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            guild_id = %guild_id,
-                            "Failed to continue after stream resolution error: {:?}",
-                            next_err
-                        );
-                    }
-                    return;
-                }
-            };
-
-            let eight_d_enabled = {
-                let player = player_lock_clone.read().await;
-                player.eight_d_enabled
-            };
-            let source = match crate::audio::source::create_stream_input(
-                Some(current_track.url.to_string()),
-                &resolved_url,
-                eight_d_enabled,
-            )
-            .await
-            {
-                Ok(source) => source,
-                Err(err) => {
-                    tracing::error!(guild_id = %guild_id, %err, "Failed to create audio input");
-                    return;
-                }
-            };
-
-            let mut call = call_lock_clone.lock().await;
-            let handle = call.play_input(source);
-            tracing::info!("Playback started for track: {:?}", current_track.title);
-
-            let playback_ctx = crate::audio::events::PlaybackContext {
-                guild_id,
-                database: database_clone.clone(),
-                guild_players: guild_players_clone.clone(),
-                http_client: http_client_clone.clone(),
-                serenity_ctx: serenity_ctx_clone.clone(),
-                config: config_clone.clone(),
-            };
-
-            let _ = handle.add_event(
-                songbird::Event::Track(songbird::TrackEvent::End),
-                TrackEndHandler {
-                    ctx: playback_ctx.clone(),
-                },
-            );
-            let _ = handle.add_event(
-                songbird::Event::Track(songbird::TrackEvent::Error),
-                TrackErrorHandler { ctx: playback_ctx },
-            );
-
-            let mut player = player_lock_clone.write().await;
-            // Check race condition again
-            if player.playback_status == PlaybackStatus::Playing
-                && let Some(ref mut current) = player.now_playing
-                && (current.url == current_track.url || current.url == original_url)
-            {
-                current.resolved_url = Some(std::sync::Arc::new(resolved_url));
-                player.current_track_handle = Some(handle);
-                crate::audio::events::schedule_prefetch(
-                    guild_id,
-                    guild_players_clone.clone(),
-                    current_track.duration,
-                    http_client_clone.clone(),
-                );
-
-                let announce_channel = player.announce_channel;
-                let track_for_ann = current_track.clone();
-                let db_for_ann = database_clone.clone();
-                let ctx_for_ann = serenity_ctx_clone.clone();
-                let cfg_for_ann = config_clone.clone();
-
-                tokio::spawn(async move {
-                    let announce_setting = db_for_ann
-                        .get_guild_settings(guild_id.get())
-                        .await
-                        .announce_track;
-
-                    if announce_setting && let Some(channel) = announce_channel {
-                        let embed = crate::discord::embeds::now_playing_announce_embed(
-                            &track_for_ann,
-                            &cfg_for_ann,
-                        );
-                        let _ = channel
-                            .send_message(
-                                &ctx_for_ann.http,
-                                serenity::CreateMessage::new()
-                                    .embed(embed)
-                                    .flags(serenity::MessageFlags::SUPPRESS_NOTIFICATIONS),
-                            )
-                            .await;
-                    }
-                });
-
-                return;
-            }
-            let _ = handle.stop();
         });
-
-        // Drop player lock BEFORE sending response to allow background task to start immediately!
-        drop(player);
-
-        if show_queue_after_enqueue {
-            let queue_tracks = queue_snapshot(&player_lock).await;
-            crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue")
-                .await?;
-        } else if added > 0 {
-            let mut embed = crate::discord::embeds::minimal_track_added_embed(
-                &first_track,
-                &ctx.data().config(),
-            );
-            embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
-                "Enqueued {} other tracks.",
-                added
-            )));
-            let reply = poise::CreateReply::default().embed(embed);
-            ctx.send(reply).await?;
-        } else {
-            let embed = crate::discord::embeds::minimal_track_added_embed(
-                &first_track,
-                &ctx.data().config(),
-            );
-            let reply = poise::CreateReply::default().embed(embed);
-            ctx.send(reply).await?;
-        }
-    } else {
-        let track_count = tracks.len();
-        let first_title = tracks.first().map(|t| t.title.clone()).unwrap_or_default();
-
-        let requester_name: std::sync::Arc<str> = std::sync::Arc::from(ctx.author().name.as_str());
-        for t in &mut tracks {
-            t.requester_name = Some(requester_name.clone());
-            tracing::info!("Queueing track: {:?}", t.title);
-        }
-
-        let added = player.queue.push_batch(tracks, max_queue_size)?;
-        tracing::info!("Track enqueued: count={}", added);
-
-        if added == 0 {
-            drop(player);
-            let embed =
-                crate::discord::embeds::error_embed("Queue is full! Could not add any tracks.");
-            let reply = poise::CreateReply::default().embed(embed);
-            ctx.send(reply).await?;
-        } else if show_queue_after_enqueue {
-            let mut queue_tracks = Vec::new();
-            if let Some(ref np) = player.now_playing {
-                queue_tracks.push(np.clone());
-            }
-            queue_tracks.extend(player.queue.iter().cloned());
-            drop(player);
-            crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue")
-                .await?;
-        } else if added == 1 && track_count == 1 {
-            let queue_pos = player.queue.len();
-            let track_opt = player.queue.get(queue_pos - 1).cloned();
-            drop(player);
-            if let Some(track) = track_opt {
-                let embed = crate::discord::embeds::track_added_embed(
-                    &track,
-                    queue_pos,
-                    &ctx.data().config(),
-                );
-                let reply = poise::CreateReply::default().embed(embed);
-                ctx.send(reply).await?;
-            } else {
-                ctx.say(format!("📝 **Enqueued:** {}", first_title)).await?;
-            }
-        } else {
-            drop(player);
-            let embed = serenity::CreateEmbed::new()
-                .title("📝 Tracks Enqueued")
-                .description(format!(
-                    "Successfully enqueued **{}** tracks to the queue.",
-                    added
-                ))
-                .color(0x57F287);
-            let reply = poise::CreateReply::default().embed(embed);
-            ctx.send(reply).await?;
-        }
-
-        // Trigger prefetching in case it's the next track
+    } else if preparation.added_to_queue > 0 {
         let gp_clone = ctx.data().guild_players.clone();
         let http_client_clone = ctx.data().http_client.clone();
         tokio::spawn(async move {
@@ -495,18 +320,52 @@ pub(crate) async fn enqueue_and_play_resolved(
         });
     }
 
+    if preparation.added_to_queue == 0 && !preparation.start_playback {
+        let embed = crate::discord::embeds::error_embed("Queue is full! Could not add any tracks.");
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+        return Ok(());
+    }
+
+    if show_queue_after_enqueue {
+        let queue_tracks = queue_snapshot(&player_lock).await;
+        crate::discord::pagination::paginate_queue(ctx, &queue_tracks, "🎶 Current Queue").await?;
+    } else if preparation.start_playback {
+        let mut embed = crate::discord::embeds::minimal_track_added_embed(
+            &preparation.first_track,
+            &ctx.data().config(),
+        );
+        if preparation.added_to_queue > 0 {
+            embed = embed.footer(serenity::CreateEmbedFooter::new(format!(
+                "Enqueued {} other tracks.",
+                preparation.added_to_queue
+            )));
+        }
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    } else {
+        let queue_pos = {
+            let player = player_lock.read().await;
+            player.queue.len()
+        };
+        let embed = crate::discord::embeds::track_added_embed(
+            &preparation.first_track,
+            queue_pos,
+            &ctx.data().config(),
+        );
+        ctx.send(poise::CreateReply::default().embed(embed)).await?;
+    }
+
     Ok(())
 }
 
 async fn queue_snapshot(
     player_lock: &std::sync::Arc<tokio::sync::RwLock<GuildPlayer>>,
-) -> Vec<Track> {
+) -> Vec<QueueTrackSnapshot> {
     let player = player_lock.read().await;
     let mut tracks = Vec::new();
     if let Some(ref np) = player.now_playing {
-        tracks.push(np.clone());
+        tracks.push(QueueTrackSnapshot::from(np));
     }
-    tracks.extend(player.queue.iter().cloned());
+    tracks.extend(player.queue.iter().map(QueueTrackSnapshot::from));
     tracks
 }
 
@@ -647,6 +506,13 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
         .get(&guild_id)
         .map(|r| r.value().clone())
         .ok_or_else(|| SerenyaError::NotFound("No player active in this server.".into()))?;
+
+    crate::audio::events::finalize_interrupted_playback_stats(
+        ctx.data().database.as_ref(),
+        guild_id,
+        &player_lock,
+    )
+    .await;
 
     let handle_opt = {
         let mut player = player_lock.write().await;
@@ -844,26 +710,181 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
 
         let embed =
             crate::discord::embeds::playback_status_embed("⏭️ Skip", "Skipping track...", 0x5865F2);
-        ctx.send(poise::CreateReply::default().embed(embed)).await?;
-
-        if let Some(handle) = handle_opt {
-            let _ = handle.stop();
-        } else {
-            crate::audio::events::play_next(
-                crate::audio::events::PlaybackContext {
-                    guild_id,
-                    database: std::sync::Arc::clone(&ctx.data().database),
-                    guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
-                    http_client: ctx.data().http_client.clone(),
-                    serenity_ctx: ctx.serenity_context().clone(),
-                    config: ctx.data().config(),
-                },
-                None,
-                true,
-            )
-            .await?;
-        }
+        let playback_ctx = crate::audio::events::PlaybackContext {
+            guild_id,
+            database: std::sync::Arc::clone(&ctx.data().database),
+            guild_players: std::sync::Arc::clone(&ctx.data().guild_players),
+            http_client: ctx.data().http_client.clone(),
+            serenity_ctx: ctx.serenity_context().clone(),
+            config: std::sync::Arc::clone(&ctx.data().config),
+        };
+        crate::commands::control::run_control_transition(
+            async {
+                ctx.send(poise::CreateReply::default().embed(embed)).await?;
+                Ok::<(), Error>(())
+            },
+            async move {
+                if let Some(handle) = handle_opt {
+                    let _ = handle.stop();
+                } else {
+                    crate::audio::events::play_next(playback_ctx, None, true).await?;
+                }
+                Ok::<(), Error>(())
+            },
+        )
+        .await?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::{ExistingVoiceAction, existing_voice_action, prepare_enqueue};
+    use crate::core::{GuildPlayer, PlaybackStatus, SourceType, Track};
+    use poise::serenity_prelude as serenity;
+    use std::sync::Arc;
+
+    fn track(title: &str) -> Track {
+        Track {
+            title: title.into(),
+            url: format!("https://example.com/{title}").into(),
+            duration: Some(std::time::Duration::from_secs(180)),
+            requester_id: serenity::UserId::new(1),
+            requester_name: None,
+            source_type: SourceType::Url,
+            resolved_url: None,
+            thumbnail: None,
+            source_provider: Arc::from("test"),
+        }
+    }
+
+    #[test]
+    fn existing_voice_reuses_only_the_same_channel() {
+        assert_eq!(existing_voice_action(None, 20), ExistingVoiceAction::Join);
+        assert_eq!(
+            existing_voice_action(Some(20), 20),
+            ExistingVoiceAction::Reuse
+        );
+        assert_eq!(
+            existing_voice_action(Some(10), 20),
+            ExistingVoiceAction::RejectDifferentChannel
+        );
+    }
+
+    #[test]
+    fn idle_enqueue_never_claims_playing_before_a_handle_exists() {
+        let mut player = GuildPlayer::new();
+        let prepared = prepare_enqueue(
+            &mut player,
+            vec![track("one"), track("two")],
+            100,
+            Arc::from("requester"),
+        )
+        .unwrap();
+
+        assert!(prepared.start_playback);
+        assert!(player.now_playing.is_some());
+        assert_eq!(player.queue.len(), 1);
+        assert_eq!(player.playback_status, PlaybackStatus::Idle);
+        assert!(player.current_track_handle.is_none());
+    }
+
+    #[test]
+    fn active_enqueue_only_extends_the_waiting_queue() {
+        let mut player = GuildPlayer::new();
+        player.now_playing = Some(track("current"));
+        player.playback_status = PlaybackStatus::Playing;
+
+        let prepared = prepare_enqueue(
+            &mut player,
+            vec![track("next")],
+            100,
+            Arc::from("requester"),
+        )
+        .unwrap();
+
+        assert!(!prepared.start_playback);
+        assert_eq!(
+            player.now_playing.as_ref().unwrap().title.as_ref(),
+            "current"
+        );
+        assert_eq!(player.queue.len(), 1);
+    }
+
+    #[test]
+    fn advancing_to_the_next_track_stays_idle_until_a_handle_exists() {
+        let mut player = GuildPlayer::new();
+        player.queue.push(track("next"), 100).unwrap();
+        player.playback_status = PlaybackStatus::Playing;
+        player.advance_queue();
+
+        assert!(player.now_playing.is_some());
+        assert_eq!(player.playback_status, PlaybackStatus::Idle);
+        assert!(player.current_track_handle.is_none());
+    }
+}
+
+#[cfg(test)]
+mod post_join_voice_configuration_tests {
+    use super::join_then_configure_voice;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn bitrate_failure_after_successful_join_is_nonfatal() {
+        let joined = Arc::new(AtomicBool::new(false));
+        let configured = Arc::new(AtomicBool::new(false));
+        let joined_for_task = Arc::clone(&joined);
+        let configured_for_task = Arc::clone(&configured);
+
+        let result = join_then_configure_voice(
+            move || async move {
+                joined_for_task.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+            move || async move {
+                configured_for_task.store(true, Ordering::SeqCst);
+                Err::<(), &'static str>("guild cache unavailable")
+            },
+        )
+        .await;
+
+        assert!(
+            joined.load(Ordering::SeqCst),
+            "voice join must have completed"
+        );
+        assert!(
+            configured.load(Ordering::SeqCst),
+            "bitrate configuration must run after a successful join"
+        );
+        assert_eq!(
+            result,
+            Ok(()),
+            "bitrate tuning is auxiliary; a failure after a successful join must not abort /play and leave the connection orphaned"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_failure_remains_fatal_and_skips_bitrate_configuration() {
+        let configured = Arc::new(AtomicBool::new(false));
+        let configured_for_task = Arc::clone(&configured);
+
+        let result = join_then_configure_voice(
+            || async { Err::<(), &'static str>("join failed") },
+            move || async move {
+                configured_for_task.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            },
+        )
+        .await;
+
+        assert_eq!(result, Err("join failed"));
+        assert!(
+            !configured.load(Ordering::SeqCst),
+            "bitrate configuration must not run when the voice join itself failed"
+        );
+    }
 }

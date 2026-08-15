@@ -1,8 +1,8 @@
 use crate::{
-    InnerTubeClient, ResolveContext, ResolveError, ResolvedStream, create_android_client,
-    create_android_vr_client, create_ios_client, create_tvhtml5_client, create_web_safari_client,
-    format_selector, get_or_fetch_session, js_solver, resolve_best_audio_stream_rusty_ytdl,
-    stream_probe,
+    BaseInnerTubeClient, InnerTubeClient, ResolveContext, ResolveError, ResolvedStream,
+    create_android_client, create_android_vr_client, create_ios_client, create_tvhtml5_client,
+    create_visionos_client, create_web_safari_client, format_selector, get_or_fetch_session,
+    js_solver, resolve_best_audio_stream_rusty_ytdl, stream_probe,
 };
 
 pub async fn probe_resolved_stream_health(
@@ -22,23 +22,88 @@ pub async fn probe_resolved_stream_health(
     .await
 }
 
+fn ordered_clients() -> Vec<BaseInnerTubeClient> {
+    vec![
+        create_visionos_client(),
+        create_android_vr_client(),
+        create_tvhtml5_client(None),
+        create_web_safari_client(),
+        create_ios_client(None),
+        create_android_client(None),
+    ]
+}
+
+fn client_is_allowed(context: &ResolveContext, client_name: &str) -> bool {
+    context.excluded_client_kind.as_deref() != Some(client_name)
+}
+
+fn client_requires_gvs_pot(client_name: &str) -> bool {
+    matches!(client_name, "IOS" | "ANDROID" | "WEB" | "WEB_SAFARI")
+}
+
+fn is_googlevideo_stream_url(stream_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(stream_url) else {
+        return false;
+    };
+
+    if parsed.scheme() != "https" {
+        return false;
+    }
+
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+}
+
+fn stream_has_gvs_pot(stream_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(stream_url) else {
+        return false;
+    };
+
+    parsed
+        .query_pairs()
+        .any(|(key, value)| key == "pot" && !value.is_empty())
+}
+
+fn validate_gvs_token_requirement(client_name: &str, stream_url: &str) -> Result<(), ResolveError> {
+    if is_googlevideo_stream_url(stream_url)
+        && client_requires_gvs_pot(client_name)
+        && !stream_has_gvs_pot(stream_url)
+    {
+        tracing::warn!(
+            client = client_name,
+            "Rejecting Googlevideo stream from GVS PO-token-sensitive client without a token"
+        );
+
+        return Err(ResolveError::NotPlayable(format!(
+            "Client {client_name} returned Googlevideo stream without required GVS PO token"
+        )));
+    }
+
+    Ok(())
+}
+
 pub async fn resolve_best_audio_stream_via_api(
     video_id: &str,
     context: &ResolveContext,
 ) -> Result<ResolvedStream, ResolveError> {
     let http_client = &context.http_client;
     let player_url = get_or_fetch_session(http_client).await?.player_url;
-    let clients = vec![
-        create_android_vr_client(),
-        create_web_safari_client(),
-        create_ios_client(None),
-        create_android_client(None),
-        create_tvhtml5_client(None),
-    ];
+    let clients = ordered_clients();
     let mut last_err =
         ResolveError::NotPlayable("All Innertube clients failed to resolve stream".to_string());
 
     for client in clients {
+        if !client_is_allowed(context, client.name()) {
+            tracing::info!(
+                client = client.name(),
+                video_id,
+                "Skipping Innertube client excluded for this retry"
+            );
+            continue;
+        }
         tracing::debug!(
             client = client.name(),
             video_id,
@@ -59,7 +124,34 @@ pub async fn resolve_best_audio_stream(
     if let Ok(stream) = resolve_best_audio_stream_via_api(video_id, context).await {
         return Ok(stream);
     }
-    resolve_best_audio_stream_rusty_ytdl(video_id, context).await
+
+    let stream = resolve_best_audio_stream_rusty_ytdl(video_id, context).await?;
+
+    validate_gvs_token_requirement(&stream.client_kind, &stream.url)?;
+
+    if !client_is_allowed(context, &stream.client_kind) {
+        return Err(ResolveError::NotPlayable(format!(
+            "Fallback resolver returned client {} excluded for this retry",
+            stream.client_kind
+        )));
+    }
+
+    probe_resolved_stream_health(&context.http_client, &stream, 102_400, 50.0)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                client = %stream.client_kind,
+                source = %stream.resolve_source,
+                error = %err,
+                "Fallback resolver stream failed strict access validation"
+            );
+
+            ResolveError::NotPlayable(format!(
+                "Fallback resolver stream failed strict access validation: {err}"
+            ))
+        })?;
+
+    Ok(stream)
 }
 
 async fn try_client(
@@ -125,6 +217,8 @@ async fn validate_stream(
     decrypted_url: String,
     best_format: &rusty_ytdl::StreamingDataFormat,
 ) -> Result<ResolvedStream, ResolveError> {
+    validate_gvs_token_requirement(client.name(), &decrypted_url)?;
+
     let user_agent = client.user_agent();
     let probe = stream_probe::probe_stream_health(
         http_client,
@@ -161,4 +255,116 @@ async fn validate_stream(
         bitrate: best_format.bitrate,
         resolve_source: format!("api_client_{}", client.name().to_lowercase()),
     })
+}
+
+#[cfg(test)]
+mod retry_client_tests {
+    use super::{client_is_allowed, ordered_clients};
+    use crate::{InnerTubeClient, ResolveContext};
+
+    #[test]
+    fn retry_exclusion_skips_only_the_failed_client() {
+        let android_vr_context = ResolveContext {
+            excluded_client_kind: Some("ANDROID_VR".to_owned()),
+            ..Default::default()
+        };
+        assert!(!client_is_allowed(&android_vr_context, "ANDROID_VR"));
+        assert!(client_is_allowed(&android_vr_context, "TVHTML5"));
+        assert!(client_is_allowed(&android_vr_context, "WEB_SAFARI"));
+
+        let tv_context = ResolveContext {
+            excluded_client_kind: Some("TVHTML5".to_owned()),
+            ..Default::default()
+        };
+        assert!(!client_is_allowed(&tv_context, "TVHTML5"));
+    }
+
+    #[test]
+    fn native_client_order_prefers_visionos_before_fallbacks() {
+        let names = ordered_clients()
+            .iter()
+            .map(|client| client.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "VISIONOS",
+                "ANDROID_VR",
+                "TVHTML5",
+                "WEB_SAFARI",
+                "IOS",
+                "ANDROID"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod gvs_token_requirement_tests {
+    use super::validate_gvs_token_requirement;
+
+    const NO_POT: &str = "https://rr1---sn.example.googlevideo.com/videoplayback?itag=251&c=IOS";
+
+    const WITH_POT: &str =
+        "https://rr1---sn.example.googlevideo.com/videoplayback?itag=251&c=IOS&pot=opaque-token";
+
+    const EMPTY_POT: &str =
+        "https://rr1---sn.example.googlevideo.com/videoplayback?itag=251&c=IOS&pot=";
+
+    #[test]
+    fn ios_googlevideo_without_gvs_pot_is_rejected() {
+        assert!(
+            validate_gvs_token_requirement("IOS", NO_POT).is_err(),
+            "BUG #13: IOS Googlevideo without GVS POT must not be accepted as playable"
+        );
+    }
+
+    #[test]
+    fn ios_googlevideo_with_non_empty_gvs_pot_remains_eligible() {
+        assert!(validate_gvs_token_requirement("IOS", WITH_POT).is_ok());
+    }
+
+    #[test]
+    fn empty_gvs_pot_is_equivalent_to_missing_token() {
+        assert!(
+            validate_gvs_token_requirement("IOS", EMPTY_POT).is_err(),
+            "an empty pot query parameter must not satisfy the GVS token requirement"
+        );
+    }
+
+    #[test]
+    fn other_gvs_pot_sensitive_clients_without_token_are_rejected() {
+        for client in ["ANDROID", "WEB", "WEB_SAFARI"] {
+            assert!(
+                validate_gvs_token_requirement(client, NO_POT).is_err(),
+                "{client} Googlevideo stream without GVS POT must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn android_vr_without_pot_is_not_blocked_by_gvs_guard() {
+        assert!(validate_gvs_token_requirement("ANDROID_VR", NO_POT).is_ok());
+    }
+
+    #[test]
+    fn tvhtml5_without_pot_is_not_blocked_by_gvs_guard() {
+        assert!(validate_gvs_token_requirement("TVHTML5", NO_POT).is_ok());
+    }
+
+    #[test]
+    fn googlevideo_lookalike_host_is_not_treated_as_googlevideo() {
+        assert!(
+            validate_gvs_token_requirement(
+                "IOS",
+                "https://googlevideo.com.attacker.example/audio?itag=251"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unrelated_non_googlevideo_url_is_not_blocked_by_ios_guard() {
+        assert!(validate_gvs_token_requirement("IOS", "https://media.example/audio.webm").is_ok());
+    }
 }

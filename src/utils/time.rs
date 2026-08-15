@@ -29,17 +29,29 @@ pub fn parse_duration(input: &str) -> Result<Duration, SerenyaError> {
                     })?;
             }
             'h' | 'H' => {
-                total_secs += current * 3600;
+                total_secs = current
+                    .checked_mul(3600)
+                    .and_then(|component| total_secs.checked_add(component))
+                    .ok_or_else(|| {
+                        SerenyaError::Config(format!("Invalid duration format: {input}"))
+                    })?;
                 current = 0;
                 has_suffix = true;
             }
             'm' | 'M' => {
-                total_secs += current * 60;
+                total_secs = current
+                    .checked_mul(60)
+                    .and_then(|component| total_secs.checked_add(component))
+                    .ok_or_else(|| {
+                        SerenyaError::Config(format!("Invalid duration format: {input}"))
+                    })?;
                 current = 0;
                 has_suffix = true;
             }
             's' | 'S' => {
-                total_secs += current;
+                total_secs = total_secs.checked_add(current).ok_or_else(|| {
+                    SerenyaError::Config(format!("Invalid duration format: {input}"))
+                })?;
                 current = 0;
                 has_suffix = true;
             }
@@ -59,7 +71,9 @@ pub fn parse_duration(input: &str) -> Result<Duration, SerenyaError> {
 
     // Bare trailing number: seconds if suffixes were used, otherwise whole input as seconds
     if current > 0 || !has_suffix {
-        total_secs += current;
+        total_secs = total_secs
+            .checked_add(current)
+            .ok_or_else(|| SerenyaError::Config(format!("Invalid duration format: {input}")))?;
     }
 
     Ok(Duration::from_secs(total_secs))
@@ -123,5 +137,44 @@ mod tests {
     #[test]
     fn zero_is_valid() {
         assert_eq!(parse_duration("0").ok(), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn oversized_hour_duration_returns_error_without_panicking() {
+        let result = std::panic::catch_unwind(|| parse_duration("18446744073709551615h"));
+        assert!(result.is_ok(), "overflowing hour conversion must not panic");
+        assert!(
+            result
+                .expect("duration parser should return normally")
+                .is_err(),
+            "duration larger than u64 seconds must be rejected"
+        );
+    }
+
+    #[test]
+    fn oversized_minute_duration_returns_error_without_panicking() {
+        let result = std::panic::catch_unwind(|| parse_duration("18446744073709551615m"));
+        assert!(
+            result.is_ok(),
+            "overflowing minute conversion must not panic"
+        );
+        assert!(
+            result
+                .expect("duration parser should return normally")
+                .is_err(),
+            "duration larger than u64 seconds must be rejected"
+        );
+    }
+
+    #[test]
+    fn duration_component_sum_overflow_returns_error_without_panicking() {
+        let result = std::panic::catch_unwind(|| parse_duration("18446744073709551615s1s"));
+        assert!(result.is_ok(), "overflowing duration sum must not panic");
+        assert!(
+            result
+                .expect("duration parser should return normally")
+                .is_err(),
+            "component sum larger than u64 seconds must be rejected"
+        );
     }
 }

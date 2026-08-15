@@ -19,3 +19,7 @@ rquickjs = { workspace = true }
 url = { workspace = true }
 regex = { workspace = true }
 tracing = { workspace = true }
+
+[features]
+# Opt-in smoke tests against the live YouTube service.
+live-tests = []
