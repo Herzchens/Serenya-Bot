@@ -534,7 +534,7 @@ async fn on_error(error: poise::FrameworkError<'_, Data, utils::Error>) {
 fn should_cleanup_empty_room(
     empty_since: Option<std::time::Instant>,
     now: std::time::Instant,
-    stay_in_voice: bool,
+    _stay_in_voice: bool,
     queue_is_empty: bool,
     playback_status: core::PlaybackStatus,
 ) -> bool {
@@ -544,12 +544,12 @@ fn should_cleanup_empty_room(
     if now.duration_since(empty_since) < std::time::Duration::from_secs(3 * 60 * 60) {
         return false;
     }
-    !stay_in_voice || !queue_is_empty || playback_status != core::PlaybackStatus::Idle
+    !queue_is_empty || playback_status != core::PlaybackStatus::Idle
 }
 
 async fn empty_room_disconnect_then_cleanup<D, DFut, C, CFut, T, E>(
-    stay_in_voice: bool,
-    disconnect: D,
+    _stay_in_voice: bool,
+    _disconnect: D,
     cleanup: C,
 ) -> Result<T, E>
 where
@@ -558,10 +558,11 @@ where
     C: FnOnce() -> CFut,
     CFut: std::future::Future<Output = T>,
 {
-    if !stay_in_voice {
-        disconnect().await?;
-    }
     Ok(cleanup().await)
+}
+
+fn sticky_voice_policy(_configured_stay_in_voice: bool) -> bool {
+    true
 }
 
 fn start_empty_room_monitor(
@@ -569,7 +570,7 @@ fn start_empty_room_monitor(
     http: Arc<serenity::Http>,
     config: Arc<arc_swap::ArcSwap<BotConfig>>,
     database: Arc<DatabaseManager>,
-    serenity_ctx: serenity::Context,
+    _serenity_ctx: serenity::Context,
     cancel_token: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -591,7 +592,7 @@ fn start_empty_room_monitor(
                     None => continue,
                 };
                 let player = player_lock.read().await;
-                let stay = config.load().playback.stay_in_voice;
+                let stay = sticky_voice_policy(config.load().playback.stay_in_voice);
                 if should_cleanup_empty_room(
                     player.empty_since,
                     now,
@@ -608,7 +609,7 @@ fn start_empty_room_monitor(
                 if let Some(player_lock) = player_lock_opt {
                     let (handle_uuid, still_due) = {
                         let player = player_lock.read().await;
-                        let stay = config.load().playback.stay_in_voice;
+                        let stay = sticky_voice_policy(config.load().playback.stay_in_voice);
                         (
                             player
                                 .current_track_handle
@@ -634,7 +635,7 @@ fn start_empty_room_monitor(
                         None
                     };
 
-                    let stay = config.load().playback.stay_in_voice;
+                    let stay = sticky_voice_policy(config.load().playback.stay_in_voice);
                     let still_due_before_disconnect = {
                         let player = player_lock.read().await;
                         should_cleanup_empty_room(
@@ -657,19 +658,9 @@ fn start_empty_room_monitor(
                     let cleanup_players = Arc::clone(&guild_players);
                     let cleanup_database = Arc::clone(&database);
                     let cleanup_http = Arc::clone(&http);
-                    let disconnect_ctx = serenity_ctx.clone();
                     let result = empty_room_disconnect_then_cleanup(
                         stay,
-                        || async {
-                            if let Some(manager) = songbird::get(&disconnect_ctx).await {
-                                manager
-                                    .remove(guild_id)
-                                    .await
-                                    .map_err(|err| err.to_string())
-                            } else {
-                                Ok::<(), String>(())
-                            }
-                        },
+                        || async { Ok::<(), String>(()) },
                         move || async move {
                             let (announce_channel, record_play_time) = {
                                 let mut player = cleanup_player.write().await;
@@ -804,17 +795,89 @@ fn apply_bot_voice_update_state(player: &mut core::GuildPlayer, update: BotVoice
             false
         }
         BotVoiceUpdate::Disconnected => {
+            let should_recover = player.voice_channel.is_some();
             player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
-            player.reset();
-            player.voice_channel = None;
-            player.announce_channel = None;
-            true
+            should_recover
         }
     }
 }
 
 fn voice_room_is_empty(cached_human_count: Option<usize>) -> Option<bool> {
     cached_human_count.map(|human_count| human_count == 0)
+}
+
+fn voice_recovery_delay(attempt: u32) -> std::time::Duration {
+    let seconds = match attempt {
+        0 => 1,
+        1 => 2,
+        2 => 5,
+        3 => 10,
+        _ => 30,
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
+fn voice_recovery_is_current(
+    player: &core::GuildPlayer,
+    expected_generation: u64,
+    desired_channel: serenity::ChannelId,
+) -> bool {
+    player.bot_voice_generation == expected_generation
+        && player.voice_channel == Some(desired_channel)
+}
+
+fn schedule_voice_recovery(
+    ctx: serenity::Context,
+    guild_id: serenity::GuildId,
+    desired_channel: serenity::ChannelId,
+    player_lock: Arc<tokio::sync::RwLock<core::GuildPlayer>>,
+    expected_generation: u64,
+) {
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            tokio::time::sleep(voice_recovery_delay(attempt)).await;
+            let still_current = {
+                let player = player_lock.read().await;
+                voice_recovery_is_current(&player, expected_generation, desired_channel)
+            };
+            if !still_current {
+                return;
+            }
+
+            let Some(manager) = songbird::get(&ctx).await else {
+                tracing::warn!(guild_id = %guild_id, "Songbird manager unavailable during sticky voice recovery");
+                attempt = attempt.saturating_add(1);
+                continue;
+            };
+
+            if let Some(call_lock) = manager.get(guild_id) {
+                let current_channel = {
+                    let call = call_lock.lock().await;
+                    call.current_channel().map(|channel| channel.0.get())
+                };
+                if current_channel == Some(desired_channel.get()) {
+                    return;
+                }
+            }
+
+            match manager.join(guild_id, desired_channel).await {
+                Ok(_) => {
+                    info!(guild_id = %guild_id, "Recovered unexpected voice disconnect");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        guild_id = %guild_id,
+                        error = %err,
+                        attempt,
+                        "Sticky voice recovery join failed; retrying"
+                    );
+                }
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    });
 }
 
 async fn handle_voice_state_update(
@@ -850,15 +913,7 @@ async fn handle_voice_state_update(
                     .map(|handle| handle.uuid()),
             )
         };
-        let interrupted_play_time = if bot_update == BotVoiceUpdate::Disconnected {
-            if let Some(handle_uuid) = interrupted_handle_uuid {
-                audio::events::interrupted_play_time_for_handle(&player_lock, handle_uuid).await
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let interrupted_play_time: Option<std::time::Duration> = None;
 
         let state_change = {
             let mut player = player_lock.write().await;
@@ -912,20 +967,22 @@ async fn handle_voice_state_update(
         }
 
         if disconnected {
-            let still_disconnected = {
-                let player = player_lock.read().await;
-                player.bot_voice_generation == applied_generation && player.voice_channel.is_none()
-            };
-            if still_disconnected {
-                data.guild_players.remove(&guild_id);
-                audio::runtime::cleanup_guild(guild_id.get());
-                if let Some(manager) = songbird::get(ctx).await {
-                    let _ = manager.remove(guild_id).await;
-                }
-                info!(guild_id = %guild_id, "Bot left voice; removed stale GuildPlayer state");
-                return Ok(());
+            if let Some(desired_channel) = previous_channel {
+                info!(
+                    guild_id = %guild_id,
+                    "Unexpected bot voice disconnect; preserving GuildPlayer and scheduling recovery"
+                );
+                schedule_voice_recovery(
+                    ctx.clone(),
+                    guild_id,
+                    desired_channel,
+                    player_lock.clone(),
+                    applied_generation,
+                );
             }
+            return Ok(());
         }
+
 
         if let BotVoiceUpdate::Connected(channel_id) = bot_update {
             data.guild_players.insert(guild_id, player_lock.clone());
@@ -1056,7 +1113,7 @@ mod multiguild_tests {
     }
 
     #[test]
-    fn external_bot_disconnect_resets_player_and_requests_runtime_cleanup() {
+    fn unexpected_bot_disconnect_preserves_player_and_requests_recovery() {
         let mut player = GuildPlayer::new();
         player.voice_channel = Some(ChannelId::new(11));
         player.announce_channel = Some(ChannelId::new(33));
@@ -1064,10 +1121,11 @@ mod multiguild_tests {
         let update = classify_bot_voice_update(UserId::new(9), UserId::new(9), None);
         assert_eq!(update, BotVoiceUpdate::Disconnected);
         assert!(apply_bot_voice_update_state(&mut player, update));
-        assert_eq!(player.voice_channel, None);
-        assert_eq!(player.announce_channel, None);
-        assert_eq!(player.playback_status, PlaybackStatus::Idle);
+        assert_eq!(player.voice_channel, Some(ChannelId::new(11)));
+        assert_eq!(player.announce_channel, Some(ChannelId::new(33)));
+        assert_eq!(player.playback_status, PlaybackStatus::Paused);
     }
+
 
     #[test]
     fn another_users_voice_event_does_not_mutate_bot_state() {
@@ -1081,9 +1139,9 @@ mod multiguild_tests {
     }
 
     #[test]
-    fn idle_empty_player_disconnects_when_stay_is_disabled() {
+    fn idle_empty_player_never_disconnects_when_legacy_stay_flag_is_disabled() {
         let now = Instant::now();
-        assert!(should_cleanup_empty_room(
+        assert!(!should_cleanup_empty_room(
             Some(now - Duration::from_secs(10800)),
             now,
             false,
@@ -1126,6 +1184,43 @@ mod multiguild_tests {
             true,
             PlaybackStatus::Idle
         ));
+    }
+}
+
+
+#[cfg(test)]
+mod sticky_voice_recovery_tests {
+    use super::{sticky_voice_policy, voice_recovery_delay, voice_recovery_is_current};
+    use crate::core::GuildPlayer;
+    use poise::serenity_prelude::ChannelId;
+    use std::time::Duration;
+
+    #[test]
+    fn legacy_config_cannot_enable_automatic_voice_leave() {
+        assert!(sticky_voice_policy(true));
+        assert!(sticky_voice_policy(false));
+    }
+
+    #[test]
+    fn recovery_backoff_is_bounded() {
+        assert_eq!(voice_recovery_delay(0), Duration::from_secs(1));
+        assert_eq!(voice_recovery_delay(1), Duration::from_secs(2));
+        assert_eq!(voice_recovery_delay(2), Duration::from_secs(5));
+        assert_eq!(voice_recovery_delay(3), Duration::from_secs(10));
+        assert_eq!(voice_recovery_delay(99), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn newer_voice_generation_or_channel_move_cancels_stale_recovery() {
+        let mut player = GuildPlayer::new();
+        player.voice_channel = Some(ChannelId::new(10));
+        let generation = player.bot_voice_generation;
+        assert!(voice_recovery_is_current(&player, generation, ChannelId::new(10)));
+        player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
+        assert!(!voice_recovery_is_current(&player, generation, ChannelId::new(10)));
+        let generation = player.bot_voice_generation;
+        player.voice_channel = Some(ChannelId::new(20));
+        assert!(!voice_recovery_is_current(&player, generation, ChannelId::new(10)));
     }
 }
 
@@ -1364,56 +1459,24 @@ mod empty_room_disconnect_order_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
-    async fn failed_empty_room_leave_does_not_commit_destructive_cleanup() {
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleanup_flag = Arc::clone(&cleaned);
-
-        let result = empty_room_disconnect_then_cleanup(
-            false,
-            || async { Err::<(), &'static str>("gateway unavailable") },
-            move || async move {
-                cleanup_flag.store(true, Ordering::SeqCst);
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err("gateway unavailable"));
-        assert!(
-            !cleaned.load(Ordering::SeqCst),
-            "empty-room cleanup/stat state must remain retryable when Songbird leave fails"
-        );
-    }
-
-    #[tokio::test]
-    async fn successful_empty_room_leave_commits_cleanup() {
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleanup_flag = Arc::clone(&cleaned);
-        let result = empty_room_disconnect_then_cleanup(
-            false,
-            || async { Ok::<(), &'static str>(()) },
-            move || async move {
-                cleanup_flag.store(true, Ordering::SeqCst);
-            },
-        )
-        .await;
-        assert_eq!(result, Ok(()));
-        assert!(cleaned.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn stay_in_voice_cleanup_does_not_attempt_disconnect() {
+    async fn empty_room_maintenance_never_calls_disconnect_even_with_legacy_flag_disabled() {
         let disconnected = Arc::new(AtomicBool::new(false));
+        let cleaned = Arc::new(AtomicBool::new(false));
         let disconnect_flag = Arc::clone(&disconnected);
+        let cleanup_flag = Arc::clone(&cleaned);
         let result = empty_room_disconnect_then_cleanup(
-            true,
+            false,
             move || async move {
                 disconnect_flag.store(true, Ordering::SeqCst);
                 Ok::<(), &'static str>(())
             },
-            || async {},
+            move || async move {
+                cleanup_flag.store(true, Ordering::SeqCst);
+            },
         )
         .await;
         assert_eq!(result, Ok(()));
         assert!(!disconnected.load(Ordering::SeqCst));
+        assert!(cleaned.load(Ordering::SeqCst));
     }
 }
