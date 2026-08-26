@@ -3,10 +3,10 @@ name: Fix Validation
 on:
   push:
     branches:
-      - fix/playback-multiguild-stability
+      - "fix/**"
 
 concurrency:
-  group: fix-playback-multiguild-stability
+  group: fix-validation-${{ github.ref_name }}
   cancel-in-progress: true
 
 permissions:
@@ -69,19 +69,22 @@ jobs:
           fi
 
       - name: Check diff integrity
-        run: git diff --check
+        shell: bash
+        run: |
+          git diff --check HEAD^ HEAD
+          git diff --check
 
       - name: Check formatting
         run: cargo fmt --all --check
 
       - name: Cargo check
-        run: cargo check --workspace --locked
+        run: cargo check --workspace --all-targets --locked
 
       - name: Cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Cargo test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-targets --locked
 
       - name: DHAT redactor retention
         run: >-
@@ -93,7 +96,7 @@ jobs:
         run: cargo build --workspace --release --locked
 
       - name: Cargo test release
-        run: cargo test --workspace --release --locked
+        run: cargo test --workspace --all-targets --release --locked
 
       - name: Install pinned cargo-audit
         shell: bash
