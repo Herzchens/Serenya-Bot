@@ -2614,10 +2614,22 @@ mod tests {
         assert_eq!(canonical_youtube_watch_url("   "), None);
     }
 
-    #[test]
-    fn direct_spotify_track_does_not_prompt_only_because_candidates_are_close() {
-        let top = metadata_candidate("YouTube Music", "Example Song", "Example Artist", 180, Some(1_000_000));
-        let second = metadata_candidate("YouTube", "Example Song", "Example Artist", 180, Some(900_000));
+    #[tokio::test]
+    async fn direct_spotify_track_does_not_prompt_only_because_candidates_are_close() {
+        let top = metadata_candidate(
+            "YouTube Music",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(1_000_000),
+        );
+        let second = metadata_candidate(
+            "YouTube",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(900_000),
+        );
         let resolved = evaluate_confidence_and_respond(
             "https://open.spotify.com/track/example",
             vec![(top, 0.94), (second, 0.93)],
@@ -2633,8 +2645,20 @@ mod tests {
 
     #[test]
     fn ordinary_ambiguous_search_still_requires_selection() {
-        let top = metadata_candidate("YouTube Music", "Example Song", "Example Artist", 180, Some(1_000_000));
-        let second = metadata_candidate("YouTube", "Example Song", "Example Artist", 180, Some(900_000));
+        let top = metadata_candidate(
+            "YouTube Music",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(1_000_000),
+        );
+        let second = metadata_candidate(
+            "YouTube",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(900_000),
+        );
         let resolved = evaluate_confidence_and_respond(
             "Example Artist - Example Song",
             vec![(top, 0.94), (second, 0.93)],

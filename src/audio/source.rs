@@ -1107,7 +1107,9 @@ mod youtube_url_classification_tests {
     #[test]
     fn bare_playlist_video_id_is_not_routable_but_canonical_watch_url_is() {
         assert!(!is_youtube_url("dQw4w9WgXcQ"));
-        assert!(is_youtube_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        assert!(is_youtube_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
     }
 }
 

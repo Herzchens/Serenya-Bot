@@ -983,7 +983,6 @@ async fn handle_voice_state_update(
             return Ok(());
         }
 
-
         if let BotVoiceUpdate::Connected(channel_id) = bot_update {
             data.guild_players.insert(guild_id, player_lock.clone());
             if previous_channel != Some(channel_id) {
@@ -1126,7 +1125,6 @@ mod multiguild_tests {
         assert_eq!(player.playback_status, PlaybackStatus::Paused);
     }
 
-
     #[test]
     fn another_users_voice_event_does_not_mutate_bot_state() {
         let mut player = GuildPlayer::new();
@@ -1187,7 +1185,6 @@ mod multiguild_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sticky_voice_recovery_tests {
     use super::{sticky_voice_policy, voice_recovery_delay, voice_recovery_is_current};
@@ -1215,12 +1212,24 @@ mod sticky_voice_recovery_tests {
         let mut player = GuildPlayer::new();
         player.voice_channel = Some(ChannelId::new(10));
         let generation = player.bot_voice_generation;
-        assert!(voice_recovery_is_current(&player, generation, ChannelId::new(10)));
+        assert!(voice_recovery_is_current(
+            &player,
+            generation,
+            ChannelId::new(10)
+        ));
         player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
-        assert!(!voice_recovery_is_current(&player, generation, ChannelId::new(10)));
+        assert!(!voice_recovery_is_current(
+            &player,
+            generation,
+            ChannelId::new(10)
+        ));
         let generation = player.bot_voice_generation;
         player.voice_channel = Some(ChannelId::new(20));
-        assert!(!voice_recovery_is_current(&player, generation, ChannelId::new(10)));
+        assert!(!voice_recovery_is_current(
+            &player,
+            generation,
+            ChannelId::new(10)
+        ));
     }
 }
 
