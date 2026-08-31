@@ -1,6 +1,7 @@
 use crate::discord::embeds::{QueueTrackSnapshot, queue_embed};
 use crate::utils::{Context, Error};
 use poise::serenity_prelude as serenity;
+use serenity::futures::StreamExt;
 
 fn make_navigation_components(
     ctx_id: u64,
@@ -149,6 +150,36 @@ fn get_page_slice(
     &tracks[start_idx..end_idx]
 }
 
+fn navigation_target(
+    ctx_id: u64,
+    current_page: usize,
+    total_pages: usize,
+    custom_id: &str,
+    selected_value: Option<&str>,
+) -> Option<usize> {
+    if total_pages == 0 {
+        return None;
+    }
+
+    let prefix = format!("{ctx_id}_");
+    let action = custom_id.strip_prefix(&prefix)?;
+    match action {
+        "prev" => Some(current_page.saturating_sub(1)),
+        "next" => Some(
+            current_page
+                .saturating_add(1)
+                .min(total_pages.saturating_sub(1)),
+        ),
+        "first" => Some(0),
+        "last" => Some(total_pages.saturating_sub(1)),
+        "select" => selected_value?
+            .parse::<usize>()
+            .ok()
+            .filter(|page| *page < total_pages),
+        _ => None,
+    }
+}
+
 async fn disable_buttons(
     mut msg: serenity::Message,
     http: &serenity::Http,
@@ -190,61 +221,54 @@ pub async fn paginate_queue(
     let msg_inner = msg.into_message().await?;
 
     let timeout = std::time::Duration::from_secs(180);
-    let start_time = std::time::Instant::now();
-
-    while start_time.elapsed() < timeout {
-        let remaining = timeout
-            .checked_sub(start_time.elapsed())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-
-        let collector = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
+    // Keep one collector alive for the entire paginator lifetime. Re-creating a one-shot
+    // collector after every response leaves a gap where a rapid second click can be lost.
+    let mut interaction_stream =
+        serenity::ComponentInteractionCollector::new(ctx.serenity_context())
             .author_id(ctx.author().id)
             .message_id(msg_inner.id)
-            .timeout(remaining);
+            .timeout(timeout)
+            .stream();
 
-        if let Some(interaction) = collector.next().await {
-            if interaction.data.custom_id == format!("{}_prev", ctx_id) {
-                current_page = current_page.saturating_sub(1);
-            } else if interaction.data.custom_id == format!("{}_next", ctx_id) {
-                if current_page + 1 < total_pages {
-                    current_page += 1;
-                }
-            } else if interaction.data.custom_id == format!("{}_first", ctx_id) {
-                current_page = 0;
-            } else if interaction.data.custom_id == format!("{}_last", ctx_id) {
-                current_page = total_pages.saturating_sub(1);
-            } else if interaction.data.custom_id == format!("{}_select", ctx_id) {
-                if let serenity::ComponentInteractionDataKind::StringSelect { values } =
-                    &interaction.data.kind
-                    && let Some(val_str) = values.first()
-                    && let Ok(parsed_page) = val_str.parse::<usize>()
-                    && parsed_page < total_pages
-                {
-                    current_page = parsed_page;
-                }
-            } else {
-                continue;
+    while let Some(interaction) = interaction_stream.next().await {
+        let selected_value = match &interaction.data.kind {
+            serenity::ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str)
             }
+            _ => None,
+        };
 
-            let slice = get_page_slice(tracks, current_page, page_size);
-            let next_embed = queue_embed(slice, current_page, total_pages, tracks.len(), title);
-            let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
+        let Some(target_page) = navigation_target(
+            ctx_id,
+            current_page,
+            total_pages,
+            &interaction.data.custom_id,
+            selected_value,
+        ) else {
+            continue;
+        };
+        current_page = target_page;
 
-            let _ = interaction
-                .create_response(
-                    &ctx.serenity_context().http,
-                    serenity::CreateInteractionResponse::UpdateMessage(
-                        serenity::CreateInteractionResponseMessage::new()
-                            .embed(next_embed)
-                            .components(next_comps),
-                    ),
-                )
-                .await;
-        } else {
-            break;
+        let slice = get_page_slice(tracks, current_page, page_size);
+        let next_embed = queue_embed(slice, current_page, total_pages, tracks.len(), title);
+        let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
+
+        if let Err(error) = interaction
+            .create_response(
+                &ctx.serenity_context().http,
+                serenity::CreateInteractionResponse::UpdateMessage(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .embed(next_embed)
+                        .components(next_comps),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                custom_id = %interaction.data.custom_id,
+                "failed to acknowledge queue pagination interaction"
+            );
         }
     }
 
@@ -296,60 +320,51 @@ pub async fn paginate_lyrics(
     let msg_inner = msg.into_message().await?;
 
     let timeout = std::time::Duration::from_secs(180);
-    let start_time = std::time::Instant::now();
-
-    while start_time.elapsed() < timeout {
-        let remaining = timeout
-            .checked_sub(start_time.elapsed())
-            .unwrap_or_default();
-        if remaining.is_zero() {
-            break;
-        }
-
-        let collector = serenity::ComponentInteractionCollector::new(ctx.serenity_context())
+    let mut interaction_stream =
+        serenity::ComponentInteractionCollector::new(ctx.serenity_context())
             .author_id(ctx.author().id)
             .message_id(msg_inner.id)
-            .timeout(remaining);
+            .timeout(timeout)
+            .stream();
 
-        if let Some(interaction) = collector.next().await {
-            if interaction.data.custom_id == format!("{}_prev", ctx_id) {
-                current_page = current_page.saturating_sub(1);
-            } else if interaction.data.custom_id == format!("{}_next", ctx_id) {
-                if current_page + 1 < total_pages {
-                    current_page += 1;
-                }
-            } else if interaction.data.custom_id == format!("{}_first", ctx_id) {
-                current_page = 0;
-            } else if interaction.data.custom_id == format!("{}_last", ctx_id) {
-                current_page = total_pages.saturating_sub(1);
-            } else if interaction.data.custom_id == format!("{}_select", ctx_id) {
-                if let serenity::ComponentInteractionDataKind::StringSelect { values } =
-                    &interaction.data.kind
-                    && let Some(val_str) = values.first()
-                    && let Ok(parsed_page) = val_str.parse::<usize>()
-                    && parsed_page < total_pages
-                {
-                    current_page = parsed_page;
-                }
-            } else {
-                continue;
+    while let Some(interaction) = interaction_stream.next().await {
+        let selected_value = match &interaction.data.kind {
+            serenity::ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str)
             }
+            _ => None,
+        };
 
-            let next_embed = make_embed(current_page);
-            let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
+        let Some(target_page) = navigation_target(
+            ctx_id,
+            current_page,
+            total_pages,
+            &interaction.data.custom_id,
+            selected_value,
+        ) else {
+            continue;
+        };
+        current_page = target_page;
 
-            let _ = interaction
-                .create_response(
-                    &ctx.serenity_context().http,
-                    serenity::CreateInteractionResponse::UpdateMessage(
-                        serenity::CreateInteractionResponseMessage::new()
-                            .embed(next_embed)
-                            .components(next_comps),
-                    ),
-                )
-                .await;
-        } else {
-            break;
+        let next_embed = make_embed(current_page);
+        let next_comps = make_navigation_components(ctx_id, current_page, total_pages);
+
+        if let Err(error) = interaction
+            .create_response(
+                &ctx.serenity_context().http,
+                serenity::CreateInteractionResponse::UpdateMessage(
+                    serenity::CreateInteractionResponseMessage::new()
+                        .embed(next_embed)
+                        .components(next_comps),
+                ),
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                custom_id = %interaction.data.custom_id,
+                "failed to acknowledge lyrics pagination interaction"
+            );
         }
     }
 
@@ -365,4 +380,38 @@ pub async fn paginate_lyrics(
     .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::navigation_target;
+
+    #[test]
+    fn rapid_next_then_previous_round_trip_is_stable() {
+        let page = navigation_target(42, 0, 4, "42_next", None).unwrap();
+        assert_eq!(page, 1);
+        let page = navigation_target(42, page, 4, "42_prev", None).unwrap();
+        assert_eq!(page, 0);
+    }
+
+    #[test]
+    fn page_select_accepts_only_in_range_values() {
+        assert_eq!(navigation_target(7, 0, 4, "7_select", Some("3")), Some(3));
+        assert_eq!(navigation_target(7, 0, 4, "7_select", Some("4")), None);
+        assert_eq!(navigation_target(7, 0, 4, "7_select", Some("bad")), None);
+    }
+
+    #[test]
+    fn foreign_or_unknown_component_ids_are_ignored() {
+        assert_eq!(navigation_target(7, 0, 4, "8_next", None), None);
+        assert_eq!(navigation_target(7, 0, 4, "7_unknown", None), None);
+    }
+
+    #[test]
+    fn navigation_stays_inside_page_bounds() {
+        assert_eq!(navigation_target(7, 0, 4, "7_prev", None), Some(0));
+        assert_eq!(navigation_target(7, 3, 4, "7_next", None), Some(3));
+        assert_eq!(navigation_target(7, 2, 4, "7_first", None), Some(0));
+        assert_eq!(navigation_target(7, 1, 4, "7_last", None), Some(3));
+    }
 }

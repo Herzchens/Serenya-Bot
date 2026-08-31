@@ -22,25 +22,6 @@ pub struct PlaybackContext {
     pub config: Arc<arc_swap::ArcSwap<crate::config::BotConfig>>,
 }
 
-fn stay_in_voice(config: &Arc<arc_swap::ArcSwap<crate::config::BotConfig>>) -> bool {
-    config.load().playback.stay_in_voice
-}
-
-async fn automatic_disconnect_then_cleanup<D, DFut, C, CFut, E>(
-    disconnect: D,
-    cleanup: C,
-) -> Result<(), E>
-where
-    D: FnOnce() -> DFut,
-    DFut: std::future::Future<Output = Result<(), E>>,
-    C: FnOnce() -> CFut,
-    CFut: std::future::Future<Output = ()>,
-{
-    disconnect().await?;
-    cleanup().await;
-    Ok(())
-}
-
 pub(crate) fn register_terminal_handlers<End, Error, E>(end: End, error: Error) -> Result<(), E>
 where
     End: FnOnce() -> Result<(), E>,
@@ -593,38 +574,6 @@ pub fn play_next(
                 });
             }
 
-            // If stay_in_voice is disabled, disconnect and reclaim resources
-            if !stay_in_voice(&ctx.config) {
-                tracing::info!(
-                    guild_id = %ctx.guild_id,
-                    "Queue finished and stay_in_voice=false, disconnecting"
-                );
-                let cleanup_player = Arc::clone(&player_lock);
-                let cleanup_players = Arc::clone(&ctx.guild_players);
-                let guild_id = ctx.guild_id;
-                if let Err(err) = automatic_disconnect_then_cleanup(
-                    || songbird_manager.remove(guild_id),
-                    move || async move {
-                        {
-                            let mut player = cleanup_player.write().await;
-                            player.reset();
-                            player.voice_channel = None;
-                            player.announce_channel = None;
-                        }
-                        cleanup_players.remove(&guild_id);
-                        crate::audio::runtime::cleanup_guild(guild_id.get());
-                    },
-                )
-                .await
-                {
-                    tracing::warn!(
-                        guild_id = %guild_id,
-                        error = %err,
-                        "Automatic queue-finished voice disconnect failed; preserving local state for retry"
-                    );
-                }
-            }
-
             return Ok(());
         };
 
@@ -1173,27 +1122,8 @@ mod tests {
 
 #[cfg(test)]
 mod live_config_and_stats_tests {
-    use super::{playback_stat_delta, stay_in_voice};
-    use crate::config::BotConfig;
-    use std::sync::Arc;
+    use super::playback_stat_delta;
     use std::time::Duration;
-
-    fn example_config() -> BotConfig {
-        serde_saphyr::from_str(include_str!("../../config.example.yml")).unwrap()
-    }
-
-    #[test]
-    fn active_playback_reads_latest_stay_in_voice_value() {
-        let mut initial = example_config();
-        initial.playback.stay_in_voice = true;
-        let live = Arc::new(arc_swap::ArcSwap::from_pointee(initial));
-        assert!(stay_in_voice(&live));
-
-        let mut reloaded = example_config();
-        reloaded.playback.stay_in_voice = false;
-        live.store(Arc::new(reloaded));
-        assert!(!stay_in_voice(&live));
-    }
 
     #[test]
     fn skipped_tracks_add_listening_time_but_not_completed_count() {
@@ -1281,50 +1211,6 @@ mod interrupted_stats_tests {
             Some(observed),
             observed,
         ));
-    }
-}
-
-#[cfg(test)]
-mod automatic_disconnect_cleanup_tests {
-    use super::automatic_disconnect_then_cleanup;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[tokio::test]
-    async fn failed_gateway_leave_does_not_commit_local_cleanup() {
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleanup_flag = Arc::clone(&cleaned);
-
-        let result = automatic_disconnect_then_cleanup(
-            || async { Err::<(), &'static str>("gateway unavailable") },
-            move || async move {
-                cleanup_flag.store(true, Ordering::SeqCst);
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err("gateway unavailable"));
-        assert!(
-            !cleaned.load(Ordering::SeqCst),
-            "local GuildPlayer/runtime state must remain available when Songbird says leave must be retried"
-        );
-    }
-
-    #[tokio::test]
-    async fn successful_gateway_leave_commits_local_cleanup() {
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let cleanup_flag = Arc::clone(&cleaned);
-
-        let result = automatic_disconnect_then_cleanup(
-            || async { Ok::<(), &'static str>(()) },
-            move || async move {
-                cleanup_flag.store(true, Ordering::SeqCst);
-            },
-        )
-        .await;
-
-        assert_eq!(result, Ok(()));
-        assert!(cleaned.load(Ordering::SeqCst));
     }
 }
 
