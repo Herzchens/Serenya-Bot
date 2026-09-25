@@ -35,6 +35,23 @@ where
     Ok(())
 }
 
+fn begin_intentional_voice_disconnect(
+    player: &mut crate::core::GuildPlayer,
+) -> Option<poise::serenity_prelude::ChannelId> {
+    let previous = player.voice_channel;
+    player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
+    player.voice_channel = None;
+    previous
+}
+
+fn rollback_failed_intentional_voice_disconnect(
+    player: &mut crate::core::GuildPlayer,
+    previous: Option<poise::serenity_prelude::ChannelId>,
+) {
+    player.bot_voice_generation = player.bot_voice_generation.wrapping_add(1);
+    player.voice_channel = previous;
+}
+
 /// Join the user's voice channel.
 #[poise::command(slash_command, prefix_command, aliases("j"))]
 pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
@@ -101,7 +118,19 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
 
     tracing::info!("Voice disconnect start: leaving voice channel");
     let has_handler = manager.get(guild_id).is_some();
-    leave_disconnect_then_cleanup(
+    let player_lock_for_leave = ctx
+        .data()
+        .guild_players
+        .get(&guild_id)
+        .map(|entry| entry.value().clone());
+    let previous_voice_channel = if let Some(ref player_lock) = player_lock_for_leave {
+        let mut player = player_lock.write().await;
+        begin_intentional_voice_disconnect(&mut player)
+    } else {
+        None
+    };
+
+    let leave_result = leave_disconnect_then_cleanup(
         has_handler,
         || async { manager.remove(guild_id).await },
         || async {
@@ -123,13 +152,18 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
                 player.announce_channel = None;
                 tracing::info!("Reset guild player state and dropped track handle");
             }
-
-            tracing::info!("Removing guild player from map");
             ctx.data().guild_players.remove(&guild_id);
-            tracing::info!("Guild player removed from map");
         },
     )
-    .await?;
+    .await;
+
+    if let Err(err) = leave_result {
+        if let Some(player_lock) = player_lock_for_leave {
+            let mut player = player_lock.write().await;
+            rollback_failed_intentional_voice_disconnect(&mut player, previous_voice_channel);
+        }
+        return Err(err.into());
+    }
     tracing::info!("Voice disconnect complete");
 
     crate::audio::runtime::cleanup_guild(guild_id.get());
@@ -185,9 +219,27 @@ mod lock_scope_tests {
 
 #[cfg(test)]
 mod leave_disconnect_failure_tests {
-    use super::leave_disconnect_then_cleanup;
+    use super::{
+        begin_intentional_voice_disconnect, leave_disconnect_then_cleanup,
+        rollback_failed_intentional_voice_disconnect,
+    };
+    use crate::core::GuildPlayer;
+    use poise::serenity_prelude::ChannelId;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn intentional_leave_marker_suppresses_recovery_and_rolls_back_on_failure() {
+        let mut player = GuildPlayer::new();
+        player.voice_channel = Some(ChannelId::new(55));
+        let previous_generation = player.bot_voice_generation;
+        let previous = begin_intentional_voice_disconnect(&mut player);
+        assert_eq!(previous, Some(ChannelId::new(55)));
+        assert_eq!(player.voice_channel, None);
+        assert_ne!(player.bot_voice_generation, previous_generation);
+        rollback_failed_intentional_voice_disconnect(&mut player, previous);
+        assert_eq!(player.voice_channel, Some(ChannelId::new(55)));
+    }
 
     #[tokio::test]
     async fn failed_leave_preserves_player_and_stats_state_for_retry() {

@@ -57,7 +57,6 @@ pub(crate) fn extract_artist_string(artists: Option<&Vec<serde_json::Value>>) ->
     }
 }
 
-#[cfg(test)]
 const TRUSTED_METADATA_PICK_THRESHOLD: f64 = 0.68;
 
 #[cfg(test)]
@@ -974,6 +973,10 @@ fn metadata_display_title(meta: &ExternalTrackMeta) -> String {
     meta.title.clone()
 }
 
+fn is_direct_spotify_track_url(input: &str) -> bool {
+    input.contains("open.spotify.com/track/")
+}
+
 /// Evaluates candidate scores, caches the result if confidence is high, and constructs the appropriate ResolvedInput.
 fn evaluate_confidence_and_respond(
     original_query: &str,
@@ -1002,9 +1005,17 @@ fn evaluate_confidence_and_respond(
     let variant_conflict =
         contains_unrequested_variant(&top_cand.title, &variant_context) || has_critical;
 
-    let mut low_confidence = *top_score < settings.auto_pick_threshold || variant_conflict;
+    let direct_spotify_track =
+        source_provider == "Spotify" && is_direct_spotify_track_url(original_query);
+    let auto_pick_threshold = if direct_spotify_track {
+        TRUSTED_METADATA_PICK_THRESHOLD.min(settings.auto_pick_threshold)
+    } else {
+        settings.auto_pick_threshold
+    };
 
-    if !low_confidence && scored.len() > 1 {
+    let mut low_confidence = *top_score < auto_pick_threshold || variant_conflict;
+
+    if !low_confidence && scored.len() > 1 && !direct_spotify_track {
         let second_score = scored[1].1;
         let margin = top_score - second_score;
         let required_margin = if *top_score >= 0.96 { 0.05 } else { 0.08 };
@@ -2288,6 +2299,15 @@ pub async fn resolve_ytsearch_track(
     }
 }
 
+fn canonical_youtube_watch_url(video_id: &str) -> Option<String> {
+    let video_id = video_id.trim();
+    if video_id.is_empty() {
+        None
+    } else {
+        Some(format!("https://www.youtube.com/watch?v={video_id}"))
+    }
+}
+
 fn recursive_find_tracks(
     value: &serde_json::Value,
     tracks: &mut Vec<Track>,
@@ -2416,8 +2436,11 @@ async fn resolve_youtube_playlist(
             }
 
             if !valid_videos.is_empty() {
-                is_valid_playlist = true;
                 for video in valid_videos {
+                    let Some(video_url) = canonical_youtube_watch_url(&video.id) else {
+                        continue;
+                    };
+
                     let duration = if video.duration > 0 {
                         Some(Duration::from_millis(video.duration))
                     } else {
@@ -2426,7 +2449,7 @@ async fn resolve_youtube_playlist(
 
                     tracks.push(Track {
                         title: video.title.into(),
-                        url: video.url.into(),
+                        url: video_url.into(),
                         duration,
                         requester_id: serenity::UserId::new(user_id),
                         requester_name: None,
@@ -2439,6 +2462,7 @@ async fn resolve_youtube_playlist(
                         source_provider: provider_name.clone(),
                     });
                 }
+                is_valid_playlist = !tracks.is_empty();
             }
         }
     }
@@ -2579,6 +2603,73 @@ mod tests {
         );
         assert_eq!(tracks[1].duration, Some(Duration::from_secs(225))); // 3 * 60 + 45 = 225
         assert_eq!(&*tracks[1].source_provider, "YouTube");
+    }
+
+    #[test]
+    fn youtube_playlist_video_id_is_canonicalized_to_playable_watch_url() {
+        assert_eq!(
+            canonical_youtube_watch_url("dQw4w9WgXcQ").as_deref(),
+            Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        );
+        assert_eq!(canonical_youtube_watch_url("   "), None);
+    }
+
+    #[tokio::test]
+    async fn direct_spotify_track_does_not_prompt_only_because_candidates_are_close() {
+        let top = metadata_candidate(
+            "YouTube Music",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(1_000_000),
+        );
+        let second = metadata_candidate(
+            "YouTube",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(900_000),
+        );
+        let resolved = evaluate_confidence_and_respond(
+            "https://open.spotify.com/track/example",
+            vec![(top, 0.94), (second, 0.93)],
+            12345,
+            None,
+            Some("Example Song".to_owned()),
+            Some(Duration::from_secs(180)),
+            "Spotify".to_owned(),
+        )
+        .unwrap();
+        assert!(matches!(resolved, ResolvedInput::Track(_)));
+    }
+
+    #[test]
+    fn ordinary_ambiguous_search_still_requires_selection() {
+        let top = metadata_candidate(
+            "YouTube Music",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(1_000_000),
+        );
+        let second = metadata_candidate(
+            "YouTube",
+            "Example Song",
+            "Example Artist",
+            180,
+            Some(900_000),
+        );
+        let resolved = evaluate_confidence_and_respond(
+            "Example Artist - Example Song",
+            vec![(top, 0.94), (second, 0.93)],
+            12345,
+            None,
+            Some("Example Song".to_owned()),
+            Some(Duration::from_secs(180)),
+            "Spotify".to_owned(),
+        )
+        .unwrap();
+        assert!(matches!(resolved, ResolvedInput::SearchResults(_)));
     }
 
     #[cfg(feature = "live-tests")]

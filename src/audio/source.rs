@@ -1101,6 +1101,19 @@ pub fn cache_entry_counts() -> (u64, u64, u64, u64) {
 }
 
 #[cfg(test)]
+mod youtube_url_classification_tests {
+    use super::is_youtube_url;
+
+    #[test]
+    fn bare_playlist_video_id_is_not_routable_but_canonical_watch_url_is() {
+        assert!(!is_youtube_url("dQw4w9WgXcQ"));
+        assert!(is_youtube_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod cache_tests {
     use super::{cache_invalidate_stream, cache_set_stream, cached_resolved_stream_is_current};
 
