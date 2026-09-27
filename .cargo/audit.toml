@@ -1,4 +1,4 @@
-# Reviewed 2026-08-11. See SECURITY_AUDIT.md for dependency paths and reachability.
+# Reviewed 2026-09-27. See SECURITY_AUDIT.md for dependency paths and reachability.
 # New advisories are not ignored and remain fail-closed.
 [advisories]
 ignore = [
@@ -27,6 +27,14 @@ ignore = [
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
+
+    # Reviewed 2026-09-27 (#25): Songbird 0.6.0 pins ringbuf 0.4.
+    # Its selected ring-buffer consumer is HeapCons<u8>, and the vulnerable
+    # Consumer::skip path requires an element's Drop implementation to panic.
+    # u8 has no Drop implementation, so that trigger is unreachable in the
+    # current Songbird AsyncAdapterStream path. Patched ringbuf starts at 0.5.2;
+    # remove this exception when Songbird adopts that line or the adapter changes.
+    "RUSTSEC-2026-0293",
 
     # Informational unmaintained-crate warnings with no patch-level remediation.
     # Latest stable Songbird/Poise still use derivative; Davey/OpenMLS still pulls

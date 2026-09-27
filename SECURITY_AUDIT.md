@@ -1,6 +1,6 @@
 # Dependency security audit exceptions
 
-Reviewed: 2026-08-11
+Reviewed: 2026-09-27
 
 Serenya runs `cargo audit` as a fail-closed CI gate. These exceptions are narrowly scoped to
 reviewed upstream constraints. Any new advisory still fails CI. Re-review an exception whenever its
@@ -26,6 +26,23 @@ upstream dependency line, target architecture, or referenced runtime path change
 
 - `RUSTSEC-2026-0204` (`crossbeam-epoch`): upgraded from 0.9.18 to patched 0.9.20. The crate is
   active through Moka/Crossbeam, so an exception is not justified.
+
+- `RUSTSEC-2026-0285` (`rustls`): upgraded the locked 0.23 line from
+  0.23.41 to patched 0.23.45. The workspace's existing `rustls = "0.23"`
+  requirement accepts the patched release without an API-line migration.
+
+## Reviewed vulnerability exceptions
+
+- `RUSTSEC-2026-0293` (`ringbuf` 0.4.8): active through `songbird 0.6.0`.
+  Songbird's selected `AsyncAdapterStream` specializes the ring buffer as
+  `HeapProd<u8>` / `HeapCons<u8>` and clears buffered bytes during seek with
+  `Consumer::skip`. The advisory requires an element's `Drop` implementation
+  to panic before the consumer read index advances; `u8` has no destructor, so
+  that trigger is not reachable through this selected path. Songbird 0.6.0
+  constrains `ringbuf` to the 0.4 line while the patched release is 0.5.2 or
+  newer. This is a temporary upstream compatibility exception. Re-review and
+  remove it when Songbird adopts ringbuf 0.5.2+, or if its adapter element type
+  or ring-buffer usage changes.
 
 ## Informational maintenance exceptions
 
