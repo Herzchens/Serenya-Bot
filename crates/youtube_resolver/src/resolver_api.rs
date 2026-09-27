@@ -1,8 +1,7 @@
 use crate::{
     BaseInnerTubeClient, InnerTubeClient, ResolveContext, ResolveError, ResolvedStream,
-    create_android_client, create_android_vr_client, create_ios_client, create_tvhtml5_client,
-    create_visionos_client, create_web_safari_client, format_selector, get_or_fetch_session,
-    js_solver, resolve_best_audio_stream_rusty_ytdl, stream_probe,
+    create_tvhtml5_client, create_visionos_client, format_selector, get_or_fetch_session,
+    js_solver, stream_probe,
 };
 
 pub async fn probe_resolved_stream_health(
@@ -23,14 +22,13 @@ pub async fn probe_resolved_stream_health(
 }
 
 fn ordered_clients() -> Vec<BaseInnerTubeClient> {
-    vec![
-        create_visionos_client(),
-        create_android_vr_client(),
-        create_tvhtml5_client(None),
-        create_web_safari_client(),
-        create_ios_client(None),
-        create_android_client(None),
-    ]
+    // Anonymous path: prefer clients that current yt-dlp does not mark as
+    // requiring a GVS PO token for ordinary HTTPS playback.
+    //
+    // POT-sensitive clients remain defined for a future token-provider path,
+    // but probing them without a valid token only burns requests and increases
+    // the chance of triggering YouTube's anti-bot controls.
+    vec![create_tvhtml5_client(None), create_visionos_client()]
 }
 
 fn client_is_allowed(context: &ResolveContext, client_name: &str) -> bool {
@@ -38,7 +36,10 @@ fn client_is_allowed(context: &ResolveContext, client_name: &str) -> bool {
 }
 
 fn client_requires_gvs_pot(client_name: &str) -> bool {
-    matches!(client_name, "IOS" | "ANDROID" | "WEB" | "WEB_SAFARI")
+    matches!(
+        client_name,
+        "IOS" | "ANDROID" | "ANDROID_VR" | "WEB" | "WEB_SAFARI" | "MWEB"
+    )
 }
 
 fn is_googlevideo_stream_url(stream_url: &str) -> bool {
@@ -85,17 +86,19 @@ fn validate_gvs_token_requirement(client_name: &str, stream_url: &str) -> Result
     Ok(())
 }
 
-pub async fn resolve_best_audio_stream_via_api(
+async fn resolve_best_audio_stream_with_clients(
+    http_client: &reqwest::Client,
+    player_url: &str,
+    clients: &[&dyn InnerTubeClient],
     video_id: &str,
     context: &ResolveContext,
 ) -> Result<ResolvedStream, ResolveError> {
-    let http_client = &context.http_client;
-    let player_url = get_or_fetch_session(http_client).await?.player_url;
-    let clients = ordered_clients();
     let mut last_err =
         ResolveError::NotPlayable("All Innertube clients failed to resolve stream".to_string());
 
     for client in clients {
+        let client = *client;
+
         if !client_is_allowed(context, client.name()) {
             tracing::info!(
                 client = client.name(),
@@ -104,54 +107,58 @@ pub async fn resolve_best_audio_stream_via_api(
             );
             continue;
         }
+
         tracing::debug!(
             client = client.name(),
             video_id,
             "Attempting to resolve stream with client"
         );
-        match try_client(http_client, &player_url, &client, video_id, context).await {
+
+        match try_client(http_client, player_url, client, video_id, context).await {
             Ok(stream) => return Ok(stream),
+            Err(err) if err.is_not_a_bot_gate() => {
+                // An explicit anti-bot gate is session-level evidence. Trying
+                // another anonymous client would only spend another request and
+                // could overwrite the signal that must trigger cooldown.
+                return Err(err);
+            }
             Err(err) => last_err = err,
         }
     }
+
     Err(last_err)
+}
+
+pub async fn resolve_best_audio_stream_via_api(
+    video_id: &str,
+    context: &ResolveContext,
+) -> Result<ResolvedStream, ResolveError> {
+    let http_client = &context.http_client;
+    let player_url = get_or_fetch_session(http_client).await?.player_url;
+    let clients = ordered_clients();
+    let client_refs = clients
+        .iter()
+        .map(|client| client as &dyn InnerTubeClient)
+        .collect::<Vec<_>>();
+
+    resolve_best_audio_stream_with_clients(
+        http_client,
+        &player_url,
+        &client_refs,
+        video_id,
+        context,
+    )
+    .await
 }
 
 pub async fn resolve_best_audio_stream(
     video_id: &str,
     context: &ResolveContext,
 ) -> Result<ResolvedStream, ResolveError> {
-    if let Ok(stream) = resolve_best_audio_stream_via_api(video_id, context).await {
-        return Ok(stream);
-    }
-
-    let stream = resolve_best_audio_stream_rusty_ytdl(video_id, context).await?;
-
-    validate_gvs_token_requirement(&stream.client_kind, &stream.url)?;
-
-    if !client_is_allowed(context, &stream.client_kind) {
-        return Err(ResolveError::NotPlayable(format!(
-            "Fallback resolver returned client {} excluded for this retry",
-            stream.client_kind
-        )));
-    }
-
-    probe_resolved_stream_health(&context.http_client, &stream, 102_400, 50.0)
-        .await
-        .map_err(|err| {
-            tracing::warn!(
-                client = %stream.client_kind,
-                source = %stream.resolve_source,
-                error = %err,
-                "Fallback resolver stream failed strict access validation"
-            );
-
-            ResolveError::NotPlayable(format!(
-                "Fallback resolver stream failed strict access validation: {err}"
-            ))
-        })?;
-
-    Ok(stream)
+    // The anonymous native path is intentionally restricted to ordered_clients()
+    // (TVHTML5 -> VISIONOS). The vendored rusty_ytdl fallback internally falls
+    // back to an old Android client, which would bypass that policy.
+    resolve_best_audio_stream_via_api(video_id, context).await
 }
 
 async fn try_client(
@@ -258,6 +265,107 @@ async fn validate_stream(
 }
 
 #[cfg(test)]
+mod rotation_access_gate_tests {
+    use super::resolve_best_audio_stream_with_clients;
+    use crate::{InnerTubeClient, ResolveContext, ResolveError};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone, Copy)]
+    enum FakeFailure {
+        BotGate,
+        Ordinary,
+    }
+
+    struct FailingClient {
+        name: &'static str,
+        failure: FakeFailure,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl InnerTubeClient for FailingClient {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn client_name(&self) -> &'static str {
+            self.name
+        }
+
+        fn client_version(&self) -> String {
+            "test".to_owned()
+        }
+
+        fn user_agent(&self) -> String {
+            "serenya-test".to_owned()
+        }
+
+        async fn player(
+            &self,
+            _video_id: &str,
+            _context: &ResolveContext,
+        ) -> Result<crate::PlayerResponse, ResolveError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            Err(match self.failure {
+                FakeFailure::BotGate => ResolveError::ApiError {
+                    status: Some("LOGIN_REQUIRED".to_owned()),
+                    reason: Some("Sign in to confirm you're not a bot".to_owned()),
+                },
+                FakeFailure::Ordinary => {
+                    ResolveError::NotPlayable("ordinary later-client failure".to_owned())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_bot_gate_aborts_remaining_client_rotation() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+
+        let first = FailingClient {
+            name: "TVHTML5",
+            failure: FakeFailure::BotGate,
+            calls: Arc::clone(&first_calls),
+        };
+
+        let second = FailingClient {
+            name: "VISIONOS",
+            failure: FakeFailure::Ordinary,
+            calls: Arc::clone(&second_calls),
+        };
+
+        let clients: Vec<&dyn InnerTubeClient> = vec![&first, &second];
+        let context = ResolveContext::default();
+
+        let err = resolve_best_audio_stream_with_clients(
+            &context.http_client,
+            "https://example.invalid/player.js",
+            &clients,
+            "test-video-id",
+            &context,
+        )
+        .await
+        .expect_err("both fake clients intentionally fail");
+
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "client rotation continued after explicit anti-bot gate"
+        );
+        assert!(
+            err.is_not_a_bot_gate(),
+            "explicit anti-bot gate was overwritten by a later ordinary client error"
+        );
+    }
+}
+
+#[cfg(test)]
 mod retry_client_tests {
     use super::{client_is_allowed, ordered_clients};
     use crate::{InnerTubeClient, ResolveContext};
@@ -280,22 +388,13 @@ mod retry_client_tests {
     }
 
     #[test]
-    fn native_client_order_prefers_visionos_before_fallbacks() {
+    fn anonymous_client_order_avoids_pot_sensitive_clients() {
         let names = ordered_clients()
             .iter()
             .map(|client| client.name())
             .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            vec![
-                "VISIONOS",
-                "ANDROID_VR",
-                "TVHTML5",
-                "WEB_SAFARI",
-                "IOS",
-                "ANDROID"
-            ]
-        );
+
+        assert_eq!(names, vec!["TVHTML5", "VISIONOS"]);
     }
 }
 
@@ -343,8 +442,11 @@ mod gvs_token_requirement_tests {
     }
 
     #[test]
-    fn android_vr_without_pot_is_not_blocked_by_gvs_guard() {
-        assert!(validate_gvs_token_requirement("ANDROID_VR", NO_POT).is_ok());
+    fn android_vr_without_pot_is_rejected_by_gvs_guard() {
+        assert!(
+            validate_gvs_token_requirement("ANDROID_VR", NO_POT).is_err(),
+            "current Android VR playback is POT-sensitive and must not be used tokenless"
+        );
     }
 
     #[test]

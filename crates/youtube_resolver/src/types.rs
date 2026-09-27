@@ -77,6 +77,45 @@ pub enum ResolveError {
     Unknown(String),
 }
 
+impl ResolveError {
+    pub fn is_not_a_bot_gate(&self) -> bool {
+        match self {
+            Self::ApiError { status, reason } => {
+                status.as_deref() == Some("LOGIN_REQUIRED")
+                    && reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.to_ascii_lowercase().contains("not a bot"))
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod access_gate_tests {
+    use super::ResolveError;
+
+    #[test]
+    fn explicit_not_a_bot_login_gate_is_classified() {
+        let err = ResolveError::ApiError {
+            status: Some("LOGIN_REQUIRED".to_owned()),
+            reason: Some("Sign in to confirm you’re not a bot".to_owned()),
+        };
+
+        assert!(err.is_not_a_bot_gate());
+    }
+
+    #[test]
+    fn unrelated_login_required_is_not_global_antibot_signal() {
+        let err = ResolveError::ApiError {
+            status: Some("LOGIN_REQUIRED".to_owned()),
+            reason: Some("This video requires authentication".to_owned()),
+        };
+
+        assert!(!err.is_not_a_bot_gate());
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedStream {
     pub url: String,
