@@ -326,7 +326,7 @@ pub fn youtube_degraded_error() -> SerenyaError {
         .unwrap_or_default();
 
     SerenyaError::Audio(format!(
-        "YouTube is temporarily rate-limited, so Serenya is avoiding new yt-dlp requests.{remaining}"
+        "YouTube is temporarily rate-limited or access-gated, so Serenya is avoiding new YouTube resolution requests.{remaining}"
     ))
 }
 
@@ -371,7 +371,10 @@ pub fn negative_cache_key(namespace: &str, id: &str) -> String {
 
 pub fn contains_youtube_rate_limit(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
-    lower.contains("rate-limited by youtube") || lower.contains("rate limited by youtube")
+
+    lower.contains("rate-limited by youtube")
+        || lower.contains("rate limited by youtube")
+        || (lower.contains("confirm you") && lower.contains("not a bot"))
 }
 
 pub fn should_negative_cache(stderr: &str) -> bool {
@@ -531,6 +534,16 @@ mod tests {
         assert!(contains_youtube_rate_limit(
             "The current session has been rate-limited by YouTube for up to an hour."
         ));
+    }
+
+    #[test]
+    fn detects_youtube_explicit_not_a_bot_gate() {
+        assert!(
+            contains_youtube_rate_limit(
+                "ERROR: Sign in to confirm you’re not a bot. Use --cookies-from-browser for authentication."
+            ),
+            "explicit YouTube anti-bot gate must enter degraded cooldown"
+        );
     }
 
     #[test]

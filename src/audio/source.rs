@@ -720,12 +720,29 @@ async fn finish_stream_resolve_for_guild(
     }
 }
 
+fn should_continue_youtube_proxy_fallback(error: &youtube_resolver::ResolveError) -> bool {
+    !error.is_not_a_bot_gate()
+}
+
+fn should_try_ytdlp_after_native_failure(
+    youtube_degraded: bool,
+    ytdlp_fallback_active: bool,
+) -> bool {
+    !youtube_degraded && ytdlp_fallback_active
+}
+
 async fn resolve_stream_uncached(
     track_url: &str,
     http_client: &reqwest::Client,
     excluded_client_kind: Option<&str>,
 ) -> Result<youtube_resolver::ResolvedStream, StreamResolveFailure> {
     let youtube_url = is_youtube_url(track_url);
+
+    if youtube_url && crate::audio::runtime::is_youtube_degraded() {
+        return Err(StreamResolveFailure::from_serenya(
+            crate::audio::runtime::youtube_degraded_error(),
+        ));
+    }
 
     if youtube_url {
         if let Some(stream) =
@@ -741,7 +758,12 @@ async fn resolve_stream_uncached(
             cache_set_stream(track_url.to_owned(), &stream).await;
             return Ok(stream);
         }
-        if crate::audio::runtime::is_ytdlp_fallback_active() {
+        let youtube_degraded = crate::audio::runtime::is_youtube_degraded();
+
+        if should_try_ytdlp_after_native_failure(
+            youtube_degraded,
+            crate::audio::runtime::is_ytdlp_fallback_active(),
+        ) {
             tracing::warn!(
                 track_url,
                 "native YouTube stream resolution failed, falling back to yt-dlp"
@@ -756,6 +778,13 @@ async fn resolve_stream_uncached(
                 }
             }
         }
+
+        if youtube_degraded {
+            return Err(StreamResolveFailure::from_serenya(
+                crate::audio::runtime::youtube_degraded_error(),
+            ));
+        }
+
         return Err(StreamResolveFailure::message(
             "native YouTube stream resolution failed",
         ));
@@ -831,6 +860,45 @@ async fn extract_stream_url_inner(
     finish_stream_resolve_for_guild(&negative_key, result).await
 }
 
+#[cfg(test)]
+mod youtube_gate_routing_tests {
+    use super::{should_continue_youtube_proxy_fallback, should_try_ytdlp_after_native_failure};
+
+    #[test]
+    fn explicit_bot_gate_stops_proxy_fallback() {
+        let err = youtube_resolver::ResolveError::ApiError {
+            status: Some("LOGIN_REQUIRED".to_owned()),
+            reason: Some("Sign in to confirm you're not a bot".to_owned()),
+        };
+
+        assert!(
+            !should_continue_youtube_proxy_fallback(&err),
+            "explicit anti-bot gate must stop proxy fallback"
+        );
+    }
+
+    #[test]
+    fn ordinary_native_failure_can_continue_to_proxy_fallback() {
+        let err = youtube_resolver::ResolveError::NotPlayable("ordinary failure".to_owned());
+
+        assert!(should_continue_youtube_proxy_fallback(&err));
+    }
+
+    #[test]
+    fn degraded_youtube_state_blocks_outer_ytdlp_fallback() {
+        assert!(
+            !should_try_ytdlp_after_native_failure(true, true),
+            "degraded YouTube state must block outer yt-dlp fallback"
+        );
+    }
+
+    #[test]
+    fn healthy_youtube_state_can_use_enabled_outer_ytdlp_fallback() {
+        assert!(should_try_ytdlp_after_native_failure(false, true));
+        assert!(!should_try_ytdlp_after_native_failure(false, false));
+    }
+}
+
 fn is_direct_stream_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
@@ -866,26 +934,44 @@ async fn resolve_youtube_stream_native(
                 .youtube_timeout_ms
                 .max(10000),
         );
-        if let Ok(Ok(stream)) = tokio::time::timeout(timeout_duration, resolver_future).await {
-            if is_direct_stream_url(&stream.url) {
+        match tokio::time::timeout(timeout_duration, resolver_future).await {
+            Ok(Ok(stream)) => {
+                if is_direct_stream_url(&stream.url) {
+                    tracing::debug!(
+                        track_url,
+                        stream_host = %stream_log_location(&stream.url),
+                        client = %stream.client_kind,
+                        source = %stream.resolve_source,
+                        "youtube_resolver resolved direct stream"
+                    );
+                    return Some(stream);
+                }
+
                 tracing::debug!(
-                    track_url,
                     stream_host = %stream_log_location(&stream.url),
-                    client = %stream.client_kind,
-                    source = %stream.resolve_source,
-                    "youtube_resolver resolved direct stream"
+                    "rejecting non-direct stream URL from youtube_resolver"
                 );
-                return Some(stream);
             }
-            tracing::debug!(
-                stream_host = %stream_log_location(&stream.url),
-                "rejecting non-direct stream URL from youtube_resolver"
-            );
-        } else {
-            tracing::debug!(
-                track_url,
-                "youtube_resolver stream resolution failed or timed out"
-            );
+            Ok(Err(err)) => {
+                if err.is_not_a_bot_gate() {
+                    crate::audio::runtime::mark_youtube_degraded(Duration::from_secs(60 * 60));
+                    tracing::warn!(
+                        "YouTube anti-bot challenge detected; pausing native YouTube resolution"
+                    );
+                } else {
+                    tracing::debug!(
+                        error = %err,
+                        "youtube_resolver stream resolution failed"
+                    );
+                }
+
+                if !should_continue_youtube_proxy_fallback(&err) {
+                    return None;
+                }
+            }
+            Err(_) => {
+                tracing::debug!(track_url, "youtube_resolver stream resolution timed out");
+            }
         }
     }
 
